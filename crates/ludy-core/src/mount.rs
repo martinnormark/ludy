@@ -153,13 +153,17 @@ pub async fn attach(port: u16, export: &str, mountpoint: &Path, opts: &AttachOpt
     }
 }
 
-#[derive(Debug, PartialEq)]
 pub enum Detach {
     Done,
     /// `umount` is still running after the watchdog expired. It is left
-    /// alone (it cannot be killed while inside the kernel) and the caller
-    /// must keep the NFS server up and not reuse the mount point.
-    Stuck,
+    /// alone (it cannot be killed while inside the kernel). The caller must
+    /// keep the NFS server up, must not reuse the mount point, and can await
+    /// the child to learn when the unmount finally completes.
+    ///
+    /// The known way to get here: another app touched the volume and macOS
+    /// is holding its call on a "would like to access files on a network
+    /// volume" prompt. The unmount finishes once the prompt is answered.
+    Stuck(tokio::process::Child),
 }
 
 /// Force-unmount `mountpoint` from a child process under a watchdog.
@@ -175,12 +179,11 @@ pub async fn detach(mountpoint: &Path, watchdog: Duration) -> Result<Detach> {
         .stderr(Stdio::piped())
         .spawn()
         .context("run /sbin/umount")?;
-    let mut stderr = child.stderr.take();
     match tokio::time::timeout(watchdog, child.wait()).await {
         Ok(Ok(status)) if status.success() => Ok(Detach::Done),
         Ok(Ok(status)) => {
             let mut msg = String::new();
-            if let Some(mut e) = stderr.take() {
+            if let Some(mut e) = child.stderr.take() {
                 use tokio::io::AsyncReadExt;
                 let _ = e.read_to_string(&mut msg).await;
             }
@@ -190,7 +193,7 @@ pub async fn detach(mountpoint: &Path, watchdog: Duration) -> Result<Detach> {
             bail!("umount failed ({status}): {}", msg.trim())
         }
         Ok(Err(e)) => Err(anyhow!("umount: {e}")),
-        Err(_) => Ok(Detach::Stuck),
+        Err(_) => Ok(Detach::Stuck(child)),
     }
 }
 

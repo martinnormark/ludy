@@ -1,0 +1,15 @@
+[package]
+name = "ludy-cli"
+description = "Headless Ludy: list drives, upload, and mount a drive from the terminal"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ludy"
+path = "src/main.rs"
+
+[dependencies]
+ludy-core = { path = "../ludy-core" }
+ludy-cloud = { path = "../ludy-cloud" }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"

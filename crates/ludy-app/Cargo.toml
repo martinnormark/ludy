@@ -1,5 +1,6 @@
 [package]
 name = "ludy-app"
+description = "Ludy: cloud drives that mount in the Finder and stream on demand"
 version.workspace = true
 edition.workspace = true
 
@@ -8,4 +9,8 @@ name = "ludy-app"
 path = "src/main.rs"
 
 [dependencies]
+# runtime_shaders: compile Metal shaders when the app starts, so building
+# needs only the Command Line Tools, not full Xcode's `metal` compiler.
 gpui = { version = "0.2.2", default-features = false, features = ["runtime_shaders", "font-kit"] }
+ludy-core = { path = "../ludy-core" }
+anyhow = "1"

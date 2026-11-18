@@ -33,11 +33,11 @@ impl EngineConfig {
     pub fn from_env() -> EngineConfig {
         let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()));
         let state = std::env::var("LUDY_HOME").map(PathBuf::from).unwrap_or_else(|_| home.join("Library/Application Support/Ludy"));
-        let cache_mb = std::env::var("LUDY_CACHE_MB").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(2048);
+        let cache_mb = std::env::var("LUDY_CACHE_MB").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(2000);
         EngineConfig {
             server_url: std::env::var("LUDY_SERVER").unwrap_or_else(|_| "http://127.0.0.1:9000".into()),
             cache_dir: std::env::var("LUDY_CACHE_DIR").map(PathBuf::from).unwrap_or_else(|_| home.join("Library/Caches/Ludy/blocks")),
-            cache_cap: cache_mb * 1024 * 1024,
+            cache_cap: cache_mb * 1_000_000,
             journal_dir: state.join("journal"),
             mount_root: std::env::var("LUDY_MOUNT_ROOT").map(PathBuf::from).unwrap_or_else(|_| home.join("Ludy")),
             read_only: std::env::var("LUDY_READ_ONLY").is_ok(),
@@ -286,6 +286,9 @@ impl Inner {
 
     async fn eject(self: &Arc<Self>, drive: &str) -> Result<()> {
         let mounted = self.mounts.lock().unwrap().get(drive).cloned().ok_or_else(|| anyhow!("not mounted"))?;
+        if mounted.state() == MountState::Stuck {
+            bail!("an eject is already waiting on another app; answer any macOS permission prompt for this volume");
+        }
         // Publish what is still in the journal before the volume goes away.
         if !mounted.fs.flush(Duration::from_secs(120)).await {
             let p = mounted.fs.pending();
@@ -294,11 +297,29 @@ impl Inner {
         mount::wait_quiet(&mounted.fs, Duration::from_millis(1500), Duration::from_secs(8)).await;
         match mount::detach(&mounted.mountpoint, Duration::from_secs(25)).await? {
             Detach::Done => {}
-            Detach::Stuck => {
+            Detach::Stuck(mut child) => {
+                // Keep serving the volume, and finish the job whenever the
+                // kernel lets the unmount through.
                 *mounted.state.lock().unwrap() = MountState::Stuck;
-                bail!("the unmount did not finish; the volume is still being served. Close anything using it and try again");
+                let (this, mounted, drive) = (self.clone(), mounted.clone(), drive.to_string());
+                tokio::spawn(async move {
+                    let _ = child.wait().await;
+                    if !mount::is_mounted(&mounted.mountpoint) {
+                        this.finish_eject(&drive, &mounted);
+                        this.set_notice(format!("{drive} has been ejected."));
+                        this.rebuild_view();
+                    }
+                });
+                bail!(
+                    "the unmount is waiting on another app. If macOS is showing a \"would like to access files on a network volume\" prompt, answer it and the eject will complete"
+                );
             }
         }
+        self.finish_eject(drive, &mounted);
+        Ok(())
+    }
+
+    fn finish_eject(&self, drive: &str, mounted: &Mounted) {
         for t in mounted.tasks.lock().unwrap().drain(..) {
             t.abort();
         }
@@ -308,7 +329,6 @@ impl Inner {
         if !mount::is_mounted(&mounted.mountpoint) {
             let _ = std::fs::remove_dir(&mounted.mountpoint);
         }
-        Ok(())
     }
 
     async fn fetch_drives(&self) {
