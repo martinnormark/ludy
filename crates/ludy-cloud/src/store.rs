@@ -78,7 +78,7 @@ pub struct Version {
     pub content: Content,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Share {
     pub email: String,
     pub role: String,
@@ -100,7 +100,7 @@ struct Drive {
     seq_tx: watch::Sender<u64>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DriveInfo {
     pub name: String,
     pub created_ms: u64,

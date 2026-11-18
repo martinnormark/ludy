@@ -2657,6 +2657,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "ludy-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "futures-util",
+ "libc",
+ "ludy-cloud",
+ "nfsserve",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "lyon"
 version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2917,6 +2935,22 @@ name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
+
+[[package]]
+name = "nfsserve"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef1424b6d88c60a091931392970999ea3ceab132d968e6a5545c770fad5b97d7"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "byteorder",
+ "filetime",
+ "num-derive",
+ "num-traits",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "nix"
