@@ -46,6 +46,15 @@ fn main() {
     for drive in &automount {
         engine.mount(drive);
     }
+    // Ctrl-C in the terminal (or `kill`) must not leave mounted volumes
+    // behind with no server: eject them, then exit.
+    let on_signal = engine.clone();
+    std::thread::spawn(move || {
+        on_signal.wait_for_signal();
+        eprintln!("ludy-app: ejecting drives before exit");
+        on_signal.shutdown();
+        std::process::exit(130);
+    });
 
     Application::new().run(move |cx: &mut App| {
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);

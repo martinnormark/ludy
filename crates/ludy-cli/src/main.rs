@@ -96,26 +96,32 @@ fn run() -> Result<()> {
 fn mount(engine: &Engine, drive: &str) -> Result<()> {
     let mounted = engine.block_on(engine.mount_now(drive))?;
     println!("mounted {drive} at {} (NFS on 127.0.0.1:{}); Ctrl-C to eject", mounted.mountpoint.display(), mounted.port);
-    engine.block_on(async {
-        let mut ticker = tokio::time::interval(Duration::from_secs(2));
-        let mut last = (0, 0, 0);
-        loop {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => break,
-                _ = ticker.tick() => {
-                    let v = engine.view();
-                    let now = (v.stats.bytes_down, v.stats.bytes_up, v.cache.bytes);
-                    if now != last {
-                        last = now;
-                        println!(
-                            "streamed {} in {} ranges ({}/s) | cache {} of {} | cache hits {} | uploaded {}",
-                            human(v.stats.bytes_down), v.stats.range_requests, human(v.stats.down_rate as u64),
-                            human(v.cache.bytes), human(v.cache.cap), human(v.stats.cache_hit_bytes), human(v.stats.bytes_up),
-                        );
-                    }
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut last = (0, 0, 0);
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                let v = engine.view();
+                let now = (v.stats.bytes_down, v.stats.bytes_up, v.cache.bytes);
+                if now != last {
+                    last = now;
+                    println!(
+                        "streamed {} in {} ranges ({}/s) | cache {} of {} | cache hits {} | uploaded {}",
+                        human(v.stats.bytes_down),
+                        v.stats.range_requests,
+                        human(v.stats.down_rate as u64),
+                        human(v.cache.bytes),
+                        human(v.cache.cap),
+                        human(v.stats.cache_hit_bytes),
+                        human(v.stats.bytes_up),
+                    );
                 }
+                std::thread::sleep(Duration::from_secs(1));
             }
-        }
+        });
+        // Ctrl-C or `kill`: fall through to the eject below.
+        engine.wait_for_signal();
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
     });
     println!("ejecting {drive}…");
     engine.block_on(engine.eject_now(drive))?;

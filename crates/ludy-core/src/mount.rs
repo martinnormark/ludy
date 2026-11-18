@@ -78,6 +78,62 @@ pub async fn serve(fs: Arc<DriveFs>, read_only: bool) -> Result<(u16, tokio::tas
     Ok((port, task))
 }
 
+/// Run a short helper command, giving up (and abandoning it) after `limit`.
+async fn run_child(program: &str, args: &[&std::ffi::OsStr], limit: Duration) -> Result<()> {
+    let mut child = Command::new(program).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+    match tokio::time::timeout(limit, child.wait()).await {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(status)) => bail!("{program} exited with {status}"),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => bail!("{program} did not finish within {limit:?}; the path may be a stuck mount point"),
+    }
+}
+
+/// Remove an empty mount-point folder, from a child process.
+pub async fn remove_mountpoint(mountpoint: &Path) {
+    if !is_mounted(mountpoint) {
+        let _ = run_child("/bin/rmdir", &[mountpoint.as_os_str()], Duration::from_secs(5)).await;
+    }
+}
+
+/// Ejects whose `umount` never returned, remembered across app restarts so
+/// the same path is not touched while the kernel is still stuck on it.
+/// (A half-unmounted volume no longer shows in the mount table.)
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StuckEject {
+    pub mountpoint: PathBuf,
+    pub umount_pid: u32,
+}
+
+fn pid_alive(pid: u32) -> bool {
+    // SAFETY: kill with signal 0 only checks that the process exists.
+    pid != 0 && unsafe { libc::kill(pid as libc::pid_t, 0) } == 0
+}
+
+/// Read the stuck-eject record, dropping entries whose `umount` has exited.
+pub fn load_stuck(state_file: &Path) -> Vec<StuckEject> {
+    let all: Vec<StuckEject> = std::fs::read(state_file).ok().and_then(|raw| serde_json::from_slice(&raw).ok()).unwrap_or_default();
+    let live: Vec<StuckEject> = all.iter().filter(|s| pid_alive(s.umount_pid)).cloned().collect();
+    if live.len() != all.len() {
+        save_stuck(state_file, &live);
+    }
+    live
+}
+
+pub fn save_stuck(state_file: &Path, list: &[StuckEject]) {
+    if let Some(dir) = state_file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(state_file, serde_json::to_vec_pretty(list).unwrap_or_default());
+}
+
+pub fn record_stuck(state_file: &Path, mountpoint: &Path, umount_pid: u32) {
+    let mut list = load_stuck(state_file);
+    list.retain(|s| s.mountpoint != mountpoint);
+    list.push(StuckEject { mountpoint: mountpoint.to_path_buf(), umount_pid });
+    save_stuck(state_file, &list);
+}
+
 #[derive(Clone, Debug)]
 pub struct AttachOptions {
     pub read_only: bool,
@@ -122,7 +178,11 @@ pub async fn attach(port: u16, export: &str, mountpoint: &Path, opts: &AttachOpt
     if is_mounted(mountpoint) {
         bail!("{} is already a mount point", mountpoint.display());
     }
-    std::fs::create_dir_all(mountpoint).with_context(|| format!("create {}", mountpoint.display()))?;
+    // Created by a child process: if the path is a half-unmounted mount point
+    // the call blocks in the kernel, and that must not happen to a thread of ours.
+    run_child("/bin/mkdir", &["-p".as_ref(), mountpoint.as_os_str()], Duration::from_secs(5))
+        .await
+        .with_context(|| format!("create {}", mountpoint.display()))?;
     let mut child = Command::new("/sbin/mount_nfs")
         .arg("-o")
         .arg(mount_options(port, opts))
@@ -222,6 +282,19 @@ mod tests {
     fn mount_table_lists_the_root_volume() {
         let table = mount_table();
         assert!(table.iter().any(|m| m.on == Path::new("/")), "no / in {table:?}");
+    }
+
+    #[test]
+    fn stuck_ejects_are_remembered_only_while_umount_is_alive() {
+        let dir = std::env::temp_dir().join(format!("ludy-stuck-test-{}", std::process::id()));
+        let file = dir.join("stuck.json");
+        // Our own pid is certainly alive; pid 0x7fff_fff0 certainly is not.
+        record_stuck(&file, Path::new("/tmp/ludy-a"), std::process::id());
+        record_stuck(&file, Path::new("/tmp/ludy-b"), 0x7fff_fff0);
+        let live = load_stuck(&file);
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].mountpoint, Path::new("/tmp/ludy-a"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

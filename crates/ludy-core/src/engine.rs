@@ -25,6 +25,8 @@ pub struct EngineConfig {
     pub mount_root: PathBuf,
     pub read_only: bool,
     pub browse: bool,
+    /// Where ejects that never finished are remembered.
+    pub stuck_file: PathBuf,
 }
 
 impl EngineConfig {
@@ -39,6 +41,7 @@ impl EngineConfig {
             cache_dir: std::env::var("LUDY_CACHE_DIR").map(PathBuf::from).unwrap_or_else(|_| home.join("Library/Caches/Ludy/blocks")),
             cache_cap: cache_mb * 1_000_000,
             journal_dir: state.join("journal"),
+            stuck_file: state.join("stuck-ejects.json"),
             mount_root: std::env::var("LUDY_MOUNT_ROOT").map(PathBuf::from).unwrap_or_else(|_| home.join("Ludy")),
             read_only: std::env::var("LUDY_READ_ONLY").is_ok(),
             browse: std::env::var("LUDY_NOBROWSE").is_err(),
@@ -222,13 +225,26 @@ impl Engine {
         self.rt.spawn(async move { inner.eject(&drive).await }).await?
     }
 
-    /// Eject everything (called when the app quits).
+    /// Eject everything, briefly (called when the app quits or is signalled).
+    /// Writes that cannot be uploaded within a few seconds are abandoned.
     pub fn shutdown(&self) {
         let drives: Vec<String> = self.inner.mounts.lock().unwrap().keys().cloned().collect();
         let inner = self.inner.clone();
         self.rt.block_on(async move {
             for d in drives {
-                let _ = inner.eject(&d).await;
+                let _ = inner.eject_with(&d, true).await;
+            }
+        });
+    }
+
+    /// Block until SIGINT or SIGTERM arrives.
+    pub fn wait_for_signal(&self) {
+        self.rt.block_on(async {
+            use tokio::signal::unix::{signal, SignalKind};
+            let (Ok(mut int), Ok(mut term)) = (signal(SignalKind::interrupt()), signal(SignalKind::terminate())) else { return };
+            tokio::select! {
+                _ = int.recv() => {}
+                _ = term.recv() => {}
             }
         });
     }
@@ -269,6 +285,13 @@ impl Inner {
             bail!("already mounted");
         }
         let mountpoint = self.cfg.mount_root.join(drive);
+        if let Some(stuck) = mount::load_stuck(&self.cfg.stuck_file).into_iter().find(|s| s.mountpoint == mountpoint) {
+            bail!(
+                "an earlier eject of {} is still stuck in the kernel (umount pid {}). Answer any macOS permission prompt for that volume, or restart the Mac",
+                mountpoint.display(),
+                stuck.umount_pid
+            );
+        }
         let fs = DriveFs::new(drive, self.client.clone(), self.cache.clone(), self.stats.clone(), self.cfg.journal_dir.join(drive))?;
         fs.refresh().await.map_err(|e| anyhow!("cannot list drive: {e:#}"))?;
         let (port, nfs_task) = mount::serve(fs.clone(), self.cfg.read_only).await?;
@@ -285,27 +308,37 @@ impl Inner {
     }
 
     async fn eject(self: &Arc<Self>, drive: &str) -> Result<()> {
+        self.eject_with(drive, false).await
+    }
+
+    /// `quitting`: the app is going away, so be brief and unmount even if
+    /// some writes could not be uploaded in time.
+    async fn eject_with(self: &Arc<Self>, drive: &str, quitting: bool) -> Result<()> {
         let mounted = self.mounts.lock().unwrap().get(drive).cloned().ok_or_else(|| anyhow!("not mounted"))?;
         if mounted.state() == MountState::Stuck {
             bail!("an eject is already waiting on another app; answer any macOS permission prompt for this volume");
         }
         // Publish what is still in the journal before the volume goes away.
-        if !mounted.fs.flush(Duration::from_secs(120)).await {
+        let patience = Duration::from_secs(if quitting { 15 } else { 120 });
+        if !mounted.fs.flush(patience).await && !quitting {
             let p = mounted.fs.pending();
             bail!("{} file(s) are still uploading{}", p.files, p.last_error.map(|e| format!(" ({e})")).unwrap_or_default());
         }
-        mount::wait_quiet(&mounted.fs, Duration::from_millis(1500), Duration::from_secs(8)).await;
-        match mount::detach(&mounted.mountpoint, Duration::from_secs(25)).await? {
+        if !quitting {
+            mount::wait_quiet(&mounted.fs, Duration::from_millis(1500), Duration::from_secs(8)).await;
+        }
+        match mount::detach(&mounted.mountpoint, Duration::from_secs(if quitting { 8 } else { 25 })).await? {
             Detach::Done => {}
             Detach::Stuck(mut child) => {
                 // Keep serving the volume, and finish the job whenever the
                 // kernel lets the unmount through.
                 *mounted.state.lock().unwrap() = MountState::Stuck;
+                mount::record_stuck(&self.cfg.stuck_file, &mounted.mountpoint, child.id().unwrap_or(0));
                 let (this, mounted, drive) = (self.clone(), mounted.clone(), drive.to_string());
                 tokio::spawn(async move {
                     let _ = child.wait().await;
                     if !mount::is_mounted(&mounted.mountpoint) {
-                        this.finish_eject(&drive, &mounted);
+                        this.finish_eject(&drive, &mounted).await;
                         this.set_notice(format!("{drive} has been ejected."));
                         this.rebuild_view();
                     }
@@ -315,20 +348,19 @@ impl Inner {
                 );
             }
         }
-        self.finish_eject(drive, &mounted);
+        self.finish_eject(drive, &mounted).await;
         Ok(())
     }
 
-    fn finish_eject(&self, drive: &str, mounted: &Mounted) {
-        for t in mounted.tasks.lock().unwrap().drain(..) {
+    async fn finish_eject(&self, drive: &str, mounted: &Mounted) {
+        let tasks: Vec<_> = mounted.tasks.lock().unwrap().drain(..).collect();
+        for t in tasks {
             t.abort();
         }
         mounted.fs.stop();
         self.mounts.lock().unwrap().remove(drive);
-        // Leave no empty folder behind, but only once it is no mount point.
-        if !mount::is_mounted(&mounted.mountpoint) {
-            let _ = std::fs::remove_dir(&mounted.mountpoint);
-        }
+        // Leave no empty folder behind (checked and removed by a child process).
+        mount::remove_mountpoint(&mounted.mountpoint).await;
     }
 
     async fn fetch_drives(&self) {

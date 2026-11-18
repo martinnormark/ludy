@@ -4,7 +4,7 @@ Cloud drives that mount in the Finder and stream on demand. A drive holding hund
 
 The "cloud" here is simulated: a local S3-like server with configurable latency and bandwidth. The Mac app is written in Rust with [gpui](https://gpui.rs/).
 
-**Status (2026-11-19):** the server, the engine and the app are built and covered by automated tests that run without a kernel mount. The mount mechanism passed a spike (see below), but the full app has **not yet been verified through a real mount** — Finder, Quick Look and eject are untested end to end. The reason is a hazard found during the spike; read [Eject and the "network volume" prompt](#eject-and-the-network-volume-prompt) before mounting.
+**Status (2026-11-19):** the server, the engine and the app are built and covered by automated tests that run without a kernel mount. **Nothing in this repository has been mounted yet.** A throwaway spike showed that the read path of the chosen mechanism works, but the real NFS adapter, mount and eject code here has never run against the kernel, and Finder, Quick Look and eject are untested. The reason is a hazard found during the spike; read [Eject and the "network volume" prompt](#eject-and-the-network-volume-prompt) before mounting.
 
 ## Run it
 
@@ -28,7 +28,7 @@ Start the app.
 cargo run -p ludy-app
 ```
 
-Click **Mount** on a drive. It mounts at `~/Ludy/<drive>` and appears under Locations in the Finder sidebar. **Open** browses the drive inside the app, mounted or not.
+Click **Mount** on a drive. It mounts at `~/Ludy/<drive>` and, being a browsable volume, should appear under Locations in the Finder sidebar (not yet observed). **Open** browses the drive inside the app, mounted or not. Quitting the app, or Ctrl-C in its terminal, ejects mounted drives first.
 
 Useful variations:
 
@@ -58,9 +58,9 @@ Why this one:
 | Loopback SMB (what Space's CLI uses) | Would need an SMB2/3 server written from scratch. |
 | WebDAV (`mount_webdav`) | macOS's WebDAV client downloads a file to a local cache when it is opened, which defeats the purpose for a 50 GB file. Not tested here; ruled out on that basis. |
 
-What the spike measured, on a throwaway NFS server in front of an HTTP range server:
+What the spike measured, on a throwaway NFS server in front of an HTTP range server (that code is not in the repository):
 
-- `mount_nfs` succeeded as a normal user, and the volume was browsable (no `nobrowse` flag).
+- `mount_nfs` succeeded as a normal user, and the mount had no `nobrowse` flag. Whether the Finder showed it was not observed.
 - `ls -la` showed a 50 GB and a 95 MB file with correct sizes and caused **zero** HTTP requests.
 - One 64 KiB `dd` at the 25 GB mark of the 50 GB file caused **one** NFS READ and **one** HTTP range request of 114,688 bytes.
 
@@ -70,15 +70,17 @@ Mount options are in [`mount.rs`](crates/ludy-core/src/mount.rs): 256 KiB reads 
 
 During the spike a plain `umount` blocked forever inside the kernel's `unmount` call and could not be killed. While it was stuck, `diskarbitrationd`, `lsd`, Finder and Raycast each had a thread blocked on the half-unmounted mount point.
 
-The probable cause: macOS asks for consent the first time an app touches a network volume (*"Raycast" would like to access files on a network volume*). Raycast's file indexer had started crawling the new volume under the home folder, macOS suspended its calls on that prompt, and the unmount waited for them. The prompt was still on screen an hour later. Apple's NFS client source confirms that `nfs_vfs_unmount` waits with no timeout for in-flight requests. This explanation fits the evidence but was not confirmed by answering the prompt.
+The cause, as far as it can be established without kernel stacks: macOS asks for consent the first time an app touches a network volume (*"Raycast" would like to access files on a network volume*). Raycast's file indexer started crawling the new volume under the home folder, and the consent daemon's log shows it began prompting for Raycast seven seconds before the `umount`. Raycast's `lstat` and `getxattr` calls sat suspended on that prompt, which was still on screen an hour later, and the unmount waited behind them. Apple's NFS client has several waits without a timeout on the unmount path; which one was hit is not known. Two later mount and unmount cycles with nothing crawling the volume were clean. Whether answering the prompt releases the stuck unmount has not been tested.
 
 What Ludy does about it:
 
 - Eject always force-unmounts, from a **child process** under a watchdog. The app never calls `unmount` itself, so it cannot become unkillable.
 - Before unmounting it uploads pending writes and waits for the volume to go quiet.
 - The NFS server keeps serving until the unmount has finished.
-- If the watchdog expires, the drive is shown as "eject did not finish" with a hint to answer any pending permission prompt, and the eject completes by itself once the kernel lets it through.
-- The mount table is read with `getmntinfo(MNT_NOWAIT)`. Nothing stats a mount point.
+- If the watchdog expires, the drive is shown as "eject did not finish" with a hint to answer any pending permission prompt, and the eject completes by itself once the kernel lets it through. A force-unmount probably cannot beat a call held by a prompt; the watchdog is the real protection.
+- A stuck eject is recorded on disk with the `umount` process id. While that process is alive, Ludy refuses to mount at the same path, even after a restart.
+- The mount table is read with `getmntinfo(MNT_NOWAIT)`. The app's own process never stats, creates or removes a mount-point path; `mkdir` and `rmdir` run as child processes.
+- If the app is killed outright, the mounts are soft with a 45-second dead timeout, so the kernel should drop them. This is untested.
 
 If you ever see a stuck eject: look for a macOS permission prompt and answer it. Do not `ls -la` the mount root in the meantime.
 
@@ -123,7 +125,7 @@ If you ever see a stuck eject: look for a macOS permission prompt and answer it.
 
 ## What works, and how it was checked
 
-Checked by `cargo test` (25 integration tests and 14 unit tests, no kernel mount involved; the cloud server's request log is the witness):
+Checked by `cargo test` (25 integration tests and 15 unit tests, no kernel mount involved; the cloud server's request log is the witness):
 
 - A listing shows real sizes, including a 50 GB synthetic file, with no object bytes downloaded.
 - A 64 KiB read from the middle of the 50 GB file returns the right bytes (compared with the generator) and causes one range request of at most two blocks.
@@ -143,7 +145,8 @@ Checked by hand:
 
 **Not yet verified:**
 
-- Mount, Open, Show in Finder and Eject from the app against a real mount.
+- Any real mount of this code. `mount_nfs` against the real NFS adapter, and the eject path, have never run.
+- Mount, Open, Show in Finder and Eject from the app.
 - The drive appearing in the Finder sidebar, and Quick Look playing the video while the cache stays smaller than the file.
 - Writes through the Finder (copying a file in), and how quickly the Finder notices a server-side change. The engine picks changes up within two seconds; when the Finder redraws is up to the Finder.
 - Clicks in the app. Every button was wired and compiles, but only the two screens' rendering was looked at.
