@@ -34,8 +34,8 @@ impl NfsDrive {
             uid: self.uid,
             gid: self.gid,
             size: a.size,
-            // What this Mac actually holds: cached or journaled bytes. The macOS
-            // NFS client ignores this and reports the full size as "on disk".
+            // What this Mac actually holds: cached or journaled bytes. On macOS
+            // `stat` still shows the full size as "on disk"; see the README.
             used: a.local_bytes,
             rdev: specdata3::default(),
             fsid: 0,

@@ -66,7 +66,7 @@ Mount options are in [`mount.rs`](crates/ludy-core/src/mount.rs): 256 KiB reads 
 
 During the spike a plain `umount` blocked forever inside the kernel's `unmount` call and could not be killed. While it was stuck, `diskarbitrationd`, `lsd`, Finder and Raycast each had a thread blocked on the half-unmounted mount point.
 
-The cause, as far as it can be established without kernel stacks: macOS asks for consent the first time an app touches a network volume (*"Raycast" would like to access files on a network volume*). Raycast's file indexer started crawling the new volume under the home folder, and the consent daemon's log shows it began prompting for Raycast seven seconds before the `umount`. Raycast's `lstat` and `getxattr` calls sat suspended on that prompt, which was still on screen an hour later, and the unmount waited behind them. Apple's NFS client has several waits without a timeout on the unmount path; which one was hit is not known. Answering the prompt released it: the consent log shows the answer at 07:02:26 the next morning, and the `umount` and the blocked threads were gone without a reboot. Eight mount and eject cycles since then, hidden and Finder-visible, were clean, each eject taking one to two seconds.
+The cause, as far as it can be established without kernel stacks: macOS asks for consent the first time an app touches a network volume (*"Raycast" would like to access files on a network volume*). Raycast's file indexer started crawling the new volume under the home folder, and the consent daemon's log shows it began prompting for Raycast seven seconds before the `umount`. Raycast's `lstat` and `getxattr` calls sat suspended on that prompt, which was still on screen an hour later, and the unmount waited behind them. Apple's NFS client has several waits without a timeout on the unmount path; which one was hit is not known. Answering the prompt released it: the consent log shows the answer at 07:02:26 the next morning, and the `umount` and the blocked threads were gone without a reboot. Nine mount and eject cycles since then, hidden and Finder-visible, were clean, each eject taking one to two seconds.
 
 What Ludy does about it:
 
@@ -76,7 +76,7 @@ What Ludy does about it:
 - If the watchdog expires, the drive is shown as "eject did not finish" with a hint to answer any pending permission prompt, and the eject completes by itself once the kernel lets it through. A force-unmount probably cannot beat a call held by a prompt; the watchdog is the real protection.
 - A stuck eject is recorded on disk with the `umount` process id. While that process is alive, Ludy refuses to mount at the same path, even after a restart.
 - The mount table is read with `getmntinfo(MNT_NOWAIT)`. The app's own process never stats, creates or removes a mount-point path; `mkdir` and `rmdir` run as child processes.
-- If the app is killed outright, the mounts are soft with a 45-second dead timeout. Tested with `kill -9`: the kernel dropped the mount by itself about 55 seconds later, and an `ls` of the dead mount in the meantime returned instead of hanging.
+- If the app is killed outright, the mounts are soft with a 45-second dead timeout. Tested twice with `kill -9`: the kernel dropped the mount by itself 55 to 57 seconds later, and an `ls` of the dead mount in the meantime failed with "Operation timed out" instead of hanging.
 
 If you ever see a stuck eject: look for a macOS permission prompt and answer it. Do not `ls -la` the mount root in the meantime.
 
@@ -102,7 +102,7 @@ If you ever see a stuck eject: look for a macOS permission prompt and answer it.
 
 **Reads.** A read maps to the 256 KiB blocks that cover it. Blocks already in the cache are read from disk. Missing neighbours are fetched with one range request of at most 2 MiB, several requests run in parallel, and concurrent readers of the same block share one request. A sequential reader gets read-ahead that grows to 8 MiB; a random read fetches only what it asked for.
 
-**Cache.** Blocks are keyed by `(version id, block index)`. A version never changes, so a cached block is never stale. The cache has a byte cap and evicts the least recently used blocks. The NFS server reports each file's locally held bytes as its space used, but the macOS NFS client ignores that and reports the full size, so the Finder's "on disk" figure and `du` show the cloud size (a test with a fixed value confirmed the client does not use it). What the Mac really holds is shown in the app, under "On this Mac".
+**Cache.** Blocks are keyed by `(version id, block index)`. A version never changes, so a cached block is never stale. The cache has a byte cap and evicts the least recently used blocks. The NFS server reports each file's locally held bytes as its space used, but `stat` and `du` on the mount report the full size regardless, so the Finder's "on disk" figure shows the cloud size. Sending a fixed value instead changed nothing, so the figure does not follow what the server sends; whether the macOS client or the NFS library drops it was not established. What the Mac really holds is shown in the app, under "On this Mac".
 
 **Writes.** A write goes to a sparse journal file and returns. An existing cloud file is not downloaded first: the journal records which byte ranges were written and reads merge them with the cloud version underneath. When a file has been quiet for 1.5 seconds it is uploaded as a new version. Renames, deletes and new folders are queued and replayed on the cloud in order. `.DS_Store` and `._*` files stay on the Mac.
 
@@ -138,13 +138,14 @@ Checked against real mounts on macOS 27.0.1, with the CLI and with the app (`--m
 
 - **Listing.** `ls -la` shows every file at its real size, the 50 GB one included, and causes no object request.
 - **Mid-file read.** A 64 KiB `dd` at the 25 GiB mark of the 50 GB file returns bytes equal to an independent SplitMix64 written in Python, and the server log shows one request: `bytes=26843545600-26843807743` (256 KiB). The cache grew by 256 KiB.
-- **Video.** Playing `demo.mp4` (95 MB, 104 s) from the mount with AVPlayer, the framework Quick Look uses: first frame after 0.18 s, 7.7 s played in 8 s of wall time, 14 range requests of 256 KiB to 2 MiB covering the first 16 MB, cache at 15 MB. A Quick Look thumbnail (`qlmanage -t`) was produced from the mount.
+- **Video.** Playing `demo.mp4` (95 MB, 104 s) with AVPlayer, the framework Quick Look uses, from a hidden mount with an empty cache: first frame after 0.30 s, 7.6 s played in 8 s of wall time, 12 range requests of 256 KiB to 2 MiB covering the first 14.9 MB (16% of the file), cache at 14 MB. A Quick Look thumbnail (`qlmanage -t`) was produced from the mount.
+- **Nothing reads behind your back.** A Finder-visible mount left untouched for 30 seconds caused no range request. During the earlier tests one 30-byte read of `shot-list.txt` appeared that the test did not make; its origin is unknown.
 - **Finder.** The mount has no `nobrowse` flag, the sidebar lists `ludy.localhost` under Locations with an eject button, and the computer view lists the drive as a remote volume.
 - **Writes.** `cp` of a 3 MB file returned in 0.08 s; the PUT followed in the background and the server's copy has the same SHA-256. `mkdir`, `mv` and `rm` reached the server in order. `._*` files stayed local.
 - **Remote changes.** A file put on the server with `curl`, and one deleted there, showed in `ls` within three seconds.
-- **Eject.** Ctrl-C in the CLI and SIGTERM to the app both ejected in one to two seconds, with a Finder window open on the volume, and a write made just before the eject was uploaded first. No mount was left behind in eight cycles.
+- **Eject.** Ctrl-C in the CLI and SIGTERM to the app both ejected in one to two seconds, with a Finder window open on the volume, and a write made just before the eject was uploaded first. No mount was left behind in nine cycles.
 - **The app.** Started with `--mount Footage`, it mounted the drive, showed the card as mounted with its path, and the status panel counted the range request and the cache blocks.
-- **Crash.** See the previous section: the kernel drops the mount of a killed process after about 55 seconds.
+- **Crash.** See the eject section: the kernel drops the mount of a killed process after 55 to 57 seconds.
 
 Checked by hand, without a mount:
 
