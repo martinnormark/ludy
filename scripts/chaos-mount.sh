@@ -38,7 +38,7 @@ cloud_up() { i=0; until curl -fsS -o /dev/null "$B/_stats" 2>/dev/null; do i=$((
 start_mount() { "$LUDY" mount Chaos --nobrowse --root "$WORK/mnt" >> "$WORK/mount.log" 2>&1 & echo $! > "$WORK/mount.pid"; }
 mounted() { /sbin/mount | grep -q " on $MNT "; }
 wait_mounted() { i=0; until mounted; do i=$((i+1)); [ $i -lt 150 ] || { echo "mount did not appear"; cat "$WORK/mount.log"; exit 1; }; sleep 0.2; done; }
-wait_unmounted() { i=0; while mounted; do i=$((i+1)); [ $i -lt 600 ] || { echo "mount did not go away"; exit 1; }; sleep 0.2; done; }
+wait_unmounted() { i=0; while mounted; do i=$((i+1)); [ $i -lt 1500 ] || { echo "mount did not go away"; exit 1; }; sleep 0.2; done; }
 
 # write <first> <count> <folder>: deterministic small files, through the mount.
 write_files() {
@@ -126,7 +126,7 @@ kill -9 "$(cat "$WORK/cloud.pid")"
 write_files 100000 $((FILES / 4)) offline
 sleep 1
 kill -9 "$(cat "$WORK/mount.pid")"
-say "waiting for the kernel to drop the dead mount (about a minute)"
+say "waiting for the kernel to drop the dead mount (one to two minutes)"
 wait_unmounted
 say "cloud and mount start again"
 start_cloud; cloud_up

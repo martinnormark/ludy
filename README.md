@@ -4,7 +4,7 @@ Cloud drives that mount in the Finder and stream on demand. A drive holding hund
 
 The "cloud" here is simulated: a local S3-like server with configurable latency and bandwidth. The Mac app is written in Rust with [gpui](https://gpui.rs/).
 
-**Status (2026-11-19):** the server, the engine and the app are built, covered by automated tests, and checked against real mounts: listing, range-only reads, video playback, writes, remote changes, eject and the crash case all work (see [What works](#what-works-and-how-it-was-checked)). Not checked: clicking the app's buttons, and the Quick Look panel itself. Read [Eject and the "network volume" prompt](#eject-and-the-network-volume-prompt) for a hazard to know about.
+**Status (2026-11-19):** the server, the engine and the app are built, covered by automated tests, and checked against real mounts: listing, range-only reads, video playback, writes, remote changes, eject and the crash case all work (see [What works](#what-works-and-how-it-was-checked)). Not checked: clicking the app's buttons, and the Quick Look panel itself. Read [Eject and the "network volume" prompt](#eject-and-the-network-volume-prompt) for a hazard to know about. The engine has a benchmark and a chaos suite (cloud killed mid-upload, stalls, app crashes with unsent writes); see [Benchmarks](#benchmarks) and [Chaos testing](#chaos-testing).
 
 ## Run it
 
@@ -40,6 +40,9 @@ Useful variations:
 | `cargo run -p ludy-app -- --click 327,345` | Post a click to the app's own window at that point (also `--rclick`, `--dclick`, repeatable; `--demo menu\|entry-menu\|share\|new-drive` opens that surface; `--size 820x560` sets the window size) |
 | `cargo run -p ludy-cli -- mount Footage` | Mount from the terminal, no window; Ctrl-C ejects |
 | `cargo run -p ludy-cli -- log --follow` | Tail the cloud's range log |
+| `cargo run --release -p ludy-cli -- bench` | Time fixed engine scenarios against a cloud of its own and print a table (`--quick` for small sizes) |
+| `cargo test -p ludy-core --test chaos` | The chaos tests; add `soak -- --ignored --nocapture` for the randomized run (`CHAOS_SEED`, `CHAOS_STEPS`) |
+| `scripts/chaos-mount.sh <work-dir>` | Flood, copy and `kill -9` the cloud and then the mounting process, on a hidden mount (needs the release builds) |
 | `curl -X PUT 'http://127.0.0.1:9000/_config?mbps=50&latency_ms=120'` | Slow the link down while running |
 
 Environment variables: `LUDY_SERVER` (default `http://127.0.0.1:9000`), `LUDY_CACHE_MB` (default 2000), `LUDY_CACHE_DIR` (default `~/Library/Caches/Ludy/blocks`), `LUDY_MOUNT_ROOT` (default `~/Ludy`), `LUDY_READ_ONLY`, `LUDY_NOBROWSE`.
@@ -119,7 +122,7 @@ That is the display's limit. "Building elements" is only the app's own share of 
 
 **Cache.** Blocks are keyed by `(version id, block index)`. A version never changes, so a cached block is never stale. The cache has a byte cap and evicts the least recently used blocks. The Finder lists every file at its full cloud size, so a drive can show far more than the Mac's disk holds; that is the point. `stat` and `du` on the mount report the full size as well. What the Mac really holds is the cache, shown in the app.
 
-**Writes.** A write goes to a sparse journal file and returns. An existing cloud file is not downloaded first: the journal records which byte ranges were written and reads merge them with the cloud version underneath. When a file has been quiet for 1.5 seconds it is uploaded as a new version, as a patch: only the shards the edit touched are sent (see Shards below). Renames, deletes and new folders are queued and replayed on the cloud in order. `.DS_Store` and `._*` files stay on the Mac.
+**Writes.** A write goes to a sparse journal file and returns. An existing cloud file is not downloaded first: the journal records which byte ranges were written and reads merge them with the cloud version underneath. When a file has been quiet for 1.5 seconds it is uploaded as a new version, as a patch: only the shards the edit touched are sent (see Shards below). Eight files upload at a time, and a file small enough to be one shard goes up in a single request. What has not been sent yet survives a quit, a crash or a power cut: next to each journal file the engine saves which byte ranges it holds and which cloud version they were written over, and it saves the queue of renames and deletes, so the next start picks everything up and sends it. Renames, deletes and new folders are queued and replayed on the cloud in order. `.DS_Store` and `._*` files stay on the Mac.
 
 **Remote changes.** Each mounted drive long-polls the cloud for its next commit and folds the new listing into the tree, keeping node ids stable. A listing is never applied while local changes are still uploading.
 
@@ -147,7 +150,7 @@ A plain `PUT` with a body still works, for `curl`: the server cuts it into shard
 
 ## What works, and how it was checked
 
-Checked by `cargo test` (38 integration tests and 34 unit tests in the cloud and engine crates, no kernel mount involved; the cloud server's request log is the witness):
+Checked by `cargo test` (57 integration tests and 34 unit tests in the cloud and engine crates, no kernel mount involved; the cloud server's request log is the witness; 19 of the integration tests are the chaos tests described under [Chaos testing](#chaos-testing)):
 
 - A listing shows real sizes, including a 50 GB synthetic file, with no object bytes downloaded.
 - A 64 KiB read from the middle of the 50 GB file returns the right bytes (compared with the generator) and causes one range request of at most two blocks.
@@ -189,6 +192,65 @@ Checked by hand, without a mount:
 - **Dragging a file in with the Finder**, and how quickly a Finder window redraws after a server-side change. Both were checked from the shell only.
 - **Another app raising the "network volume" prompt during an eject.** The watchdog path for that is written but has only been reasoned about.
 
+## Benchmarks
+
+`ludy bench` runs fixed scenarios through the engine (the same calls the NFS adapter makes) against a cloud started in the same process, with the simulated link at 400 Mbit/s and 30 ms. No kernel mount is involved, so these are the engine's numbers. Release build, Apple silicon. The full tables are in [`bench/`](bench).
+
+| Scenario | Before hardening | After | Notes |
+|---|---|---|---|
+| Link: one 64 KiB range request | 35 ms | 34 ms | straight to the server: the floor for a cold read |
+| Link: one large range request | 34 MB/s | 35 MB/s | the simulated link delivers about 70% of its nominal 50 MB/s |
+| Sequential read, cold | 41 MB/s | 41 MB/s | 256 MiB in 256 KiB reads; faster than one stream because fetches run in parallel |
+| Sequential read, warm | 3,562 MB/s | 3,554 MB/s | from the disk cache |
+| Random 64 KiB read, cold (p50 / p99) | 42 / 52 ms | 42 / 52 ms | one range request each; 7 ms over the link's floor |
+| Random 64 KiB read, warm (p50 / p99) | 0.11 / 0.31 ms | 0.11 / 0.25 ms | |
+| Open a drive of 5,000 files | 39 ms | 41 ms | fetch the listing, build the tree |
+| Create 1,000 files of 4 KiB (writes return) | 70 ms | 377 ms | the cost of saving the journal's state on every write |
+| Upload those 1,000 files | 105 s (10 files/s) | **6.3 s (159 files/s)** | eight at a time, one request each, instead of one at a time with three |
+| Copy 64 MiB in (writes return) | 4,145 MB/s | 993 MB/s | same cost; still twenty times the link |
+| Upload that copy | 1.77 s (38 MB/s) | 1.77 s (38 MB/s) | cut, hash, send, commit: the link's rate |
+| Upload the same content again | 361 ms | 367 ms | every shard already in the cloud |
+| Change 4 KiB in that file | 233 ms, 7.6x faster than re-uploading | 235 ms, 7.5x | Space states about 11x |
+| Read 64 KiB of that file, cold | 33 ms, 58x faster than fetching it whole | 34 ms, 56x | Space states about 34x |
+
+What the numbers say: reads are at the link's limit (a cold random read costs one round trip plus 7 ms); uploads of real data run at the link's rate; the two things that were slow or are now slower are both about many small files. Still to do for speed: a patch costs four round trips (manifest, check, shard, commit), which is why it reaches 7.5x and not 11x; and through a real mount the kernel's NFS client adds its own costs, which this benchmark does not see.
+
+## Chaos testing
+
+[`tests/chaos.rs`](crates/ludy-core/tests/chaos.rs) runs the engine against a cloud that misbehaves on purpose. The cloud used in tests can be killed (every request in flight is dropped) and restarted on the same data and port, which is what a deploy looks like to a client; it can also stall (accept and never answer), refuse everything with 503, hold commits back, and delete shards no manifest lists yet. Each test ends with the same check: once the cloud is back and the drive has settled, the cloud holds exactly the files the application wrote, byte for byte, nothing else, and deleting everything leaves no shard or manifest behind. Faults fire on observed events (the fortieth upload, a commit waiting), not on sleeps, and every step has a timeout, so a hang fails the test.
+
+The scenarios: a flood of 360 files and a 12 MiB copy with the cloud killed and restarted in the middle and more files written during the outage; the same flood with the cloud refusing requests while a folder is renamed and a file deleted; shards swept between upload and commit (the commit is refused with the list, the client sends them again); a restart between the shards and the commit; a stalled cloud; the background uploader and a flush running together through renames and deletes; paths longer than the cloud accepts; a file deleted in the cloud under a pending local patch; a listing that is already out of date; a damaged cache block; writes, renames and deletes on files that are mid-upload; awkward names (percent signs, quotes, emoji, 255 bytes); two writers on one file; the app killed, or quit, with unsent writes while the cloud is down.
+
+A randomized soak (`soak`, ignored by default) drives 1,200 random operations per run (create, patch, resize, rename files and folders, delete, read back and compare) while it randomly kills and restarts the cloud, stalls it, makes it refuse requests, and kills and restarts the app. The seed is printed. After the fixes below, 40 consecutive seeds pass.
+
+On a real mount, [`scripts/chaos-mount.sh`](scripts/chaos-mount.sh) was run once with the release binaries on a hidden mount: 2,000 small files and a 200 MiB copy written through the mount, `kill -9` of the cloud four seconds in, restart five seconds later: all 2,001 files in the cloud, none wrong. Then the cloud was killed, 500 more files written, and the mounting process killed with `kill -9` as well; after both were started again the 500 files arrived, none wrong. The kernel took about two minutes to drop the dead mount this time (nothing was touching it; with a reader on it, it took 55 seconds before).
+
+What this found, all fixed:
+
+| Found | Now |
+|---|---|
+| Writes that had not reached the cloud were deleted when the app quit or was killed while the cloud was down | The journal's state and the queue of renames and deletes are saved on disk and picked up at the next start |
+| A cloud file renamed locally could not be read, and a patch to it could not upload, until the rename had reached the cloud | Each remote version carries the key the cloud currently has it under |
+| The background uploader and a flush (eject, quit) could run at once and replay a rename under an upload in flight | One sync pass at a time |
+| A stalled cloud hung reads and uploads for ever | A read gives up after 8 seconds without a byte (below the NFS client's own 10 second timeout, so the mount stays alive); every request has a time limit |
+| A path longer than the cloud's 1,024-byte key limit queued a change the cloud would never accept, blocking everything behind it | Refused when it is created (`ENAMETOOLONG`); a change the cloud rejects is dropped with an error |
+| A patch whose base version was deleted in the cloud failed for ever and held up other uploads | The cloud's delete wins, the drive reports it, the rest continues |
+| A listing fetched before an upload finished could be applied after it, making the new file vanish or revert | A listing is only applied if the drive has changed nothing in the cloud since it was requested |
+| A cache block cut short on disk was served as data | Its length is checked; it is discarded and fetched again |
+| A new file renamed over a file the cloud has, then deleted before its upload, left the cloud's file in place (found by the soak) | The replaced file is deleted in the cloud explicitly |
+| Uploads ran one file at a time with three round trips each | Eight at a time; one request for a file that fits one shard |
+| Simulated cloud: a request cancelled by a disconnecting client could leave content referenced for ever (found by the soak) | Changes to the store run to their end whatever happens to the request |
+| Simulated cloud: its rate limiter held a fast link to about half its rate | Short waits are batched |
+
+Known and not fixed:
+
+- A byte flipped inside a cached block is not detected; blocks have no checksum.
+- A full disk while writing the journal turns into an I/O error for the application, and nothing has tested what happens next.
+- After a crash, the first listing must succeed before recovered writes show up, so a drive cannot be mounted offline to get at them.
+- The dead-mount wait after a crash is the kernel's and can be two minutes.
+- The simulated cloud rewrites a drive's whole catalog on every commit, and the engine fetches the whole listing on every remote change. Both are fine for thousands of files and wrong for millions.
+- The chaos script on a real mount was run once; the Finder was not involved.
+
 ## Not built
 
 - **Shards on the read path and in the cache.** Reads are range requests on the object, and the disk cache is keyed by version and block, not by shard. So after a patch the Mac's cache does not carry over to the new version except for the file that was just uploaded, and two files with the same content are cached twice.
@@ -197,5 +259,4 @@ Checked by hand, without a mount:
 - **Not exercised:** the client's second attempt after the cloud reports a missing shard at commit (the server's 409 is tested; the retry has never fired).
 - **A second user.** Sharing records an email and a role on the drive and shows who has access. There are no accounts, and nothing enforces View versus Edit.
 - **Thumbnails** in the in-app browser, drag and drop, search, and a menu-bar launcher.
-- **Journal recovery.** Writes that have not uploaded when the app is killed are lost; a clean quit or eject uploads them first.
 - **An app bundle.** The app runs from `cargo run` and is unsigned.
