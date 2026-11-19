@@ -22,6 +22,9 @@ pub struct UiOptions {
     pub demo: Option<String>,
     /// Scroll the open folder by itself for a few seconds, print frame times, quit.
     pub perf: bool,
+    /// Clicks to send to the window after launch, in window points:
+    /// (x, y, kind) with kind 0 = click, 1 = right-click, 2 = double-click.
+    pub clicks: Vec<(f32, f32, u8)>,
 }
 
 /// Frame pacing measured while the list scrolls itself.
@@ -124,6 +127,26 @@ impl LudyApp {
             }
         })
         .detach();
+        // `--click`: post mouse events to our own window (see `inject.rs`).
+        if !opts.clicks.is_empty() {
+            let steps = opts.clicks.clone();
+            cx.spawn(async move |_, cx| {
+                let pause = |ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+                pause(1500).await;
+                for (x, y, kind) in steps {
+                    crate::inject::mouse_move(x, y);
+                    pause(80).await;
+                    for nth in 1..=(if kind == 2 { 2 } else { 1 }) {
+                        crate::inject::mouse_down(x, y, kind, nth);
+                        pause(40).await;
+                        crate::inject::mouse_up(x, y, kind, nth);
+                        pause(60).await;
+                    }
+                    pause(900).await;
+                }
+            })
+            .detach();
+        }
         let view = engine.view();
         let mut app = LudyApp {
             engine,
@@ -259,8 +282,14 @@ impl LudyApp {
                         this.entries = entries;
                         this.loaded_seq = listing.seq.max(seq);
                     }
-                    Ok(Err(e)) => this.engine.set_notice(format!("Could not list folder: {e:#}")),
-                    Err(e) => this.engine.set_notice(format!("Could not list folder: {e}")),
+                    Ok(Err(e)) => {
+                        this.entries.clear();
+                        this.engine.set_notice(format!("Could not list folder: {e:#}"));
+                    }
+                    Err(e) => {
+                        this.entries.clear();
+                        this.engine.set_notice(format!("Could not list folder: {e}"));
+                    }
                 }
                 cx.notify();
             });

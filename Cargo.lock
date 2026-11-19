@@ -2649,6 +2649,7 @@ dependencies = [
  "anyhow",
  "gpui",
  "ludy-core",
+ "objc",
 ]
 
 [[package]]

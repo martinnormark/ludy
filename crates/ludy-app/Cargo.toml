@@ -14,3 +14,4 @@ path = "src/main.rs"
 gpui = { version = "0.2.2", default-features = false, features = ["runtime_shaders", "font-kit"] }
 ludy-core = { path = "../ludy-core" }
 anyhow = "1"
+objc = "0.2"

@@ -6,12 +6,16 @@
 //! `--list` in its list view. For checking the app without a hand on the
 //! mouse: `--demo menu|entry-menu|share|new-drive` opens that surface, and
 //! `--perf` scrolls the open folder by itself and prints frame times.
+//! `--click X,Y` (also `--rclick`, `--dclick`; repeatable, window points)
+//! posts mouse events to the app's own window, and `--size WxH` sets the
+//! window size.
 //!
 //! Configuration comes from the environment (see `EngineConfig::from_env`):
 //! `LUDY_SERVER` (default http://127.0.0.1:9000), `LUDY_CACHE_MB`,
 //! `LUDY_MOUNT_ROOT` (default ~/Ludy), `LUDY_READ_ONLY`, `LUDY_NOBROWSE`.
 
 mod assets;
+mod inject;
 mod theme;
 mod ui;
 
@@ -25,6 +29,7 @@ actions!(ludy, [Quit]);
 fn main() {
     let mut automount: Vec<String> = Vec::new();
     let mut opts = ui::UiOptions::default();
+    let mut window_size: (f32, f32) = (1180., 780.);
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -33,6 +38,25 @@ fn main() {
             "--list" => opts.list = true,
             "--demo" => opts.demo = args.next(),
             "--perf" => opts.perf = true,
+            "--click" | "--rclick" | "--dclick" => {
+                let kind = match a.as_str() {
+                    "--rclick" => 1,
+                    "--dclick" => 2,
+                    _ => 0,
+                };
+                let at = args.next().unwrap_or_default();
+                match at.split_once(',').and_then(|(x, y)| Some((x.parse().ok()?, y.parse().ok()?))) {
+                    Some((x, y)) => opts.clicks.push((x, y, kind)),
+                    None => {
+                        eprintln!("ludy-app: {a} needs X,Y in window points");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--size" => {
+                let s = args.next().unwrap_or_default();
+                window_size = s.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))).unwrap_or(window_size);
+            }
             "-h" | "--help" => {
                 println!("usage: ludy-app [--mount DRIVE]... [--open DRIVE[/FOLDER]] [--list]\n\nStart the simulated cloud first: cargo run -p ludy-cloud");
                 return;
@@ -81,7 +105,7 @@ fn main() {
         })
         .detach();
 
-        let bounds = Bounds::centered(None, size(px(1180.), px(780.)), cx);
+        let bounds = Bounds::centered(None, size(px(window_size.0), px(window_size.1)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(820.), px(560.))),

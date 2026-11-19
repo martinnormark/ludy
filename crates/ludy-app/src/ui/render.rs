@@ -994,6 +994,9 @@ impl LudyApp {
             window.request_animation_frame();
             return;
         }
+        if max <= 0.0 {
+            eprintln!("perf: the folder fits in the window, so nothing scrolled; open a bigger folder (scripts/seed-stress.sh makes one)");
+        }
         let build_ms = perf.build.as_secs_f32() * 1000.0 / perf.intervals_ms.len().max(1) as f32;
         let mut v = std::mem::take(&mut perf.intervals_ms);
         v.sort_by(|a, b| a.total_cmp(b));

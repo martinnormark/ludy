@@ -36,7 +36,8 @@ Useful variations:
 |---|---|
 | `cargo run -p ludy-app -- --mount Footage` | Mount a drive at launch |
 | `cargo run -p ludy-app -- --open Footage/raw` | Start in the file browser (`--list` for the list view) |
-| `cargo run -p ludy-app -- --open Footage --perf` | Scroll the folder by itself for a few seconds, print frame times, quit |
+| `scripts/seed-stress.sh` then `cargo run -p ludy-app -- --open Stress --perf` | Make a drive of 5,000 synthetic files, scroll it by itself for a few seconds, print frame times, quit |
+| `cargo run -p ludy-app -- --click 327,345` | Post a click to the app's own window at that point (also `--rclick`, `--dclick`, repeatable; `--demo menu\|entry-menu\|share\|new-drive` opens that surface; `--size 820x560` sets the window size) |
 | `cargo run -p ludy-cli -- mount Footage` | Mount from the terminal, no window; Ctrl-C ejects |
 | `cargo run -p ludy-cli -- log --follow` | Tail the cloud's range log |
 | `curl -X PUT 'http://127.0.0.1:9000/_config?mbps=50&latency_ms=120'` | Slow the link down while running |
@@ -92,7 +93,7 @@ Folders are drawn with a virtual list, so only the rows on screen are built each
 | Grid | 361 (60.0 fps) | 16.67 / 18.62 / 18.68 ms | 0 | 0.79 ms a frame |
 | List | 361 (60.0 fps) | 16.67 / 18.69 / 18.78 ms | 0 | 0.68 ms a frame |
 
-That is the display's limit, with most of each frame to spare on the part the app controls; a 120 Hz display has not been tried. Colours are one `Theme` constant in [`theme.rs`](crates/ludy-app/src/theme.rs); there is no dark variant yet, and no thumbnails.
+That is the display's limit. "Building elements" is only the app's own share of a frame (constructing the window and the visible rows); gpui's layout and painting were not timed separately, and a 120 Hz display has not been tried. Colours are one `Theme` constant in [`theme.rs`](crates/ludy-app/src/theme.rs); there is no dark variant yet, and no thumbnails.
 
 ## How it works
 
@@ -178,11 +179,12 @@ Checked against real mounts on macOS 27.0.1, with the CLI and with the app (`--m
 Checked by hand, without a mount:
 
 - The server, with `curl`: upload of the 95 MB video, range reads compared against the source file, and mid-file bytes of a synthetic 50 GB object compared against the Python generator.
-- The app, from screenshots of every surface: the drives screen with a drive mounted and not, the folder grid and list, a context menu and the share dialog (the last two opened with `--demo`).
+- The app, from screenshots: the drives screen with a drive mounted and not, the folder grid and list, the drive and file context menus, the share, fork, new-folder and versions dialogs, and an 820 by 560 window.
+- Clicks, posted to the app's own window with `--click` and checked in a screenshot after each: Mount on a card (the drive mounted), the eject icon (it ejected), Open, a folder tile, a breadcrumb, the grid/list toggle, a sidebar drive, the new-folder button, the card's "..." menu and Fork in it, and Versions in a file's menu.
 
 **Not verified:**
 
-- **Clicks in the app.** Every button is wired and compiles, and Mount and quit-ejects were exercised through `--mount` and SIGTERM, which call the same engine functions. No button, menu or dialog has been clicked: synthetic clicks need an Accessibility permission this build was not given.
+- **The rest of the app's controls.** Right-click itself (the injected event does not carry the right button, so the file menu was opened with `--demo`), typing in a dialog, Import, Show in Finder, Open in Terminal, Rename, Delete, Share's Send invite, Restore, Keep offline, Clear, and scrolling by hand.
 - **The Quick Look panel** (space bar in the Finder). `qlmanage -p` crashes on any movie on this macOS version, the local file included, so playback was checked with AVPlayer instead.
 - **Dragging a file in with the Finder**, and how quickly a Finder window redraws after a server-side change. Both were checked from the shell only.
 - **Another app raising the "network volume" prompt during an eject.** The watchdog path for that is written but has only been reasoned about.
