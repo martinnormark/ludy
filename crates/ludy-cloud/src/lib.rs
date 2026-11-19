@@ -10,6 +10,7 @@
 //! * synthetic objects generate their bytes from the offset (see [`synth`])
 //! * configurable latency and bandwidth, and a log of every range served
 
+pub mod shard;
 pub mod store;
 pub mod synth;
 
@@ -24,13 +25,15 @@ use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::extract::DefaultBodyLimit;
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use shard::Manifest;
 use store::{Content, Store, StoreError, Version};
 
 /// Size of the pieces a response body is streamed (and throttled) in.
@@ -199,11 +202,15 @@ pub fn router(cloud: Arc<Cloud>) -> Router {
         .route("/_log", get(get_log))
         .route("/_stats", get(get_stats))
         .route("/_config", get(get_stats).put(put_config).post(put_config))
+        .route("/_shards", post(shards_missing))
+        .route("/_shards/{hash}", put(shard_put))
         .route("/{drive}", get(drive_get).put(drive_put).post(drive_post).delete(drive_delete))
         .route(
             "/{drive}/{*key}",
             get(object_get).head(object_head).put(object_put).post(object_post).delete(object_delete),
         )
+        // Shards are up to 16 MiB; object bodies are streamed and unlimited.
+        .layer(DefaultBodyLimit::max(shard::MAX_SHARD as usize + 1024))
         .with_state(cloud)
 }
 
@@ -229,16 +236,21 @@ impl IntoResponse for ApiError {
     }
 }
 
-impl From<StoreError> for ApiError {
-    fn from(e: StoreError) -> Self {
-        let status = match &e {
+impl ApiError {
+    fn status(e: &StoreError) -> StatusCode {
+        match e {
             StoreError::NoSuchDrive | StoreError::NoSuchKey | StoreError::NoSuchVersion => StatusCode::NOT_FOUND,
-            StoreError::DriveExists => StatusCode::CONFLICT,
-            StoreError::BadName(_) => StatusCode::BAD_REQUEST,
+            StoreError::DriveExists | StoreError::MissingShards(_) => StatusCode::CONFLICT,
+            StoreError::BadName(_) | StoreError::BadManifest(_) | StoreError::BadShard(_) => StatusCode::BAD_REQUEST,
             StoreError::Precondition => StatusCode::PRECONDITION_FAILED,
             StoreError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-        ApiError(status, e.to_string())
+        }
+    }
+}
+
+impl From<StoreError> for ApiError {
+    fn from(e: StoreError) -> Self {
+        ApiError(ApiError::status(&e), e.to_string())
     }
 }
 
@@ -261,6 +273,7 @@ async fn get_log(State(c): State<AppState>, Query(q): Params) -> ApiResult {
 }
 
 async fn get_stats(State(c): State<AppState>) -> ApiResult {
+    let shards = c.store.shard_stats();
     Ok(Json(json!({
         "requests": c.counters.requests.load(Ordering::Relaxed),
         "bytes_out": c.counters.bytes_out.load(Ordering::Relaxed),
@@ -268,6 +281,9 @@ async fn get_stats(State(c): State<AppState>) -> ApiResult {
         "latency_ms": c.latency_ms.load(Ordering::Relaxed),
         "mbps": c.throttle.bytes_per_sec.load(Ordering::Relaxed) * 8 / 1_000_000,
         "uptime_s": c.started.elapsed().as_secs(),
+        "shards": shards.shards,
+        "shard_bytes": shards.shard_bytes,
+        "manifests": shards.manifests,
     }))
     .into_response())
 }
@@ -280,6 +296,39 @@ async fn put_config(State(c): State<AppState>, Query(q): Params) -> ApiResult {
         c.throttle.bytes_per_sec.store(v * 1_000_000 / 8, Ordering::Relaxed);
     }
     get_stats(State(c)).await
+}
+
+// ---------------------------------------------------------------- shards
+
+/// `POST /_shards` with a JSON array of hashes: which of them the cloud lacks.
+/// A client asks this before uploading, and sends only what is missing.
+async fn shards_missing(State(c): State<AppState>, body: Bytes) -> ApiResult {
+    let t0 = Instant::now();
+    c.latency().await;
+    let hashes: Vec<String> = serde_json::from_slice(&body).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let missing = c.store.missing_shards(&hashes);
+    c.record(&Method::POST, "_shards", &format!("{} of {} missing", missing.len(), hashes.len()), None, StatusCode::OK, 0, t0);
+    Ok(Json(json!({ "missing": missing })).into_response())
+}
+
+/// `PUT /_shards/<sha256>`: store one shard. The body must hash to the name.
+async fn shard_put(State(c): State<AppState>, Path(hash): Path<String>, body: Bytes) -> ApiResult {
+    let t0 = Instant::now();
+    c.latency().await;
+    let n = body.len() as u64;
+    c.throttle.take(n).await;
+    c.counters.bytes_in.fetch_add(n, Ordering::Relaxed);
+    let store = c.clone();
+    let name = hash.clone();
+    let res = tokio::task::spawn_blocking(move || store.store.put_shard(&name, &body)).await.expect("shard store does not panic");
+    let status = match &res {
+        Ok(true) => StatusCode::CREATED,
+        Ok(false) => StatusCode::OK,
+        Err(e) => ApiError::status(e),
+    };
+    c.record(&Method::PUT, "_shards", &hash, (n > 0).then(|| (0, n - 1)), status, n, t0);
+    res?;
+    Ok(status.into_response())
 }
 
 // ---------------------------------------------------------------- drives
@@ -356,13 +405,13 @@ async fn drive_post(State(c): State<AppState>, Path(drive): Path<String>, Query(
 
 // ---------------------------------------------------------------- objects
 
-fn version_headers(v: &Version) -> HeaderMap {
+fn version_headers(c: &Cloud, v: &Version) -> HeaderMap {
     let mut h = HeaderMap::new();
     h.insert("etag", HeaderValue::from_str(&format!("\"{}\"", v.id)).unwrap());
     h.insert("x-ludy-version", HeaderValue::from_str(&v.id).unwrap());
     h.insert("x-ludy-mtime-ms", HeaderValue::from(v.mtime_ms));
     h.insert("accept-ranges", HeaderValue::from_static("bytes"));
-    if matches!(v.content, Content::Synthetic { .. }) {
+    if c.store.synthetic_bytes(v) > 0 {
         h.insert("x-ludy-synthetic", HeaderValue::from_static("1"));
     }
     h
@@ -400,7 +449,7 @@ async fn object_head(State(c): State<AppState>, Path((drive, key)): Path<(String
     let status = if v.is_ok() { StatusCode::OK } else { StatusCode::NOT_FOUND };
     c.record(&Method::HEAD, &drive, &key, None, status, 0, t0);
     let v = v?;
-    let mut h = version_headers(&v);
+    let mut h = version_headers(&c, &v);
     h.insert("content-length", HeaderValue::from(v.size));
     Ok((StatusCode::OK, h).into_response())
 }
@@ -426,6 +475,16 @@ async fn object_get(
             return Err(e.into());
         }
     };
+    // `?manifest`: the segments behind this version, for patch uploads.
+    if q.contains_key("manifest") {
+        c.latency().await;
+        let found = c.store.manifest_of(&v);
+        let status = if found.is_some() { StatusCode::OK } else { StatusCode::NOT_FOUND };
+        c.record(&Method::GET, &drive, &format!("{key}?manifest"), None, status, 0, t0);
+        let (id, manifest) = found.ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "this version has no manifest".into()))?;
+        let body = json!({ "id": id, "version": v.id, "size": manifest.size, "segments": manifest.segments });
+        return Ok((StatusCode::OK, version_headers(&c, &v), Json(body)).into_response());
+    }
     // `If-Match` lets a client insist on the version it has cached blocks for.
     if let Some(want) = headers.get("if-match").and_then(|v| v.to_str().ok()) {
         if want.trim_matches('"') != v.id {
@@ -441,7 +500,7 @@ async fn object_get(
     let len = if v.size == 0 { 0 } else { end - start + 1 };
     c.latency().await;
 
-    let mut h = version_headers(&v);
+    let mut h = version_headers(&c, &v);
     h.insert("content-length", HeaderValue::from(len));
     if status == StatusCode::PARTIAL_CONTENT {
         h.insert("content-range", HeaderValue::from_str(&format!("bytes {start}-{end}/{}", v.size)).unwrap());
@@ -473,6 +532,7 @@ async fn object_get(
 async fn object_put(
     State(c): State<AppState>,
     Path((drive, key)): Path<(String, String)>,
+    Query(q): Params,
     headers: HeaderMap,
     body: Body,
 ) -> ApiResult {
@@ -486,30 +546,62 @@ async fn object_put(
         let seed = headers.get("x-ludy-synthetic-seed").and_then(|v| v.to_str().ok()).and_then(|s| s.parse().ok()).unwrap_or(0);
         let v = c.store.commit(&drive, &key, size, Content::Synthetic { seed }, if_match.as_deref(), mtime_ms).await?;
         c.record(&Method::PUT, &drive, &key, None, StatusCode::CREATED, 0, t0);
-        return Ok((StatusCode::CREATED, version_headers(&v)).into_response());
+        return Ok((StatusCode::CREATED, version_headers(&c, &v)).into_response());
     }
 
     c.store.check_drive(&drive).await?;
-    let mut upload = c.store.begin_upload().await.map_err(StoreError::Io)?;
-    let mut stream = body.into_data_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
-        c.throttle.take(chunk.len() as u64).await;
-        c.counters.bytes_in.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-        upload.write(&chunk).await.map_err(StoreError::Io)?;
-    }
-    let (size, content) = upload.finish().await.map_err(StoreError::Io)?;
-    let v = match c.store.commit(&drive, &key, size, content.clone(), if_match.as_deref(), mtime_ms).await {
+
+    // `?manifest`: the body is a manifest whose shards were uploaded already
+    // (or were in the cloud to begin with). Committing it moves no content.
+    let (size, content, new_shards, new_bytes) = if q.contains_key("manifest") {
+        let raw = axum::body::to_bytes(body, 64 << 20).await.map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
+        let manifest: Manifest = serde_json::from_slice(&raw).map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("manifest: {e}")))?;
+        match c.store.put_manifest(&manifest) {
+            Ok(id) => (manifest.size, Content::Manifest { id }, 0, 0),
+            Err(StoreError::MissingShards(missing)) => {
+                c.record(&Method::PUT, &drive, &key, None, StatusCode::CONFLICT, 0, t0);
+                return Ok((StatusCode::CONFLICT, Json(json!({ "error": "shards missing", "missing": missing }))).into_response());
+            }
+            Err(e) => {
+                c.record(&Method::PUT, &drive, &key, None, ApiError::status(&e), 0, t0);
+                return Err(e.into());
+            }
+        }
+    } else {
+        // A plain body: receive it, then cut it into shards here.
+        let mut upload = c.store.begin_upload().await.map_err(StoreError::Io)?;
+        let mut stream = body.into_data_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
+            c.throttle.take(chunk.len() as u64).await;
+            c.counters.bytes_in.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            upload.write(&chunk).await.map_err(StoreError::Io)?;
+        }
+        let tmp = upload.finish().await.map_err(StoreError::Io)?;
+        let (cloud, path) = (c.clone(), tmp.clone());
+        let ingested = tokio::task::spawn_blocking(move || cloud.store.ingest(&path)).await.expect("ingest does not panic");
+        let _ = tokio::fs::remove_file(&tmp).await;
+        let i = ingested?;
+        (i.size, i.content, i.new_shards, i.new_bytes)
+    };
+
+    let committed = c.store.commit(&drive, &key, size, content.clone(), if_match.as_deref(), mtime_ms).await;
+    // The version now holds its own reference (or the commit failed).
+    c.store.release(&content);
+    let v = match committed {
         Ok(v) => v,
         Err(e) => {
-            c.store.discard(&content).await;
-            let status = if matches!(e, StoreError::Precondition) { StatusCode::PRECONDITION_FAILED } else { StatusCode::NOT_FOUND };
-            c.record(&Method::PUT, &drive, &key, None, status, size, t0);
+            c.record(&Method::PUT, &drive, &key, None, ApiError::status(&e), size, t0);
             return Err(e.into());
         }
     };
-    c.record(&Method::PUT, &drive, &key, (size > 0).then(|| (0, size - 1)), StatusCode::CREATED, size, t0);
-    Ok((StatusCode::CREATED, version_headers(&v)).into_response())
+    // What crossed the wire in this request: the body of a plain PUT, nothing for a manifest.
+    let wire = if q.contains_key("manifest") { 0 } else { size };
+    c.record(&Method::PUT, &drive, &key, (wire > 0).then(|| (0, wire - 1)), StatusCode::CREATED, wire, t0);
+    let mut h = version_headers(&c, &v);
+    h.insert("x-ludy-new-shards", HeaderValue::from(new_shards));
+    h.insert("x-ludy-new-bytes", HeaderValue::from(new_bytes));
+    Ok((StatusCode::CREATED, h).into_response())
 }
 
 /// `POST /<drive>/<key>?rename=<new key>` moves an object (or a whole folder
@@ -526,7 +618,7 @@ async fn object_post(State(c): State<AppState>, Path((drive, key)): Path<(String
     if let Some(version) = q.get("restore") {
         let v = c.store.restore(&drive, &key, version).await?;
         c.record(&Method::POST, &drive, &format!("{key} restore {version}"), None, StatusCode::OK, 0, t0);
-        return Ok((StatusCode::OK, version_headers(&v)).into_response());
+        return Ok((StatusCode::OK, version_headers(&c, &v)).into_response());
     }
     Err(ApiError(StatusCode::BAD_REQUEST, "expected ?rename= or ?restore=".into()))
 }

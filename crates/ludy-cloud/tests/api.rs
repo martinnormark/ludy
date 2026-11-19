@@ -2,6 +2,7 @@
 
 use std::time::{Duration, Instant};
 
+use ludy_cloud::shard::sha256_hex;
 use ludy_cloud::{synth, Config};
 use reqwest::{Client, StatusCode};
 use serde_json::Value;
@@ -35,9 +36,36 @@ impl Server {
     async fn json(&self, path: &str) -> Value {
         self.http.get(format!("{}{path}", self.base)).send().await.unwrap().json().await.unwrap()
     }
-    fn blob_count(&self) -> usize {
-        std::fs::read_dir(self._dir.path().join("blobs")).unwrap().count()
+    /// Shard files on the server's disk: (count, bytes).
+    fn shards(&self) -> (usize, u64) {
+        shard_files(self._dir.path())
     }
+    fn manifest_count(&self) -> usize {
+        std::fs::read_dir(self._dir.path().join("manifests")).unwrap().count()
+    }
+    async fn manifest(&self, drive: &str, key: &str) -> Value {
+        self.json(&format!("/{drive}/{key}?manifest")).await
+    }
+    async fn put_shard(&self, data: &[u8]) -> String {
+        let hash = sha256_hex(data);
+        let r = self.http.put(format!("{}/_shards/{hash}", self.base)).body(data.to_vec()).send().await.unwrap();
+        assert!(r.status().is_success(), "shard put: {}", r.status());
+        hash
+    }
+    async fn commit(&self, key: &str, manifest: &Value) -> reqwest::Response {
+        self.http.put(format!("{}/d/{key}?manifest", self.base)).json(manifest).send().await.unwrap()
+    }
+}
+
+fn shard_files(data: &std::path::Path) -> (usize, u64) {
+    let mut out = (0, 0);
+    for dir in std::fs::read_dir(data.join("shards")).unwrap().flatten() {
+        for f in std::fs::read_dir(dir.path()).unwrap().flatten() {
+            out.0 += 1;
+            out.1 += f.metadata().unwrap().len();
+        }
+    }
+    out
 }
 
 #[tokio::test]
@@ -85,7 +113,7 @@ async fn a_synthetic_50gb_object_serves_any_range_and_uses_no_disk() {
     assert_eq!(&got[..], &synth::bytes(7, off, 5000)[..]);
     let tail = s.get("huge.bin", Some("bytes=-16")).await.bytes().await.unwrap();
     assert_eq!(&tail[..], &synth::bytes(7, size - 16, 16)[..]);
-    assert_eq!(s.blob_count(), 0, "a synthetic object stores nothing");
+    assert_eq!(s.shards(), (0, 0), "a synthetic object stores nothing");
     let drives = s.json("/").await;
     assert_eq!(drives["drives"][0]["bytes"], size);
     assert_eq!(drives["drives"][0]["synthetic_bytes"], size);
@@ -104,13 +132,20 @@ async fn every_put_is_a_new_version_and_old_ones_can_be_restored() {
     let old = s.http.get(format!("{}/d/doc.txt?version={v1}", s.base)).send().await.unwrap().bytes().await.unwrap();
     assert_eq!(&old[..], b"first");
 
-    // Restore = a new version pointing at the old content; no new blob.
-    let blobs = s.blob_count();
+    // Restore = a new version pointing at the old content; nothing is stored.
+    let (shards, manifests) = (s.shards(), s.manifest_count());
     let r = s.http.post(format!("{}/d/doc.txt?restore={v1}", s.base)).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::OK);
     assert_eq!(&s.get("doc.txt", None).await.bytes().await.unwrap()[..], b"first");
-    assert_eq!(s.json("/d/doc.txt?versions").await["versions"].as_array().unwrap().len(), 3);
-    assert_eq!(s.blob_count(), blobs);
+    let versions = s.json("/d/doc.txt?versions").await;
+    let versions = versions["versions"].as_array().unwrap();
+    assert_eq!(versions.len(), 3);
+    assert_eq!((s.shards(), s.manifest_count()), (shards, manifests));
+    // Every version names the one it replaced.
+    assert!(versions[0].get("parent").is_none());
+    assert_eq!(versions[1]["parent"], v1.as_str());
+    assert_eq!(versions[2]["parent"], v2.as_str());
+    assert_eq!(versions[2]["content"], versions[0]["content"]);
 }
 
 #[tokio::test]
@@ -123,8 +158,9 @@ async fn of_two_racing_writers_exactly_one_wins() {
     statuses.sort();
     assert_eq!(statuses, [StatusCode::CREATED, StatusCode::PRECONDITION_FAILED]);
     assert_eq!(s.json("/d/doc.txt?versions").await["versions"].as_array().unwrap().len(), 2);
-    // The loser's upload left no orphan blob behind.
-    assert_eq!(s.blob_count(), 2);
+    // The loser's upload left nothing behind: one shard each for the base and the winner.
+    assert_eq!(s.shards().0, 2);
+    assert_eq!(s.manifest_count(), 2);
 }
 
 #[tokio::test]
@@ -133,13 +169,13 @@ async fn rename_moves_folders_without_copying_and_delete_frees_blobs() {
     s.put("a/one.txt", b"1").await;
     s.put("a/sub/two.txt", b"22").await;
     s.put("b.txt", b"333").await;
-    let blobs = s.blob_count();
+    let shards = s.shards();
     let r = s.http.post(format!("{}/d/a?rename=moved/here", s.base)).send().await.unwrap();
     assert_eq!(r.json::<Value>().await.unwrap()["moved"], 2);
     let listing = s.json("/d").await;
     let keys: Vec<&str> = listing["objects"].as_array().unwrap().iter().map(|o| o["key"].as_str().unwrap()).collect();
     assert_eq!(keys, ["b.txt", "moved/here/one.txt", "moved/here/sub/two.txt"]);
-    assert_eq!(s.blob_count(), blobs);
+    assert_eq!(s.shards(), shards);
 
     // One folder level at a time, the way a file browser asks.
     let level = s.json("/d?prefix=moved/here/&delimiter=/").await;
@@ -148,7 +184,8 @@ async fn rename_moves_folders_without_copying_and_delete_frees_blobs() {
 
     assert_eq!(s.http.delete(format!("{}/d/moved/", s.base)).send().await.unwrap().status(), StatusCode::NO_CONTENT);
     assert_eq!(s.json("/d").await["objects"].as_array().unwrap().len(), 1);
-    assert_eq!(s.blob_count(), 1, "deleted objects release their blobs");
+    assert_eq!(s.shards(), (1, 3), "deleted objects release their shards");
+    assert_eq!(s.manifest_count(), 1);
     assert_eq!(s.http.delete(format!("{}/d/moved/", s.base)).send().await.unwrap().status(), StatusCode::NOT_FOUND);
 }
 
@@ -156,9 +193,9 @@ async fn rename_moves_folders_without_copying_and_delete_frees_blobs() {
 async fn forking_a_drive_copies_no_data_and_the_forks_diverge() {
     let s = server(0, 0).await;
     s.put("film.mov", &vec![7u8; 200_000]).await;
-    let blobs = s.blob_count();
+    let shards = s.shards();
     assert_eq!(s.http.post(format!("{}/d?fork=d-fork", s.base)).send().await.unwrap().status(), StatusCode::OK);
-    assert_eq!(s.blob_count(), blobs, "a fork shares content");
+    assert_eq!(s.shards(), shards, "a fork shares content");
     let drives = s.json("/").await;
     let fork = drives["drives"].as_array().unwrap().iter().find(|d| d["name"] == "d-fork").unwrap();
     assert_eq!(fork["forked_from"], "d");
@@ -167,11 +204,15 @@ async fn forking_a_drive_copies_no_data_and_the_forks_diverge() {
     // Changing the fork leaves the original alone, and vice versa.
     s.http.put(format!("{}/d-fork/film.mov", s.base)).body("recut").send().await.unwrap();
     assert_eq!(s.get("film.mov", None).await.bytes().await.unwrap().len(), 200_000);
-    // Deleting the original keeps the blob the fork's history still uses.
+    // Deleting the original keeps the shards the fork's history still uses.
     s.http.delete(format!("{}/d/film.mov", s.base)).send().await.unwrap();
     let old = s.json("/d-fork/film.mov?versions").await["versions"][0]["id"].as_str().unwrap().to_string();
     let bytes = s.http.get(format!("{}/d-fork/film.mov?version={old}", s.base)).send().await.unwrap().bytes().await.unwrap();
     assert_eq!(bytes.len(), 200_000);
+    // Deleting the fork too leaves only what nothing shares... which is nothing.
+    assert_eq!(s.http.delete(format!("{}/d-fork", s.base)).send().await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(s.shards(), (0, 0));
+    assert_eq!(s.manifest_count(), 0);
 }
 
 #[tokio::test]
@@ -236,4 +277,230 @@ async fn state_survives_a_restart() {
     assert_eq!(body, "persisted");
     let drives: Value = http.get(format!("http://{addr}/")).send().await.unwrap().json().await.unwrap();
     assert_eq!(drives["drives"][0]["shares"][0]["role"], "edit");
+}
+
+// ---------------------------------------------------------------- shards
+
+const MIB: usize = 1 << 20;
+
+#[tokio::test]
+async fn an_object_is_stored_as_shards_and_reads_back_across_their_boundaries() {
+    let s = server(0, 0).await;
+    let body = synth::bytes(21, 0, 24 * MIB);
+    let r = s.put("big.bin", &body).await;
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let new_shards: usize = r.headers()["x-ludy-new-shards"].to_str().unwrap().parse().unwrap();
+    assert_eq!(r.headers()["x-ludy-new-bytes"], (24 * MIB).to_string().as_str());
+
+    let m = s.manifest("d", "big.bin").await;
+    let segments = m["segments"].as_array().unwrap();
+    assert_eq!(m["size"], 24 * MIB);
+    assert_eq!(segments.len(), new_shards);
+    assert!(segments.len() >= 4, "24 MiB in {} shard(s)", segments.len());
+    assert_eq!(s.shards(), (segments.len(), 24 * MIB as u64));
+    // Each shard file is named by the SHA-256 of its bytes.
+    let mut pos = 0usize;
+    for seg in segments {
+        let n = seg["n"].as_u64().unwrap() as usize;
+        assert_eq!(seg["h"], sha256_hex(&body[pos..pos + n]).as_str());
+        pos += n;
+    }
+
+    // Ranges inside a shard, across one boundary, across several, and the tail.
+    let first = segments[0]["n"].as_u64().unwrap() as usize;
+    let second = first + segments[1]["n"].as_u64().unwrap() as usize;
+    for (a, b) in [(0, 99), (first - 10, first + 9), (first - 1, second + 5), (100, 24 * MIB - 1), (24 * MIB - 7, 24 * MIB - 1)] {
+        let r = s.get("big.bin", Some(&format!("bytes={a}-{b}"))).await;
+        assert_eq!(r.status(), StatusCode::PARTIAL_CONTENT);
+        assert!(r.bytes().await.unwrap()[..] == body[a..=b], "range {a}-{b}");
+    }
+    assert!(s.get("big.bin", None).await.bytes().await.unwrap()[..] == body[..]);
+
+    let stats = s.json("/_stats").await;
+    assert_eq!(stats["shards"], segments.len());
+    assert_eq!(stats["shard_bytes"], 24 * MIB);
+    assert_eq!(stats["manifests"], 1);
+}
+
+#[tokio::test]
+async fn identical_content_is_stored_once_across_keys_and_drives() {
+    let s = server(0, 0).await;
+    let body = synth::bytes(22, 0, 6 * MIB);
+    s.put("one.bin", &body).await;
+    let stored = s.shards();
+    assert_eq!(stored.1, 6 * MIB as u64);
+
+    let r = s.put("copies/two.bin", &body).await;
+    assert_eq!(r.headers()["x-ludy-new-shards"], "0");
+    assert_eq!(r.headers()["x-ludy-new-bytes"], "0");
+    s.http.put(format!("{}/other", s.base)).send().await.unwrap();
+    let r = s.http.put(format!("{}/other/three.bin", s.base)).body(body.clone()).send().await.unwrap();
+    assert_eq!(r.headers()["x-ludy-new-bytes"], "0");
+    assert_eq!(s.shards(), stored, "three objects, one copy of the bytes");
+    assert_eq!(s.manifest_count(), 1, "and one manifest");
+    assert_eq!(s.manifest("d", "one.bin").await["id"], s.manifest("other", "three.bin").await["id"]);
+
+    // The bytes stay while any of the three needs them.
+    s.http.delete(format!("{}/d/one.bin", s.base)).send().await.unwrap();
+    s.http.delete(format!("{}/other", s.base)).send().await.unwrap();
+    assert_eq!(s.shards(), stored);
+    assert!(s.get("copies/two.bin", None).await.bytes().await.unwrap()[..] == body[..]);
+    s.http.delete(format!("{}/d/copies/two.bin", s.base)).send().await.unwrap();
+    assert_eq!(s.shards(), (0, 0));
+}
+
+#[tokio::test]
+async fn editing_a_few_kilobytes_adds_only_the_shards_around_the_edit() {
+    let s = server(0, 0).await;
+    let mut body = synth::bytes(23, 0, 24 * MIB);
+    s.put("film.bin", &body).await;
+    let before = s.shards();
+
+    for b in &mut body[12 * MIB..12 * MIB + 4096] {
+        *b ^= 0xff;
+    }
+    let r = s.put("film.bin", &body).await;
+    let new_shards: u64 = r.headers()["x-ludy-new-shards"].to_str().unwrap().parse().unwrap();
+    let new_bytes: u64 = r.headers()["x-ludy-new-bytes"].to_str().unwrap().parse().unwrap();
+    assert!((1..=3).contains(&new_shards), "{new_shards} new shards for a 4 KiB edit");
+    assert!(new_bytes < 8 * MIB as u64, "{new_bytes} new bytes for a 4 KiB edit");
+    assert_eq!(s.shards().1, before.1 + new_bytes, "both versions share everything else");
+    assert!(s.get("film.bin", None).await.bytes().await.unwrap()[..] == body[..]);
+}
+
+#[tokio::test]
+async fn a_shard_must_hash_to_its_name() {
+    let s = server(0, 0).await;
+    let data = b"shard bytes".to_vec();
+    let hash = s.put_shard(&data).await;
+    // Sending it again is harmless and stores nothing new.
+    assert_eq!(s.http.put(format!("{}/_shards/{hash}", s.base)).body(data.clone()).send().await.unwrap().status(), StatusCode::OK);
+
+    let wrong = sha256_hex(b"something else");
+    let r = s.http.put(format!("{}/_shards/{wrong}", s.base)).body(data.clone()).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    for name in ["abc", &hash.to_uppercase(), &format!("..%2F{}", &hash[5..])] {
+        let r = s.http.put(format!("{}/_shards/{name}", s.base)).body(data.clone()).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{name}");
+    }
+
+    let ask = serde_json::json!([hash, wrong, wrong]);
+    let r: Value = s.http.post(format!("{}/_shards", s.base)).json(&ask).send().await.unwrap().json().await.unwrap();
+    assert_eq!(r["missing"], serde_json::json!([wrong]));
+}
+
+#[tokio::test]
+async fn a_manifest_commits_only_when_its_shards_are_present_and_add_up() {
+    let s = server(0, 0).await;
+    let (a, b) = (synth::bytes(31, 0, 300_000), synth::bytes(32, 0, 500_000));
+    let ha = s.put_shard(&a).await;
+    let hb = sha256_hex(&b);
+    let manifest = serde_json::json!({ "size": 800_000, "segments": [{ "h": ha, "n": 300_000 }, { "h": hb, "n": 500_000 }] });
+
+    let r = s.commit("joined.bin", &manifest).await;
+    assert_eq!(r.status(), StatusCode::CONFLICT);
+    assert_eq!(r.json::<Value>().await.unwrap()["missing"], serde_json::json!([hb]));
+    assert_eq!(s.get("joined.bin", None).await.status(), StatusCode::NOT_FOUND);
+
+    s.put_shard(&b).await;
+    let r = s.commit("joined.bin", &manifest).await;
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let version = r.headers()["x-ludy-version"].to_str().unwrap().to_string();
+    let body = s.get("joined.bin", None).await.bytes().await.unwrap();
+    assert!(body[..300_000] == a[..] && body[300_000..] == b[..]);
+    let r = s.get("joined.bin", Some("bytes=299990-300009")).await.bytes().await.unwrap();
+    assert!(r[..10] == a[299_990..] && r[10..] == b[..10]);
+
+    // Lengths that do not add up, or do not match the stored shard, are refused.
+    let short = serde_json::json!({ "size": 700_000, "segments": [{ "h": ha, "n": 300_000 }, { "h": hb, "n": 500_000 }] });
+    assert_eq!(s.commit("bad.bin", &short).await.status(), StatusCode::BAD_REQUEST);
+    let lying = serde_json::json!({ "size": 10, "segments": [{ "h": ha, "n": 10 }] });
+    assert_eq!(s.commit("bad.bin", &lying).await.status(), StatusCode::BAD_REQUEST);
+
+    // if-match applies to manifest commits like any other.
+    let only_a = serde_json::json!({ "size": 300_000, "segments": [{ "h": ha, "n": 300_000 }] });
+    let stale = s.http.put(format!("{}/d/joined.bin?manifest", s.base)).header("if-match", "0000").json(&only_a).send().await.unwrap();
+    assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+    let fresh = s.http.put(format!("{}/d/joined.bin?manifest", s.base)).header("if-match", version).json(&only_a).send().await.unwrap();
+    assert_eq!(fresh.status(), StatusCode::CREATED);
+    assert_eq!(s.get("joined.bin", None).await.bytes().await.unwrap().len(), 300_000);
+}
+
+#[tokio::test]
+async fn a_manifest_can_mix_stored_shards_with_synthetic_ranges() {
+    let s = server(0, 0).await;
+    // A 50 GB synthetic object with 300 KB of real bytes patched in at 25 GiB + 3.
+    let size: u64 = 50 << 30;
+    let at: u64 = (25 << 30) + 3;
+    s.http.put(format!("{}/d/huge.braw", s.base)).header("x-ludy-synthetic-size", size).header("x-ludy-synthetic-seed", 7).send().await.unwrap();
+    let base = s.manifest("d", "huge.braw").await;
+    assert_eq!(base["segments"], serde_json::json!([{ "seed": 7, "off": 0, "n": size }]));
+
+    let patch = synth::bytes(99, 0, 300_000);
+    let h = s.put_shard(&patch).await;
+    let manifest = serde_json::json!({ "size": size, "segments": [
+        { "seed": 7, "off": 0, "n": at },
+        { "h": h, "n": 300_000 },
+        { "seed": 7, "off": at + 300_000, "n": size - at - 300_000 },
+    ]});
+    assert_eq!(s.commit("huge.braw", &manifest).await.status(), StatusCode::CREATED);
+    assert_eq!(s.shards(), (1, 300_000), "the 50 GB around the patch take no disk");
+
+    let r = s.get("huge.braw", Some(&format!("bytes={}-{}", at - 16, at + 300_000 + 15))).await;
+    assert_eq!(r.headers()["x-ludy-synthetic"], "1");
+    let got = r.bytes().await.unwrap();
+    assert!(got[..16] == synth::bytes(7, at - 16, 16)[..]);
+    assert!(got[16..300_016] == patch[..]);
+    assert!(got[300_016..] == synth::bytes(7, at + 300_000, 16)[..]);
+    let tail = s.get("huge.braw", Some("bytes=-8")).await.bytes().await.unwrap();
+    assert_eq!(&tail[..], &synth::bytes(7, size - 8, 8)[..]);
+
+    // Listings still count the generated part as synthetic.
+    let listing = s.json("/d").await;
+    assert_eq!(listing["objects"][0]["size"], size);
+    assert_eq!(listing["objects"][0]["synthetic"], true);
+    let drives = s.json("/").await;
+    assert_eq!(drives["drives"][0]["synthetic_bytes"], size - 300_000);
+}
+
+#[tokio::test]
+async fn history_beyond_the_cap_releases_its_shards() {
+    let s = server(0, 0).await;
+    for i in 0..30u32 {
+        s.put("log.txt", format!("revision {i}").as_bytes()).await;
+    }
+    assert_eq!(s.json("/d/log.txt?versions").await["versions"].as_array().unwrap().len(), 25);
+    assert_eq!(s.shards().0, 25);
+    assert_eq!(s.manifest_count(), 25);
+}
+
+#[tokio::test]
+async fn a_restart_keeps_shards_in_use_and_sweeps_orphans() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Config { data_dir: dir.path().to_path_buf(), addr: "127.0.0.1:0".parse().unwrap(), latency_ms: 0, mbps: 0, print_log: false };
+    let http = Client::new();
+    let body = synth::bytes(41, 0, 5 * MIB);
+    let orphan = b"uploaded but never committed".to_vec();
+    let kept;
+    {
+        let (addr, _c, task) = ludy_cloud::serve(cfg.clone()).await.unwrap();
+        http.put(format!("http://{addr}/keep")).send().await.unwrap();
+        http.put(format!("http://{addr}/keep/a.bin")).body(body.clone()).send().await.unwrap();
+        http.post(format!("http://{addr}/keep?fork=copy")).send().await.unwrap();
+        kept = shard_files(dir.path());
+        let r = http.put(format!("http://{addr}/_shards/{}", sha256_hex(&orphan))).body(orphan.clone()).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED);
+        assert_eq!(shard_files(dir.path()).0, kept.0 + 1);
+        task.abort();
+    }
+    let (addr, _c, _task) = ludy_cloud::serve(cfg).await.unwrap();
+    assert_eq!(shard_files(dir.path()), kept, "the orphan is gone, the rest stayed");
+    let got = http.get(format!("http://{addr}/keep/a.bin")).send().await.unwrap().bytes().await.unwrap();
+    assert!(got[..] == body[..]);
+
+    // Reference counts were rebuilt: the fork keeps the shards alive, then nothing does.
+    http.delete(format!("http://{addr}/keep/a.bin")).send().await.unwrap();
+    assert_eq!(shard_files(dir.path()), kept);
+    http.delete(format!("http://{addr}/copy")).send().await.unwrap();
+    assert_eq!(shard_files(dir.path()), (0, 0));
 }
