@@ -145,13 +145,13 @@ A plain `PUT` with a body still works, for `curl`: the server cuts it into shard
 
 | Crate | What it is |
 |---|---|
-| [`ludy-proto`](crates/ludy-proto) | What a client and the cloud agree on: the JSON types of the HTTP API, the shard cutting rules and manifests, synthetic content. No network or async code |
+| [`ludy-proto`](crates/ludy-proto) | What a client and the cloud agree on: the JSON types both sides already shared (listings, the change feed, versions, the request log), the shard cutting rules and manifests, synthetic content. No network or async code. The commit reply, the server stats and the request bodies are still written out separately on each side |
 | [`ludy-cloud`](crates/ludy-cloud) | The simulated cloud: library plus the `ludy-cloud` server binary |
 | [`ludy-core`](crates/ludy-core) | The engine: cloud client, block cache, drive filesystem, patch planner; with the `mount` feature (on by default) also the NFS adapter, the mount manager and the desktop `Engine` |
 | [`ludy-app`](crates/ludy-app) | The gpui app |
 | [`ludy-cli`](crates/ludy-cli) | `ludy`, the engine without a window |
 
-**Other clients.** The engine does not depend on the server: `ludy-core` uses `ludy-proto` for the wire types, and `ludy-cloud` only in its tests. Built with `--no-default-features`, `ludy-core` is the part that is not tied to macOS or to NFS (`CloudClient`, `BlockCache`, `DriveFs`, the journal, the patch planner), and its tests pass in that build (23 unit, 19 engine, 23 chaos; the one left out tests the NFS adapter). That is the piece a second client would link: it would put its own front end (on iOS, a File Provider extension) where [`nfs.rs`](crates/ludy-core/src/nfs.rs) is now. It has only been built for macOS. A client that does not want the engine at all can use the HTTP API directly: folder listings with `prefix` and `delimiter`, `Range` reads, a plain `PUT`. The cloud has no sign-in, no HTTPS and no CORS headers yet, and the engine's HTTP client is built without TLS.
+**Other clients.** The engine does not depend on the server: `ludy-core` uses `ludy-proto` for the wire types, and `ludy-cloud` only in its tests. Built with `--no-default-features`, `ludy-core` is the part with no NFS and no macOS-specific code, though it does use Unix file calls (`CloudClient`, `BlockCache`, `DriveFs`, the journal, the patch planner), and its tests pass in that build (23 unit, 19 engine, 23 chaos; the one left out tests the NFS adapter). That is the piece a second client would link: it would put its own front end (on iOS, a File Provider extension) where [`nfs.rs`](crates/ludy-core/src/nfs.rs) is now. It has only been built for macOS. A client that does not want the engine at all can use the HTTP API directly: folder listings with `prefix` and `delimiter`, `Range` reads, a plain `PUT`. The cloud has no sign-in, no HTTPS and no CORS headers yet, and the engine's HTTP client is built without TLS.
 
 ## What works, and how it was checked
 
