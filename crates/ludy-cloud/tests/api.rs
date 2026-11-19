@@ -678,3 +678,47 @@ async fn a_patch_can_carry_its_shards_in_the_commit_request() {
     assert!(got[..400_000] == old[..] && got[400_000..] == new[..]);
     assert_eq!(s.shards(), (2, 700_000));
 }
+
+#[tokio::test]
+async fn the_log_is_folded_into_the_snapshot_and_old_lines_are_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Config { data_dir: dir.path().to_path_buf(), addr: "127.0.0.1:0".parse().unwrap(), latency_ms: 0, mbps: 0, print_log: false };
+    let http = Client::new();
+    let log = dir.path().join("drives/d.log");
+    let (before, stale);
+    {
+        let (addr, cloud, task) = ludy_cloud::serve(cfg.clone()).await.unwrap();
+        http.put(format!("http://{addr}/d")).send().await.unwrap();
+        // More commits than the log holds before it is folded: adds, new versions, deletes.
+        for i in 0..4_100u64 {
+            let key = format!("clips/clip_{:04}.mov", i % 3_000);
+            cloud.store.commit("d", &key, 1000 + i, ludy_cloud::store::Content::Synthetic { seed: i }, None, None).await.unwrap();
+            if i % 500 == 499 {
+                cloud.store.delete("d", &format!("clips/clip_{:04}.mov", i % 3_000 - 7)).await.unwrap();
+            }
+            if i == 3_990 {
+                // Just before the fold: keep a copy of the log as it was.
+                std::fs::copy(&log, dir.path().join("old.log")).unwrap();
+            }
+        }
+        let lines = std::fs::read_to_string(&log).unwrap().lines().count();
+        assert!(lines < 200, "the log was folded into the snapshot; {lines} lines since");
+        before = http.get(format!("http://{addr}/d")).send().await.unwrap().json::<Value>().await.unwrap();
+        stale = std::fs::read_to_string(dir.path().join("old.log")).unwrap();
+        task.abort();
+    }
+    assert!(before["objects"].as_array().unwrap().len() > 2_900);
+    for round in 0..2 {
+        if round == 1 {
+            // A crash between writing the snapshot and dropping the log leaves
+            // lines the snapshot already covers. They must change nothing.
+            let current = std::fs::read_to_string(&log).unwrap();
+            std::fs::write(&log, format!("{stale}{current}")).unwrap();
+        }
+        let (addr, _c, task) = ludy_cloud::serve(cfg.clone()).await.unwrap();
+        let after = http.get(format!("http://{addr}/d")).send().await.unwrap().json::<Value>().await.unwrap();
+        assert_eq!(after["seq"], before["seq"], "round {round}");
+        assert!(after["objects"] == before["objects"], "round {round}: the listing changed across a restart");
+        task.abort();
+    }
+}

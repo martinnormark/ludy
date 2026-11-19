@@ -470,6 +470,22 @@ impl Tree {
         }
     }
 
+    /// A local delete or move may have taken the last thing out of `dir`.
+    /// The person looking at it expects the folder to stay, so give it a
+    /// marker object (returned as the key to create) unless it has one.
+    fn keep_emptied(&mut self, dir: u64) -> Option<String> {
+        if dir == ROOT_ID || self.marked.contains(&dir) {
+            return None;
+        }
+        let Kind::Dir(children) = &self.nodes.get(&dir)?.kind else { return None };
+        let empty = children.values().all(|c| matches!(self.nodes.get(c).map(|n| &n.kind), Some(Kind::File(f)) if f.local_only));
+        if !empty || is_local_only(&self.nodes[&dir].name) {
+            return None;
+        }
+        self.marked.insert(dir);
+        Some(format!("{}/", self.key_of(dir)))
+    }
+
     fn has_unsynced(&self) -> bool {
         self.busy
             || !self.ops.is_empty()
@@ -1324,6 +1340,9 @@ impl DriveFs {
         };
         drop_local(t.detach(id));
         t.ops.extend(op);
+        if let Some(key) = t.keep_emptied(dir) {
+            t.ops.push_back(NsOp::Mkdir { key });
+        }
         self.persist_ops(&t);
         self.readahead.lock().unwrap().remove(&id);
         Ok(())
@@ -1393,6 +1412,12 @@ impl DriveFs {
                 t.ops.push_back(NsOp::Rename { from: old_key, to: new_key });
             }
             self.persist_ops(&t);
+        }
+        if from_dir != to_dir {
+            if let Some(key) = t.keep_emptied(from_dir) {
+                t.ops.push_back(NsOp::Mkdir { key });
+                self.persist_ops(&t);
+            }
         }
         // Journaled files under the moved node have a new path to be found by.
         let mut stack = vec![id];
@@ -1516,7 +1541,7 @@ impl DriveFs {
                 if !self.tree.lock().unwrap().ops.is_empty() {
                     break;
                 }
-                let results = futures_util::future::join_all(batch.iter().map(|id| self.upload(*id))).await;
+                let results = futures_util::future::join_all(batch.iter().map(|id| self.upload(*id, force))).await;
                 worked |= results.iter().any(|r| matches!(r, Ok(true)));
                 // A failure usually means the cloud is away: come back later
                 // rather than spin. The files that did upload are done.
@@ -1725,7 +1750,7 @@ impl DriveFs {
     }
 
     /// Publish one journaled file as a new version.
-    async fn upload(self: &Arc<Self>, id: u64) -> FsResult<bool> {
+    async fn upload(self: &Arc<Self>, id: u64, force: bool) -> FsResult<bool> {
         let (key, size, gen, mtime_ms, snap, needs_base) = {
             let mut t = self.tree.lock().unwrap();
             // The node's path is the right key only once every queued rename
@@ -1738,6 +1763,10 @@ impl DriveFs {
             let mtime_ms = node.mtime_ms;
             let f = t.file_mut(id)?;
             let Some(l) = &f.local else { return Ok(false) };
+            // It was quiet when this pass chose it; it may have been written since.
+            if f.uploading || !(force || l.last_write.elapsed() >= UPLOAD_QUIET) {
+                return Ok(false);
+            }
             let snap = ReadSnap::Local { file: l.file.clone(), extents: l.extents.clone(), base: l.base.clone(), base_len: l.base_len };
             let needs_base = l.base.is_some() && !l.extents.covers(0, f.size);
             let out = (key, f.size, l.gen, mtime_ms, snap, needs_base);
@@ -1748,6 +1777,14 @@ impl DriveFs {
 
         let snap = Arc::new(snap);
         let result = self.upload_sharded(&key, size, &snap, mtime_ms).await;
+        if result.is_err() {
+            // The plan may have come from a remembered manifest of a version
+            // the cloud no longer has. Ask the cloud next time; if the
+            // version is gone, that request says so.
+            if let ReadSnap::Local { base: Some((remote, _)), .. } = &*snap {
+                self.manifests.lock().unwrap().remove(&*remote.version);
+            }
+        }
         *self.uploading.lock().unwrap() = None;
 
         let (version, seed) = {

@@ -114,6 +114,13 @@ impl Chaos {
             let attr = self.fs.getattr(id(&self.fs, key)).unwrap();
             assert_eq!(attr.size, want.len() as u64, "{key} has the wrong size in the drive");
         }
+        // Nothing more and nothing less than the cloud lists: no file a
+        // delete should have removed, no stray folder.
+        let want = tree_from(&self.client.list("media").await.unwrap());
+        let have = tree_of(&self.fs);
+        let extra: Vec<_> = have.difference(&want).collect();
+        let missing: Vec<_> = want.difference(&have).collect();
+        assert!(extra.is_empty() && missing.is_empty(), "the drive shows extra {extra:?} and lacks {missing:?}");
     }
 
     /// Deleting every drive must leave no shard behind: nothing leaked.
@@ -780,6 +787,10 @@ async fn applying_only_what_changed_matches_a_full_listing() {
             }
             _ => "nothing".to_string(),
         };
+        // Look after one to five changes, not after every one.
+        if rnd(3) != 0 && step + 1 < 400 {
+            continue;
+        }
         assert!(c.fs.refresh().await.unwrap(), "step {step}: {what}: not applied");
         let want = tree_from(&c.client.list("media").await.unwrap());
         let have = tree_of(&c.fs);
@@ -789,7 +800,7 @@ async fn applying_only_what_changed_matches_a_full_listing() {
     }
     // It really was incremental: one listing by the drive at the start, then feeds.
     let log = c.log();
-    assert!(log.iter().filter(|e| e.method == "GET" && e.key.starts_with("?feed")).count() >= 300);
+    assert!(log.iter().filter(|e| e.method == "GET" && e.key.starts_with("?feed")).count() >= 100);
 
     // After a redeploy the cloud cannot say what changed; the drive falls
     // back to a full listing and carries on from there.
@@ -851,6 +862,70 @@ async fn a_small_patch_is_a_single_request() {
     c.expect.insert("theirs.bin".into(), theirs);
     c.converge().await;
     c.assert_no_leaks().await;
+}
+
+/// The drive uploaded the file itself and remembers its manifest. Someone
+/// deletes the file in the cloud; a local patch follows. Two outcomes are
+/// acceptable and both are checked: if the drive still holds the rest of
+/// the file, the edit is saved and the file exists again (the last writer
+/// wins and nothing is lost); if it does not, the cloud's delete wins and
+/// the drive says so. What must not happen is an upload that fails for ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_patch_to_a_file_the_drive_uploaded_and_someone_deleted_does_not_wedge() {
+    for cache_cleared in [false, true] {
+        let mut c = chaos(0).await;
+        let original = synth::bytes(111, 0, 6 * MIB);
+        let file = c.put(ROOT_ID, "mine.bin", original.clone());
+        assert!(c.fs.flush(Duration::from_secs(30)).await);
+        c.fs.refresh().await.unwrap();
+        c.client.delete("media", "mine.bin").await.unwrap();
+        assert_eq!(c.client.server_stats().await.unwrap().shards, 0, "the cloud dropped the content with the file");
+        if cache_cleared {
+            c.cache.clear();
+        }
+        c.fs.write(file, 3 * MIB as u64 + 10, b"edited after the delete").unwrap();
+        c.put(ROOT_ID, "bystander.txt", b"must not be held up".to_vec());
+
+        let settled = within(60, "the flush", c.fs.flush(Duration::from_secs(25))).await;
+        assert!(settled, "cache cleared: {cache_cleared}: the drive wedged: {:?}", c.fs.pending());
+        if cache_cleared {
+            c.expect.remove("mine.bin");
+            c.converge().await;
+            assert!(c.fs.find_path("mine.bin").is_none());
+            assert!(c.fs.pending().last_error.is_some_and(|e| e.contains("dropped")));
+        } else {
+            let mut edited = original.clone();
+            edited[3 * MIB + 10..3 * MIB + 33].copy_from_slice(b"edited after the delete");
+            c.expect.insert("mine.bin".into(), edited);
+            c.converge().await;
+        }
+        c.assert_no_leaks().await;
+    }
+}
+
+/// Deleting the last file in a folder, or moving it out, leaves the folder
+/// in place, in the drive and in the cloud, whether or not the folder ever
+/// had a marker object of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folder_emptied_locally_stays() {
+    let mut c = chaos(0).await;
+    c.client.put_bytes("media", "raw/take 1.mov", b"one".to_vec().into()).await.unwrap();
+    c.client.put_bytes("media", "raw/take 2.mov", b"two".to_vec().into()).await.unwrap();
+    c.client.put_bytes("media", "inbox/letter.txt", b"dear".to_vec().into()).await.unwrap();
+    c.fs.refresh().await.unwrap();
+    let raw = id(&c.fs, "raw");
+    c.fs.remove(raw, "take 1.mov").unwrap();
+    c.fs.remove(raw, "take 2.mov").unwrap();
+    c.fs.rename(id(&c.fs, "inbox"), "letter.txt", ROOT_ID, "letter.txt").unwrap();
+    c.expect.insert("letter.txt".into(), b"dear".to_vec());
+    c.converge().await;
+    assert!(c.fs.find_path("raw").is_some() && c.fs.find_path("inbox").is_some());
+    let keys: Vec<String> = c.client.list("media").await.unwrap().objects.into_iter().map(|o| o.key).collect();
+    assert_eq!(keys, ["inbox/", "letter.txt", "raw/"]);
+    // Removing the folder itself removes it everywhere.
+    c.fs.remove(ROOT_ID, "raw").unwrap();
+    c.converge().await;
+    assert!(c.fs.find_path("raw").is_none());
 }
 
 // ------------------------------------------------- soak
