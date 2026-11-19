@@ -504,3 +504,43 @@ async fn a_restart_keeps_shards_in_use_and_sweeps_orphans() {
     http.delete(format!("http://{addr}/copy")).send().await.unwrap();
     assert_eq!(shard_files(dir.path()), (0, 0));
 }
+
+#[tokio::test]
+async fn a_data_dir_from_before_shards_still_serves_and_migrates_on_write() {
+    // What the store wrote before shards existed: a catalog whose versions
+    // point at whole-object blobs.
+    let dir = tempfile::tempdir().unwrap();
+    let body = synth::bytes(71, 0, 300_000);
+    std::fs::create_dir_all(dir.path().join("drives")).unwrap();
+    std::fs::create_dir_all(dir.path().join("blobs")).unwrap();
+    std::fs::write(dir.path().join("blobs/01a1f0eaf4510001"), &body).unwrap();
+    let catalog = serde_json::json!({
+        "created_ms": 1795043292193u64, "seq": 2, "forked_from": null, "shares": [],
+        "objects": { "old.bin": [{ "id": "01a1f0eafa0f0002", "size": 300_000, "mtime_ms": 1795043293711u64, "seq": 2,
+                                   "content": { "kind": "blob", "id": "01a1f0eaf4510001" } }] }
+    });
+    std::fs::write(dir.path().join("drives/d.json"), serde_json::to_vec(&catalog).unwrap()).unwrap();
+
+    let cfg = Config { data_dir: dir.path().to_path_buf(), addr: "127.0.0.1:0".parse().unwrap(), latency_ms: 0, mbps: 0, print_log: false };
+    let (addr, _c, _task) = ludy_cloud::serve(cfg).await.unwrap();
+    let (http, base) = (Client::new(), format!("http://{addr}"));
+
+    let r = http.get(format!("{base}/d/old.bin")).header("range", "bytes=1000-1999").send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::PARTIAL_CONTENT);
+    assert!(r.bytes().await.unwrap()[..] == body[1000..2000]);
+    // It has no manifest, and says so without an error.
+    assert_eq!(http.get(format!("{base}/d/old.bin?manifest")).send().await.unwrap().status(), StatusCode::NO_CONTENT);
+
+    // Writing the key stores shards; the blob version stays readable in history.
+    let r = http.put(format!("{base}/d/old.bin")).body("new content").send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+    assert_eq!(http.get(format!("{base}/d/old.bin")).send().await.unwrap().text().await.unwrap(), "new content");
+    let old = http.get(format!("{base}/d/old.bin?version=01a1f0eafa0f0002")).send().await.unwrap().bytes().await.unwrap();
+    assert!(old[..] == body[..]);
+    assert_eq!(shard_files(dir.path()).0, 1);
+
+    // Deleting the key removes the blob along with the shard.
+    assert_eq!(http.delete(format!("{base}/d/old.bin")).send().await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(std::fs::read_dir(dir.path().join("blobs")).unwrap().count(), 0);
+    assert_eq!(shard_files(dir.path()), (0, 0));
+}
