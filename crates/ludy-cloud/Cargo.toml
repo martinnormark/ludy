@@ -18,8 +18,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures-util = "0.3"
 bytes = "1"
-fastcdc = "3"
-sha2 = "0.10"
+ludy-proto = { path = "../ludy-proto" }
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json"] }

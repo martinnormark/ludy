@@ -8,9 +8,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use serde::Deserialize;
 
-pub use ludy_cloud::store::{Changes, DriveInfo, Listing, ObjectInfo, Share, Version};
-pub use ludy_cloud::shard::{Manifest, Segment};
-pub use ludy_cloud::LogEntry;
+pub use ludy_proto::wire::{Changes, DriveInfo, Listing, ObjectInfo, Share, Version};
+pub use ludy_proto::shard::{Manifest, Segment};
+pub use ludy_proto::LogEntry;
 
 use crate::stats::Stats;
 
@@ -371,7 +371,7 @@ impl CloudClient {
         let file = Arc::new(std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?);
         let cut = file.clone();
         let shards: Vec<(u64, u64, String)> = tokio::task::spawn_blocking(move || {
-            ludy_cloud::shard::chunks(&*cut).map(|c| c.map(|c| (c.offset, c.data.len() as u64, c.hash))).collect::<std::io::Result<Vec<_>>>()
+            ludy_proto::shard::chunks(&*cut).map(|c| c.map(|c| (c.offset, c.data.len() as u64, c.hash))).collect::<std::io::Result<Vec<_>>>()
         })
         .await??;
         let manifest = Manifest {

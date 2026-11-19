@@ -399,6 +399,8 @@ async fn pinning_downloads_the_whole_file_and_protects_it_from_eviction() {
     assert_eq!(r.ranges().len(), before, "a pinned file reads without the network");
 }
 
+// Only with the `mount` feature: the rest of this file is the portable engine.
+#[cfg(feature = "mount")]
 mod nfs_adapter {
     use super::*;
     use ludy_core::nfs::NfsDrive;

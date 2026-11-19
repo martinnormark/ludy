@@ -268,7 +268,7 @@ pub async fn wait_quiet(fs: &DriveFs, quiet: Duration, max: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + max;
     loop {
         let last = fs.last_activity_ms.load(std::sync::atomic::Ordering::Relaxed);
-        if ludy_cloud::now_ms().saturating_sub(last) >= quiet.as_millis() as u64 {
+        if ludy_proto::now_ms().saturating_sub(last) >= quiet.as_millis() as u64 {
             return true;
         }
         if tokio::time::Instant::now() >= deadline {

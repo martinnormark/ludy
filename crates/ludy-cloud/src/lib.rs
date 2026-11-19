@@ -11,16 +11,18 @@
 //! * configurable latency and bandwidth, and a log of every range served
 
 pub mod harness;
-pub mod shard;
 pub mod store;
-pub mod synth;
+
+// The wire types and the shard rules live in `ludy-proto`, so a client does
+// not need this crate. They stay reachable under their old paths here.
+pub use ludy_proto::{human, now_ms, shard, synth, LogEntry};
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -31,7 +33,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use bytes::Bytes;
 use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 
 use shard::Manifest;
@@ -51,20 +53,6 @@ pub struct Config {
     pub mbps: u64,
     /// Print each request to stdout.
     pub print_log: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LogEntry {
-    pub n: u64,
-    pub unix_ms: u64,
-    pub method: String,
-    pub drive: String,
-    pub key: String,
-    /// Byte range served or received, when the request carried a body.
-    pub range: Option<(u64, u64)>,
-    pub status: u16,
-    pub bytes: u64,
-    pub ms: u64,
 }
 
 #[derive(Default)]
@@ -198,25 +186,6 @@ impl Cloud {
     /// Log entries with a sequence number greater than `since`.
     pub fn log_since(&self, since: u64) -> Vec<LogEntry> {
         self.log.lock().unwrap().iter().filter(|e| e.n > since).cloned().collect()
-    }
-}
-
-pub fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
-}
-
-pub fn human(n: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut v = n as f64;
-    let mut u = 0;
-    while v >= 1024.0 && u < UNITS.len() - 1 {
-        v /= 1024.0;
-        u += 1;
-    }
-    if u == 0 {
-        format!("{n} B")
-    } else {
-        format!("{v:.1} {}", UNITS[u])
     }
 }
 

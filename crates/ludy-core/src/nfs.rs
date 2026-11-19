@@ -22,7 +22,7 @@ impl NfsDrive {
     pub fn new(fs: Arc<DriveFs>, read_only: bool) -> NfsDrive {
         // SAFETY: getuid/getgid cannot fail and take no arguments.
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-        NfsDrive { fs, uid, gid, generation: ludy_cloud::now_ms() << 8 | (std::process::id() as u64 & 0xff), read_only }
+        NfsDrive { fs, uid, gid, generation: ludy_proto::now_ms() << 8 | (std::process::id() as u64 & 0xff), read_only }
     }
 
     fn fattr(&self, a: &Attr) -> fattr3 {

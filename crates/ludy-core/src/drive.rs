@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use futures_util::future::{BoxFuture, FutureExt, Shared};
 use futures_util::StreamExt;
-use ludy_cloud::shard;
+use ludy_proto::shard;
 use tokio::sync::Semaphore;
 
 use crate::cache::{BlockCache, BLOCK_SIZE};
@@ -270,7 +270,7 @@ pub struct DriveFs {
 }
 
 fn now_ms() -> u64 {
-    ludy_cloud::now_ms()
+    ludy_proto::now_ms()
 }
 
 /// Names Finder and Spotlight create on any volume. They never leave this Mac.

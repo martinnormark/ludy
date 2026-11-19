@@ -2669,12 +2669,11 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bytes",
- "fastcdc",
  "futures-util",
+ "ludy-proto",
  "reqwest",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "tempfile",
  "tokio",
 ]
@@ -2689,12 +2688,23 @@ dependencies = [
  "futures-util",
  "libc",
  "ludy-cloud",
+ "ludy-proto",
  "nfsserve",
  "reqwest",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "ludy-proto"
+version = "0.1.0"
+dependencies = [
+ "fastcdc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

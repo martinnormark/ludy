@@ -5,7 +5,7 @@
 //! manifest that no write touched are kept by reference, and only the
 //! stretches around the writes are read, cut into shards and sent.
 
-use ludy_cloud::shard::Segment;
+use ludy_proto::shard::Segment;
 
 /// One stretch of the new content, in file order.
 #[derive(Clone, Debug, PartialEq, Eq)]
