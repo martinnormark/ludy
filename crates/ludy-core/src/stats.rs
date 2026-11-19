@@ -11,6 +11,8 @@ pub struct Stats {
     pub bytes_down: AtomicU64,
     /// Bytes uploaded to the cloud.
     pub bytes_up: AtomicU64,
+    /// Bytes an upload did not have to send: shards the cloud already held.
+    pub bytes_skipped: AtomicU64,
     /// Bytes handed to applications through the mount.
     pub bytes_read: AtomicU64,
     /// Bytes applications wrote through the mount.
@@ -43,6 +45,8 @@ pub struct StatsSnapshot {
     pub bytes_written: u64,
     pub cache_hit_bytes: u64,
     pub range_requests: u64,
+    /// Bytes uploads did not send because the cloud already had those shards.
+    pub bytes_skipped: u64,
     /// Bytes per second, smoothed.
     pub down_rate: f64,
     pub up_rate: f64,
@@ -82,6 +86,7 @@ impl Stats {
             bytes_written: self.bytes_written.load(Ordering::Relaxed),
             cache_hit_bytes: self.cache_hit_bytes.load(Ordering::Relaxed),
             range_requests: self.range_requests.load(Ordering::Relaxed),
+            bytes_skipped: self.bytes_skipped.load(Ordering::Relaxed),
             down_rate: r.down_rate,
             up_rate: r.up_rate,
         }

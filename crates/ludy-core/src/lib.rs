@@ -6,6 +6,7 @@ pub mod drive;
 pub mod engine;
 pub mod mount;
 pub mod nfs;
+pub mod patch;
 pub mod rangeset;
 pub mod stats;
 

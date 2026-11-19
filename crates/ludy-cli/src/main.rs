@@ -13,7 +13,7 @@ ludy: cloud drives from the terminal
 USAGE:
     ludy drives                              list drives in the cloud
     ludy mkdrive <drive>                     create a drive
-    ludy put <drive> <file> [key]            upload a file
+    ludy put <drive> <file> [key]            upload a file as shards; sends only new ones
     ludy synth <drive> <key> <size> [seed]   add a synthetic object, e.g. 50GB
     ludy log [--follow]                      print the cloud's request log
     ludy mount <drive> [--read-only] [--nobrowse] [--root DIR]
@@ -63,8 +63,15 @@ fn run() -> Result<()> {
                 [k] => k.to_string(),
                 _ => path.file_name().and_then(|n| n.to_str()).context("file has no name")?.to_string(),
             };
-            let c = engine.block_on(client.put_file(drive, &key, &path))?;
-            println!("{drive}/{key} version {}", c.version);
+            // Cut into shards here; only the ones the cloud lacks are sent.
+            let (c, sent) = engine.block_on(client.put_file_sharded(drive, &key, &path))?;
+            println!(
+                "{drive}/{key} version {}: sent {} in {} shard(s), {} already in the cloud",
+                c.version,
+                human(sent.sent_bytes),
+                sent.sent_shards,
+                human(sent.skipped_bytes)
+            );
         }
         ("synth", [drive, key, size, seed @ ..]) => {
             let size = parse_size(size).with_context(|| format!("cannot parse size {size:?}"))?;

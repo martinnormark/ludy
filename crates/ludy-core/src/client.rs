@@ -9,6 +9,7 @@ use bytes::Bytes;
 use serde::Deserialize;
 
 pub use ludy_cloud::store::{DriveInfo, Listing, ObjectInfo, Share, Version};
+pub use ludy_cloud::shard::{Manifest, Segment};
 pub use ludy_cloud::LogEntry;
 
 use crate::stats::Stats;
@@ -49,6 +50,28 @@ pub struct ServerStats {
     pub bytes_in: u64,
     pub latency_ms: u64,
     pub mbps: u64,
+    /// Shards the cloud stores, and the bytes they take on its disk.
+    #[serde(default)]
+    pub shards: u64,
+    #[serde(default)]
+    pub shard_bytes: u64,
+    #[serde(default)]
+    pub manifests: u64,
+}
+
+/// What a sharded upload moved.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct UploadReport {
+    /// Shards sent, and their bytes.
+    pub sent_shards: u64,
+    pub sent_bytes: u64,
+    /// Bytes not sent because the cloud already held those shards.
+    pub skipped_bytes: u64,
+}
+
+#[derive(Deserialize)]
+struct MissingBody {
+    missing: Vec<String>,
 }
 
 /// Percent-encode a key for use in a URL path, keeping `/` as the separator.
@@ -195,6 +218,104 @@ impl CloudClient {
         let version = h.get("x-ludy-version").and_then(|v| v.to_str().ok()).ok_or_else(|| anyhow!("no version in reply"))?;
         let mtime_ms = h.get("x-ludy-mtime-ms").and_then(|v| v.to_str().ok()).and_then(|s| s.parse().ok()).unwrap_or(0);
         Ok(Committed { version: version.to_string(), mtime_ms })
+    }
+
+    // ------------------------------------------------- shards and manifests
+
+    /// The segments behind a version (the current one if `version` is None).
+    /// `Ok(None)` when the version is whole-object content without a manifest.
+    pub async fn manifest(&self, drive: &str, key: &str, version: Option<&str>) -> Result<Option<Manifest>> {
+        let mut req = self.http.get(format!("{}?manifest", self.url(drive, key)));
+        if let Some(v) = version {
+            req = req.query(&[("version", v)]);
+        }
+        let resp = Self::ok(req.send().await?, "manifest").await?;
+        if resp.status() == reqwest::StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+        Ok(Some(resp.json::<Manifest>().await?))
+    }
+
+    /// Which of these shards the cloud does not hold yet.
+    pub async fn missing_shards(&self, hashes: &[String]) -> Result<Vec<String>> {
+        if hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let resp = self.http.post(format!("{}/_shards", self.base)).json(hashes).send().await?;
+        Ok(Self::ok(resp, "missing shards").await?.json::<MissingBody>().await?.missing)
+    }
+
+    /// Upload one shard. The cloud checks that `data` hashes to `hash`.
+    pub async fn put_shard(&self, hash: &str, data: Bytes) -> Result<()> {
+        let n = data.len() as u64;
+        let resp = self.http.put(format!("{}/_shards/{hash}", self.base)).body(data).send().await?;
+        Self::ok(resp, "put shard").await?;
+        Stats::add(&self.stats.bytes_up, n);
+        Ok(())
+    }
+
+    /// Commit `manifest` as the new version of `key`. No content moves. If
+    /// the cloud lacks some of its shards, they come back as `Err(hashes)`.
+    pub async fn commit_manifest(
+        &self,
+        drive: &str,
+        key: &str,
+        manifest: &Manifest,
+        mtime_ms: Option<u64>,
+    ) -> Result<std::result::Result<Committed, Vec<String>>> {
+        let mut req = self.http.put(format!("{}?manifest", self.url(drive, key))).json(manifest);
+        if let Some(m) = mtime_ms {
+            req = req.header("x-ludy-mtime-ms", m);
+        }
+        let resp = req.send().await?;
+        if resp.status() == reqwest::StatusCode::CONFLICT {
+            return Ok(Err(resp.json::<MissingBody>().await?.missing));
+        }
+        let resp = Self::ok(resp, "commit manifest").await?;
+        Ok(Ok(Self::committed(&resp)?))
+    }
+
+    /// Upload a local file as shards: cut it here, ask which shards the cloud
+    /// lacks, send only those, then commit the manifest.
+    pub async fn put_file_sharded(&self, drive: &str, key: &str, path: &Path) -> Result<(Committed, UploadReport)> {
+        let file = Arc::new(std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?);
+        let cut = file.clone();
+        let shards: Vec<(u64, u64, String)> = tokio::task::spawn_blocking(move || {
+            ludy_cloud::shard::chunks(&*cut).map(|c| c.map(|c| (c.offset, c.data.len() as u64, c.hash))).collect::<std::io::Result<Vec<_>>>()
+        })
+        .await??;
+        let manifest = Manifest {
+            size: shards.iter().map(|s| s.1).sum(),
+            segments: shards.iter().map(|(_, n, h)| Segment::Shard { h: h.clone(), n: *n }).collect(),
+        };
+        let mut report = UploadReport::default();
+        let hashes: Vec<String> = shards.iter().map(|s| s.2.clone()).collect();
+        let mut missing: std::collections::HashSet<String> = self.missing_shards(&hashes).await?.into_iter().collect();
+        report.skipped_bytes = shards.iter().filter(|s| !missing.contains(&s.2)).map(|s| s.1).sum();
+        Stats::add(&self.stats.bytes_skipped, report.skipped_bytes);
+        for _ in 0..2 {
+            for (offset, n, hash) in &shards {
+                if !missing.remove(hash) {
+                    continue;
+                }
+                use std::os::unix::fs::FileExt;
+                let (file, offset, n) = (file.clone(), *offset, *n as usize);
+                let data = tokio::task::spawn_blocking(move || {
+                    let mut buf = vec![0u8; n];
+                    file.read_exact_at(&mut buf, offset).map(|_| buf)
+                })
+                .await??;
+                self.put_shard(hash, Bytes::from(data)).await?;
+                report.sent_shards += 1;
+                report.sent_bytes += n as u64;
+            }
+            match self.commit_manifest(drive, key, &manifest, None).await? {
+                Ok(committed) => return Ok((committed, report)),
+                // A shard the cloud had was cleaned up in between: send it too.
+                Err(gone) => missing = gone.into_iter().collect(),
+            }
+        }
+        bail!("put {drive}/{key}: the cloud keeps reporting missing shards")
     }
 
     /// Upload a body of known length. `body` may be a stream.

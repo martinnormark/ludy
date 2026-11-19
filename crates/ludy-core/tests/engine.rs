@@ -464,3 +464,196 @@ mod nfs_adapter {
         assert!(matches!(ro.write(id, 0, b"x").await, Err(nfsstat3::NFS3ERR_ROFS)));
     }
 }
+
+// ---------------------------------------------------------------- shards
+
+const MIB: u64 = 1 << 20;
+
+impl Rig {
+    /// Shard uploads the server has received: (count, bytes).
+    fn shard_puts(&self) -> (usize, u64) {
+        let puts: Vec<LogEntry> = self.cloud.log_since(0).into_iter().filter(|e| e.method == "PUT" && e.drive == "_shards").collect();
+        (puts.len(), puts.iter().map(|e| e.bytes).sum())
+    }
+
+    /// Abort the test process if transfers pass `ceiling` bytes. A wrong
+    /// upload path could stream tens of gigabytes into the temp dir before
+    /// any assertion ran.
+    fn guard_transfers(&self, ceiling: u64) -> tokio::task::JoinHandle<()> {
+        let stats = self.stats.clone();
+        tokio::spawn(async move {
+            loop {
+                let s = stats.sample();
+                if s.bytes_up > ceiling || s.bytes_down > ceiling {
+                    eprintln!("transfer ceiling of {ceiling} bytes passed: up {} down {}", s.bytes_up, s.bytes_down);
+                    std::process::exit(101);
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    }
+
+    async fn remote(&self, key: &str) -> Vec<u8> {
+        let obj = self.client.list("media").await.unwrap().objects.into_iter().find(|o| o.key == key).unwrap();
+        self.client.get_range("media", key, &obj.version, 0, obj.size).await.unwrap().to_vec()
+    }
+}
+
+fn write_all(fs: &DriveFs, file: u64, data: &[u8]) {
+    for (i, piece) in data.chunks(256 * 1024).enumerate() {
+        fs.write(file, i as u64 * 256 * 1024, piece).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_file_uploads_as_shards_and_identical_content_uploads_nothing() {
+    let r = rig().await;
+    let data = synth::bytes(51, 0, 10 * MIB as usize);
+    let a = r.fs.create(ROOT_ID, "a.bin", false).unwrap();
+    write_all(&r.fs, a, &data);
+    assert!(r.fs.flush(Duration::from_secs(30)).await);
+
+    let (count, bytes) = r.shard_puts();
+    assert!(count >= 2, "10 MiB went up as {count} shard(s)");
+    assert_eq!(bytes, 10 * MIB, "every byte was sent once");
+    assert_eq!(r.stats.sample().bytes_up, 10 * MIB);
+    assert_eq!(r.stats.sample().bytes_skipped, 0);
+    assert!(r.remote("a.bin").await == data);
+    let manifest = r.client.manifest("media", "a.bin", None).await.unwrap().unwrap();
+    assert_eq!(manifest.segments.len(), count);
+    // The commit itself carried no content.
+    let commits: Vec<LogEntry> = r.cloud.log_since(0).into_iter().filter(|e| e.method == "PUT" && e.key == "a.bin").collect();
+    assert_eq!(commits.len(), 1, "{commits:?}");
+    assert_eq!(commits[0].bytes, 0);
+
+    // The same bytes under another name: the cloud has every shard already.
+    let b = r.fs.create(ROOT_ID, "copy of a.bin", false).unwrap();
+    write_all(&r.fs, b, &data);
+    assert!(r.fs.flush(Duration::from_secs(30)).await);
+    assert_eq!(r.shard_puts(), (count, bytes), "no shard was sent for the copy");
+    assert_eq!(r.stats.sample().bytes_up, 10 * MIB);
+    assert_eq!(r.stats.sample().bytes_skipped, 10 * MIB);
+    assert!(r.remote("copy of a.bin").await == data);
+    assert_eq!(r.client.server_stats().await.unwrap().shard_bytes, 10 * MIB, "two files, one copy on the server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_small_patch_in_a_large_file_uploads_only_the_shards_it_touches() {
+    let r = rig().await;
+    let mut data = synth::bytes(52, 0, 24 * MIB as usize);
+    r.client.put_bytes("media", "film.bin", data.clone().into()).await.unwrap();
+    r.fs.refresh().await.unwrap();
+    let stored = r.client.server_stats().await.unwrap().shard_bytes;
+    assert_eq!(stored, 24 * MIB);
+    let up_before = r.stats.sample().bytes_up;
+
+    let file = id(&r.fs, "film.bin");
+    let patch = synth::bytes(53, 0, 4096);
+    let at = 12 * MIB as usize + 777;
+    r.fs.write(file, at as u64, &patch).unwrap();
+    data[at..at + 4096].copy_from_slice(&patch);
+    assert!(r.fs.flush(Duration::from_secs(30)).await);
+
+    let (count, sent) = r.shard_puts();
+    assert!((1..=3).contains(&count), "{count} shards sent for a 4 KiB patch");
+    assert!(sent < 8 * MIB, "{sent} bytes sent for a 4 KiB patch in 24 MiB");
+    let s = r.stats.sample();
+    assert_eq!(s.bytes_up - up_before, sent);
+    // Only the touched shard's own bytes were read back from the cloud to re-cut it.
+    assert!(s.bytes_down < 8 * MIB, "{} bytes downloaded to patch 4 KiB", s.bytes_down);
+    assert_eq!(r.client.server_stats().await.unwrap().shard_bytes, stored + sent, "old and new versions share the rest");
+
+    assert!(r.remote("film.bin").await == data);
+    let versions = r.client.versions("media", "film.bin").await.unwrap();
+    assert_eq!(versions.len(), 2);
+    assert_eq!(versions[1].parent.as_deref(), Some(versions[0].id.as_str()));
+    // The old version is still whole.
+    let old = r.client.get_range("media", "film.bin", &versions[0].id, at as u64, 4096).await.unwrap();
+    assert!(old[..] == synth::bytes(52, at as u64, 4096)[..]);
+    // And the mount reads the new one.
+    r.fs.refresh().await.unwrap();
+    let (got, _) = r.fs.read(file, at as u64 - 8, 4112).await.unwrap();
+    assert!(got[..] == data[at - 8..at + 4104]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writing_into_a_50gb_synthetic_file_uploads_only_what_was_written() {
+    let r = rig().await;
+    let guard = r.guard_transfers(64 * MIB);
+    r.client.put_synthetic("media", "raw/take-01.braw", 50 * GIB, 7).await.unwrap();
+    r.fs.refresh().await.unwrap();
+    let file = id(&r.fs, "raw/take-01.braw");
+
+    let (small, large) = (synth::bytes(61, 0, 5000), synth::bytes(62, 0, 600_000));
+    let (at_small, at_large) = (25 * GIB + 3, GIB + 1);
+    r.fs.write(file, at_small, &small).unwrap();
+    r.fs.write(file, at_large, &large).unwrap();
+    assert_eq!(r.fs.getattr(file).unwrap().size, 50 * GIB);
+    assert!(r.fs.flush(Duration::from_secs(30)).await, "{:?}", r.fs.pending());
+
+    let (count, sent) = r.shard_puts();
+    assert_eq!(sent, 605_000, "exactly the written bytes went up, in {count} shard(s)");
+    assert_eq!(r.stats.sample().bytes_down, 0, "nothing had to come down");
+    assert_eq!(r.client.server_stats().await.unwrap().shard_bytes, 605_000);
+
+    let obj = r.client.list("media").await.unwrap().objects.remove(0);
+    assert_eq!(obj.size, 50 * GIB);
+    assert!(obj.synthetic);
+    let manifest = r.client.manifest("media", "raw/take-01.braw", None).await.unwrap().unwrap();
+    assert_eq!(manifest.size, 50 * GIB);
+    assert_eq!(manifest.segments.len(), 3 + count, "synthetic, shards, synthetic, shard, synthetic");
+
+    // From the cloud: the patches, and the generated bytes right around them.
+    for (at, patch) in [(at_small, &small), (at_large, &large)] {
+        let n = patch.len() as u64;
+        let got = r.client.get_range("media", "raw/take-01.braw", &obj.version, at - 16, n + 32).await.unwrap();
+        assert!(got[..16] == synth::bytes(7, at - 16, 16)[..]);
+        assert!(got[16..16 + patch.len()] == patch[..]);
+        assert!(got[16 + patch.len()..] == synth::bytes(7, at + n, 16)[..]);
+    }
+    // Through the drive, after it picked up the new version.
+    r.fs.refresh().await.unwrap();
+    assert_eq!(r.fs.getattr(file).unwrap().size, 50 * GIB);
+    let (got, _) = r.fs.read(file, at_small - 100, 5200).await.unwrap();
+    assert!(got[..100] == synth::bytes(7, at_small - 100, 100)[..]);
+    assert!(got[100..5100] == small[..]);
+    assert!(got[5100..] == synth::bytes(7, at_small + 5000, 100)[..]);
+    let (far, _) = r.fs.read(file, 40 * GIB, 4096).await.unwrap();
+    assert!(far == synth::bytes(7, 40 * GIB, 4096));
+
+    // A second write into the already patched file keeps the first patches.
+    r.fs.write(file, 30 * GIB, b"again").unwrap();
+    assert!(r.fs.flush(Duration::from_secs(30)).await);
+    assert_eq!(r.shard_puts().1, 605_005);
+    let latest = r.client.list("media").await.unwrap().objects.remove(0);
+    let got = r.client.get_range("media", "raw/take-01.braw", &latest.version, at_small, 5000).await.unwrap();
+    assert!(got[..] == small[..]);
+    assert_eq!(&r.client.get_range("media", "raw/take-01.braw", &latest.version, 30 * GIB, 5).await.unwrap()[..], b"again");
+    guard.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn truncating_and_growing_a_sharded_file_keeps_the_untouched_shards() {
+    let r = rig().await;
+    let data = synth::bytes(54, 0, 12 * MIB as usize);
+    r.client.put_bytes("media", "clip.bin", data.clone().into()).await.unwrap();
+    r.fs.refresh().await.unwrap();
+    let file = id(&r.fs, "clip.bin");
+    let first_shard = r.client.manifest("media", "clip.bin", None).await.unwrap().unwrap().segments[0].len();
+
+    // Cut to 7 MiB, then grow to 9 MiB: the last 2 MiB are zeros, not old bytes.
+    r.fs.set_size(file, 7 * MIB).unwrap();
+    r.fs.set_size(file, 9 * MIB).unwrap();
+    r.fs.write(file, 9 * MIB, b"end").unwrap();
+    assert!(r.fs.flush(Duration::from_secs(30)).await);
+
+    let mut expected = data[..7 * MIB as usize].to_vec();
+    expected.resize(9 * MIB as usize, 0);
+    expected.extend_from_slice(b"end");
+    assert!(r.remote("clip.bin").await == expected);
+    let manifest = r.client.manifest("media", "clip.bin", None).await.unwrap().unwrap();
+    assert_eq!(manifest.size, 9 * MIB + 3);
+    assert_eq!(manifest.segments[0].len(), first_shard, "the head of the file was kept by reference");
+    let (_, sent) = r.shard_puts();
+    assert!(sent <= 9 * MIB + 3 - first_shard, "{sent} bytes sent; the first shard should not be among them");
+}

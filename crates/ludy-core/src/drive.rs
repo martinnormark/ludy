@@ -14,10 +14,13 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::future::{BoxFuture, FutureExt, Shared};
+use futures_util::StreamExt;
+use ludy_cloud::shard;
 use tokio::sync::Semaphore;
 
 use crate::cache::{BlockCache, BLOCK_SIZE};
-use crate::client::{CloudClient, Listing};
+use crate::client::{CloudClient, Committed, Listing, Manifest, Segment};
+use crate::patch::{self, Piece as Patch};
 use crate::rangeset::RangeSet;
 use crate::stats::Stats;
 
@@ -28,6 +31,10 @@ const MAX_RUN_BLOCKS: u64 = 8;
 /// Upper bound for how far ahead of a sequential reader we prefetch (8 MiB).
 const MAX_READAHEAD_BLOCKS: u64 = 32;
 const FETCH_PARALLELISM: usize = 8;
+/// How many shards one upload sends at a time.
+const UPLOAD_PARALLELISM: usize = 4;
+/// Read size when streaming a run through the chunker.
+const CUT_READ_BYTES: u64 = 1 << 20;
 /// A written file is uploaded once it has been left alone for this long.
 const UPLOAD_QUIET: Duration = Duration::from_millis(1500);
 
@@ -151,6 +158,31 @@ enum Piece {
 }
 
 /// Everything needed to read a file's bytes without holding the tree lock.
+/// A blocking `Read` over buffers arriving on a channel.
+struct ChannelReader {
+    rx: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl std::io::Read for ChannelReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        while self.pos == self.buf.len() {
+            match self.rx.blocking_recv() {
+                Some(next) => {
+                    self.buf = next?;
+                    self.pos = 0;
+                }
+                None => return Ok(0),
+            }
+        }
+        let n = out.len().min(self.buf.len() - self.pos);
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
 enum ReadSnap {
     Remote { remote: Remote, key: String },
     Local { file: Arc<File>, extents: RangeSet, base: Option<(Remote, String)>, base_len: u64 },
@@ -964,6 +996,134 @@ impl DriveFs {
         worked
     }
 
+    /// Send a journaled file to the cloud as shards, moving only what the
+    /// cloud does not already hold.
+    ///
+    /// The new content is planned as a patch over the version underneath:
+    /// segments no write touched are kept by reference, and only the runs
+    /// around the writes are read (journal over base) and cut into shards.
+    /// Of those, only the ones the cloud lacks are sent. Then the manifest is
+    /// committed. A small write into a 50 GB file moves a shard or two.
+    async fn upload_sharded(self: &Arc<Self>, key: &str, size: u64, snap: &Arc<ReadSnap>, mtime_ms: u64) -> anyhow::Result<Committed> {
+        let ReadSnap::Local { extents, base, base_len, .. } = &**snap else {
+            anyhow::bail!("{key} has no local changes to upload");
+        };
+        let whole = |size: u64| if size == 0 { Vec::new() } else { vec![Patch::Run { start: 0, end: size }] };
+        let pieces = match base {
+            // Everything was rewritten locally: the old version does not matter.
+            Some((remote, base_key)) if size > 0 && !extents.covers(0, size) => {
+                match self.client.manifest(&self.name, base_key, Some(&remote.version)).await? {
+                    Some(m) => {
+                        let dirty: Vec<(u64, u64)> = extents.segments(0, size).into_iter().filter(|s| s.2).map(|s| (s.0, s.1)).collect();
+                        patch::plan(&m.segments, (*base_len).min(remote.size), size, &dirty)
+                    }
+                    // Whole-object content from before shards: read it all.
+                    None => whole(size),
+                }
+            }
+            _ => whole(size),
+        };
+
+        // Pass 1: cut every run into shards, keeping only (offset, length, hash).
+        let mut manifest = Manifest { size, segments: Vec::with_capacity(pieces.len()) };
+        let mut fresh: Vec<(u64, u64, String)> = Vec::new();
+        for piece in pieces {
+            match piece {
+                Patch::Keep(seg) => manifest.segments.push(seg),
+                Patch::Run { start, end } => {
+                    for (offset, n, hash) in self.cut_run(snap, start, end).await? {
+                        manifest.segments.push(Segment::Shard { h: hash.clone(), n });
+                        fresh.push((offset, n, hash));
+                    }
+                }
+            }
+        }
+        manifest.coalesce();
+
+        // Ask once which of them the cloud lacks.
+        let hashes: Vec<String> = fresh.iter().map(|s| s.2.clone()).collect::<HashSet<_>>().into_iter().collect();
+        let mut missing: HashSet<String> = self.client.missing_shards(&hashes).await?.into_iter().collect();
+        let skipped: u64 = fresh.iter().filter(|s| !missing.contains(&s.2)).map(|s| s.1).sum();
+        Stats::add(&self.stats.bytes_skipped, skipped);
+
+        // Where each shard of the new file starts, to read any of them back.
+        let mut at: HashMap<String, (u64, u64)> = HashMap::new();
+        let mut pos = 0;
+        for seg in &manifest.segments {
+            if let Segment::Shard { h, n } = seg {
+                at.entry(h.clone()).or_insert((pos, *n));
+            }
+            pos += seg.len();
+        }
+
+        for _attempt in 0..2 {
+            // Pass 2: read the missing shards again and send them, a few at a time.
+            let todo: Vec<(String, u64, u64)> = missing.drain().filter_map(|h| at.get(&h).map(|&(offset, n)| (h, offset, n))).collect();
+            let mut sends = futures_util::stream::iter(todo)
+                .map(|(hash, offset, n)| {
+                    let (this, snap) = (self.clone(), snap.clone());
+                    async move {
+                        let data = this.read_snap(&snap, offset, n).await.map_err(|e| anyhow::anyhow!("read {offset}+{n}: {e:?}"))?;
+                        if shard::sha256_hex(&data) != hash {
+                            anyhow::bail!("the file changed while it was uploading");
+                        }
+                        this.client.put_shard(&hash, Bytes::from(data)).await
+                    }
+                })
+                .buffer_unordered(UPLOAD_PARALLELISM);
+            while let Some(sent) = sends.next().await {
+                sent?;
+            }
+            drop(sends);
+            match self.client.commit_manifest(&self.name, key, &manifest, Some(mtime_ms)).await? {
+                Ok(committed) => return Ok(committed),
+                // A shard the cloud held was cleaned up in between: send it too.
+                Err(gone) => missing = gone.into_iter().collect(),
+            }
+        }
+        anyhow::bail!("{key}: the cloud keeps reporting missing shards")
+    }
+
+    /// Cut bytes `start..end` of a snapshot into shards and return their
+    /// (offset in the file, length, hash). The bytes are streamed through the
+    /// chunker; at most one shard is in memory.
+    async fn cut_run(self: &Arc<Self>, snap: &Arc<ReadSnap>, start: u64, end: u64) -> anyhow::Result<Vec<(u64, u64, String)>> {
+        // Short enough to be a single shard whatever the content.
+        if end - start <= shard::MIN_SHARD as u64 {
+            let data = self.read_snap(snap, start, end - start).await.map_err(|e| anyhow::anyhow!("read {start}..{end}: {e:?}"))?;
+            return Ok(vec![(start, end - start, shard::sha256_hex(&data))]);
+        }
+        // The chunker reads synchronously; reads from the journal and the
+        // cloud are async. A bounded channel joins the two.
+        let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Vec<u8>>>(4);
+        let (this, feed_snap) = (self.clone(), snap.clone());
+        let feeder = tokio::spawn(async move {
+            let mut offset = start;
+            while offset < end {
+                let n = (end - offset).min(CUT_READ_BYTES);
+                let read = this.read_snap(&feed_snap, offset, n).await.map_err(|e| std::io::Error::other(format!("{e:?}")));
+                let failed = read.is_err();
+                if tx.send(read).await.is_err() || failed {
+                    break;
+                }
+                offset += n;
+            }
+        });
+        let cut = tokio::task::spawn_blocking(move || {
+            shard::chunks(ChannelReader { rx, buf: Vec::new(), pos: 0 })
+                .map(|c| c.map(|c| (start + c.offset, c.data.len() as u64, c.hash)))
+                .collect::<std::io::Result<Vec<_>>>()
+        })
+        .await;
+        feeder.abort();
+        let shards = cut??;
+        let total: u64 = shards.iter().map(|s| s.1).sum();
+        if total != end - start {
+            anyhow::bail!("cut {total} bytes of a {} byte run", end - start);
+        }
+        Ok(shards)
+    }
+
     /// Publish one journaled file as a new version.
     async fn upload(self: &Arc<Self>, id: u64) -> FsResult<()> {
         let (key, size, gen, mtime_ms, snap) = {
@@ -980,26 +1140,8 @@ impl DriveFs {
         };
         *self.uploading.lock().unwrap() = Some(key.clone());
 
-        let this = self.clone();
         let snap = Arc::new(snap);
-        let body_snap = snap.clone();
-        let stream = futures_util::stream::unfold(0u64, move |off| {
-            let (this, snap) = (this.clone(), body_snap.clone());
-            async move {
-                if off >= size {
-                    return None;
-                }
-                let n = (size - off).min(BLOCK_SIZE);
-                match this.read_snap(&snap, off, n).await {
-                    Ok(buf) => {
-                        Stats::add(&this.stats.bytes_up, buf.len() as u64);
-                        Some((Ok::<Bytes, std::io::Error>(Bytes::from(buf)), off + n))
-                    }
-                    Err(e) => Some((Err(std::io::Error::other(format!("{e:?}"))), size)),
-                }
-            }
-        });
-        let result = self.client.put(&self.name, &key, reqwest::Body::wrap_stream(stream), size, Some(mtime_ms)).await;
+        let result = self.upload_sharded(&key, size, &snap, mtime_ms).await;
         *self.uploading.lock().unwrap() = None;
 
         let (version, seed) = {

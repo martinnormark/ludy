@@ -479,9 +479,10 @@ async fn object_get(
     if q.contains_key("manifest") {
         c.latency().await;
         let found = c.store.manifest_of(&v);
-        let status = if found.is_some() { StatusCode::OK } else { StatusCode::NOT_FOUND };
+        let status = if found.is_some() { StatusCode::OK } else { StatusCode::NO_CONTENT };
         c.record(&Method::GET, &drive, &format!("{key}?manifest"), None, status, 0, t0);
-        let (id, manifest) = found.ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "this version has no manifest".into()))?;
+        // Whole-object content from before shards has none: 204, not an error.
+        let Some((id, manifest)) = found else { return Ok((StatusCode::NO_CONTENT, version_headers(&c, &v)).into_response()) };
         let body = json!({ "id": id, "version": v.id, "size": manifest.size, "segments": manifest.segments });
         return Ok((StatusCode::OK, version_headers(&c, &v), Json(body)).into_response());
     }
