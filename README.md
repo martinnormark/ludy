@@ -4,7 +4,7 @@ Cloud drives that mount in the Finder and stream on demand. A drive holding hund
 
 The "cloud" here is simulated: a local S3-like server with configurable latency and bandwidth. The Mac app is written in Rust with [gpui](https://gpui.rs/).
 
-**Status (2026-11-19):** the server, the engine and the app are built, covered by automated tests, and checked against real mounts: listing, range-only reads, video playback, writes, remote changes, eject and the crash case all work (see [What works](#what-works-and-how-it-was-checked)). Not checked: clicking the app's buttons, and the Quick Look panel itself. One thing does not work as intended: the Finder shows a file's full size as its size "on disk". Read [Eject and the "network volume" prompt](#eject-and-the-network-volume-prompt) for a hazard to know about.
+**Status (2026-11-19):** the server, the engine and the app are built, covered by automated tests, and checked against real mounts: listing, range-only reads, video playback, writes, remote changes, eject and the crash case all work (see [What works](#what-works-and-how-it-was-checked)). Not checked: clicking the app's buttons, and the Quick Look panel itself. Read [Eject and the "network volume" prompt](#eject-and-the-network-volume-prompt) for a hazard to know about.
 
 ## Run it
 
@@ -102,7 +102,7 @@ If you ever see a stuck eject: look for a macOS permission prompt and answer it.
 
 **Reads.** A read maps to the 256 KiB blocks that cover it. Blocks already in the cache are read from disk. Missing neighbours are fetched with one range request of at most 2 MiB, several requests run in parallel, and concurrent readers of the same block share one request. A sequential reader gets read-ahead that grows to 8 MiB; a random read fetches only what it asked for.
 
-**Cache.** Blocks are keyed by `(version id, block index)`. A version never changes, so a cached block is never stale. The cache has a byte cap and evicts the least recently used blocks. The NFS server reports each file's locally held bytes as its space used, but `stat` and `du` on the mount report the full size regardless, so the Finder's "on disk" figure shows the cloud size. Sending a fixed value instead changed nothing, so the figure does not follow what the server sends; whether the macOS client or the NFS library drops it was not established. What the Mac really holds is shown in the app, under "On this Mac".
+**Cache.** Blocks are keyed by `(version id, block index)`. A version never changes, so a cached block is never stale. The cache has a byte cap and evicts the least recently used blocks. The Finder lists every file at its full cloud size, so a drive can show far more than the Mac's disk holds; that is the point. `stat` and `du` on the mount report the full size as well. What the Mac really holds is the cache, shown in the app.
 
 **Writes.** A write goes to a sparse journal file and returns. An existing cloud file is not downloaded first: the journal records which byte ranges were written and reads merge them with the cloud version underneath. When a file has been quiet for 1.5 seconds it is uploaded as a new version. Renames, deletes and new folders are queued and replayed on the cloud in order. `.DS_Store` and `._*` files stay on the Mac.
 
@@ -158,10 +158,6 @@ Checked by hand, without a mount:
 - **The Quick Look panel** (space bar in the Finder). `qlmanage -p` crashes on any movie on this macOS version, the local file included, so playback was checked with AVPlayer instead.
 - **Dragging a file in with the Finder**, and how quickly a Finder window redraws after a server-side change. Both were checked from the shell only.
 - **Another app raising the "network volume" prompt during an eject.** The watchdog path for that is written but has only been reasoned about.
-
-**Does not work as intended:**
-
-- The Finder's "on disk" size is the full file size, not the cached bytes (see Cache above).
 
 ## Not built
 
