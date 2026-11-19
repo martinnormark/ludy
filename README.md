@@ -124,9 +124,9 @@ That is the display's limit. "Building elements" is only the app's own share of 
 
 **Writes.** A write goes to a sparse journal file and returns. An existing cloud file is not downloaded first: the journal records which byte ranges were written and reads merge them with the cloud version underneath. When a file has been quiet for 1.5 seconds it is uploaded as a new version, as a patch: only the shards the edit touched are sent (see Shards below). Eight files upload at a time, and a file small enough to be one shard goes up in a single request. What has not been sent yet survives a quit, a crash or a power cut: next to each journal file the engine saves which byte ranges it holds and which cloud version they were written over, and it saves the queue of renames and deletes, so the next start picks everything up and sends it. Renames, deletes and new folders are queued and replayed on the cloud in order. `.DS_Store` and `._*` files stay on the Mac.
 
-**Remote changes.** Each mounted drive long-polls the cloud for its next commit and folds the new listing into the tree, keeping node ids stable. A listing is never applied while local changes are still uploading.
+**Remote changes.** Each mounted drive long-polls the cloud for its next commit. The first time it fetches the whole listing; after that it asks only for what changed since the sequence number it last saw (`GET /<drive>?feed&since=N&epoch=E`) and applies that: deleted keys, then folders left with neither content nor a marker object, then new and changed objects. So noticing a change costs one round trip whatever the size of the drive. The cloud answers "reset" when it cannot say what changed (it restarted, the drive was deleted and created again, the number is too old), and the drive falls back to the full listing. Node ids of paths that still exist are kept. A listing is never applied while local changes are still uploading.
 
-**The cloud.** A drive is a bucket. Objects support list, HEAD, GET with `Range`, PUT and DELETE. Every PUT creates an immutable version whose id is the ETag and which names the version it replaced; history is kept (25 versions per key) and an old version can be restored without writing content. Every commit to a drive goes through that drive's lock and bumps its sequence number; `If-Match` makes one of two racing writers lose with a 412. A fork is a new catalog pointing at the same versions. Synthetic objects are the SplitMix64 stream for a seed, generated from the offset.
+**The cloud.** A drive is a bucket. Objects support list, HEAD, GET with `Range`, PUT and DELETE. Every PUT creates an immutable version whose id is the ETag and which names the version it replaced; history is kept (25 versions per key) and an old version can be restored without writing content. Every commit to a drive goes through that drive's lock and bumps its sequence number; `If-Match` makes one of two racing writers lose with a 412. A fork is a new catalog pointing at the same versions. Synthetic objects are the SplitMix64 stream for a seed, generated from the offset. On disk a drive's catalog is a snapshot plus a log: a commit appends one line with the new state of the keys it touched, and every 4,000 commits the log is folded into a fresh snapshot, so the cost of a commit does not grow with the drive.
 
 **Shards.** Content is cut into shards with FastCDC content-defined chunking (256 KiB minimum, about 2 MiB on average, 16 MiB maximum), so the cut points follow the bytes and an edit moves only the shards around it. A shard is named by the SHA-256 of its bytes and stored once, in `<data>/shards/`. A version's content is a manifest in `<data>/manifests/`: the ordered list of segments, each either a shard or a range of a synthetic stream. Identical content gives the same shards and the same manifest, whatever key or drive it is under. Manifests and shards are reference counted and deleted when no version points at them; fork, rename and restore write no content.
 
@@ -136,6 +136,8 @@ An upload from the mount goes in four steps:
 2. `POST /_shards` with the hashes of the newly cut shards; the cloud answers which ones it lacks.
 3. `PUT /_shards/<sha256>` for those, four at a time. The cloud checks each body against its name.
 4. `PUT /<drive>/<key>?manifest` commits the manifest. No content moves in this request. If a shard has gone missing in the meantime the cloud says which (409) and the client sends it.
+
+A small patch skips steps 2 and 3: when the upload keeps part of the old version and its new shards add up to at most 8 MiB, they travel in the commit request itself, after the manifest, and the cloud checks each against its name before committing. The drive also remembers the manifests of versions it uploaded or patched, so planning the next patch needs no request. A second edit to a file is then one round trip.
 
 A plain `PUT` with a body still works, for `curl`: the server cuts it into shards itself. `ludy put` uses the four steps and prints how much was sent and how much the cloud already had. Reads are unchanged: a `GET` with `Range` on the object, which the server maps onto the shards that cover it.
 
@@ -150,7 +152,7 @@ A plain `PUT` with a body still works, for `curl`: the server cuts it into shard
 
 ## What works, and how it was checked
 
-Checked by `cargo test` (57 integration tests and 34 unit tests in the cloud and engine crates, no kernel mount involved; the cloud server's request log is the witness; 19 of the integration tests are the chaos tests described under [Chaos testing](#chaos-testing)):
+Checked by `cargo test` (62 integration tests and 34 unit tests in the cloud and engine crates, no kernel mount involved; the cloud server's request log is the witness; 21 of the integration tests are the chaos tests described under [Chaos testing](#chaos-testing)):
 
 - A listing shows real sizes, including a 50 GB synthetic file, with no object bytes downloaded.
 - A 64 KiB read from the middle of the 50 GB file returns the right bytes (compared with the generator) and causes one range request of at most two blocks.
@@ -173,7 +175,7 @@ Checked against real mounts on macOS 27.0.1, with the CLI and with the app (`--m
 - **Nothing reads behind your back.** A Finder-visible mount left untouched for 30 seconds caused no range request. During the earlier tests one 30-byte read of `shot-list.txt` appeared that the test did not make; its origin is unknown.
 - **Finder.** The mount has no `nobrowse` flag, the sidebar lists `ludy.localhost` under Locations with an eject button, and the computer view lists the drive as a remote volume.
 - **Writes.** `cp` of a 3 MB file returned in 0.08 s; the PUT followed in the background and the server's copy has the same SHA-256. `mkdir`, `mv` and `rm` reached the server in order. `._*` files stayed local.
-- **Remote changes.** A file put on the server with `curl`, and one deleted there, showed in `ls` within three seconds.
+- **Remote changes.** A file put on the server with `curl`, and one deleted there, showed in `ls` within three seconds. Repeated after the change feed went in: the server's log shows the mount asking `?feed` (1 changed; then 1 deleted) and no listing.
 - **Shards.** On a hidden mount, with the server log as witness. `cp` of a 20 MiB file: 8 shard uploads, 20,971,520 bytes, then a commit with an empty body. `cp` of the same file under another name: the check answered "0 of 8 missing", no shard was sent, and the server's disk did not grow. Five bytes written at 10 MiB + 123 with `dd conv=notrunc`: one shard of 5,289,289 bytes sent, and the server's copy equals the expected patched file while the second copy is unchanged. 8 KiB written at 25 GiB + 4096 of the 50 GB synthetic file: one shard of 8,192 bytes sent (the kernel first read the 256 KiB block around the write, one range request); the file is still 50 GB; reading it back through the mount and from the server gives the generated bytes, then the 8 KiB, then generated bytes again; the server's data folder stayed at 116 MB. After a server restart the shard totals were unchanged (52 shards, 121,369,066 bytes) and `ludy put` of a 7 MB file sent 5 shards the first time and nothing under a second key.
 - **Eject.** Ctrl-C in the CLI and SIGTERM to the app both ejected in one to two seconds, with a Finder window open on the volume, and a write made just before the eject was uploaded first. No mount was left behind in nine cycles.
 - **The app.** Started with `--mount Footage`, it mounted the drive, showed the card as mounted with its path, and the status panel counted the range request and the cache blocks.
@@ -213,7 +215,20 @@ Checked by hand, without a mount:
 | Change 4 KiB in that file | 233 ms, 7.6x faster than re-uploading | 235 ms, 7.5x | Space states about 11x |
 | Read 64 KiB of that file, cold | 33 ms, 58x faster than fetching it whole | 34 ms, 56x | Space states about 34x |
 
-What the numbers say: reads are at the link's limit (a cold random read costs one round trip plus 7 ms); uploads of real data run at the link's rate; the two things that were slow or are now slower are both about many small files. Still to do for speed: a patch costs four round trips (manifest, check, shard, commit), which is why it reaches 7.5x and not 11x; and through a real mount the kernel's NFS client adds its own costs, which this benchmark does not see.
+The second round, on scale (full tables in [`bench/`](bench), `scale-baseline` and `scale-after`):
+
+| Scenario | Before | After | What changed |
+|---|---|---|---|
+| Change 4 KiB in a 64 MiB file | 231 ms, 7.7x faster than re-uploading | **121 ms, 14.8x** | one request instead of four (Space states about 11x) |
+| The same at 100 ms latency | 579 ms, 3.9x | **242 ms, 9.1x** | |
+| Open a drive of 50,000 files | 149 ms | 139 ms | still one full listing |
+| Pick up one remote change in it | 105 ms | **32 ms** | ask for what changed instead of listing 50,000 files |
+| Upload 500 small files into it | 8.0 s (62 files/s) | **3.1 s (161 files/s)** | the cloud appends a line per commit instead of rewriting the catalog |
+| Delete 1,000 files from it | 49.7 s (20 files/s) | **2.4 s (422 files/s)** | sixteen deletes at a time; the queue on disk is appended to, not rewritten |
+
+Everything in the first table is unchanged by this round except the patch row.
+
+What the numbers say: reads are at the link's limit (a cold random read costs one round trip plus 7 ms); uploads of real data run at the link's rate; the two things that were slow or are now slower are both about many small files. A patch still re-sends the whole shard it touched (about 2 MiB for a 4 KiB edit), which is most of its 121 ms. And through a real mount the kernel's NFS client adds its own costs, which this benchmark does not see.
 
 ## Chaos testing
 
@@ -221,7 +236,7 @@ What the numbers say: reads are at the link's limit (a cold random read costs on
 
 The scenarios: a flood of 360 files and a 12 MiB copy with the cloud killed and restarted in the middle and more files written during the outage; the same flood with the cloud refusing requests while a folder is renamed and a file deleted; shards swept between upload and commit (the commit is refused with the list, the client sends them again); a restart between the shards and the commit; a stalled cloud; the background uploader and a flush running together through renames and deletes; paths longer than the cloud accepts; a file deleted in the cloud under a pending local patch; a listing that is already out of date; a damaged cache block; writes, renames and deletes on files that are mid-upload; awkward names (percent signs, quotes, emoji, 255 bytes); two writers on one file; the app killed, or quit, with unsent writes while the cloud is down.
 
-A randomized soak (`soak`, ignored by default) drives 1,200 random operations per run (create, patch, resize, rename files and folders, delete, read back and compare) while it randomly kills and restarts the cloud, stalls it, makes it refuse requests, and kills and restarts the app. The seed is printed. After the fixes below, 40 consecutive seeds pass.
+A randomized soak (`soak`, ignored by default) drives 1,200 random operations per run (create, patch, resize, rename files and folders, delete, read back and compare) while it randomly kills and restarts the cloud, stalls it, makes it refuse requests, and kills and restarts the app. The seed is printed. After the fixes below, 40 consecutive seeds pass. Since the scale round the soak also has a second writer changing the cloud's side of the drive, and a separate test (`applying_only_what_changed_matches_a_full_listing`) makes 400 random remote changes and checks after each that the drive, asking only for changes, shows exactly what a full listing would; 40 more soak seeds and 15 seeds of that test pass.
 
 On a real mount, [`scripts/chaos-mount.sh`](scripts/chaos-mount.sh) was run once with the release binaries on a hidden mount: 2,000 small files and a 200 MiB copy written through the mount, `kill -9` of the cloud four seconds in, restart five seconds later: all 2,001 files in the cloud, none wrong. Then the cloud was killed, 500 more files written, and the mounting process killed with `kill -9` as well; after both were started again the 500 files arrived, none wrong. The kernel took about two minutes to drop the dead mount this time (nothing was touching it; with a reader on it, it took 55 seconds before).
 
@@ -248,7 +263,8 @@ Known and not fixed:
 - A full disk while writing the journal turns into an I/O error for the application, and nothing has tested what happens next.
 - After a crash, the first listing must succeed before recovered writes show up, so a drive cannot be mounted offline to get at them.
 - The dead-mount wait after a crash is the kernel's and can be two minutes.
-- The simulated cloud rewrites a drive's whole catalog on every commit, and the engine fetches the whole listing on every remote change. Both are fine for thousands of files and wrong for millions.
+- Opening a drive is still one full listing held in memory (139 ms and one JSON document for 50,000 files); a drive of millions of files would need a listing in pages and a tree that is not all in memory. Uploads run eight at a time with one commit each; there is no batched commit.
+- The cloud remembers the last 200,000 changed keys per drive for the change feed, in memory; a client further behind than that, or any client after a server restart, does one full listing.
 - The chaos script on a real mount was run once; the Finder was not involved.
 
 ## Not built
