@@ -59,6 +59,7 @@ fn stat(e: FsError) -> nfsstat3 {
         FsError::Exists => nfsstat3::NFS3ERR_EXIST,
         FsError::NotEmpty => nfsstat3::NFS3ERR_NOTEMPTY,
         FsError::Invalid => nfsstat3::NFS3ERR_INVAL,
+        FsError::NameTooLong => nfsstat3::NFS3ERR_NAMETOOLONG,
         FsError::Io(_) => nfsstat3::NFS3ERR_IO,
     }
 }

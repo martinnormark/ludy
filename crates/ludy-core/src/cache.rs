@@ -147,6 +147,12 @@ impl BlockCache {
         }
     }
 
+    /// Forget a block and delete its file (it turned out to be damaged).
+    pub fn discard(&self, version: &Arc<str>, idx: u64) {
+        self.index.lock().unwrap().remove(&(version.clone(), idx));
+        let _ = std::fs::remove_file(self.path(version, idx));
+    }
+
     /// Store a block, evicting older blocks if the cap would be exceeded.
     pub fn put(&self, version: &Arc<str>, idx: u64, data: &[u8]) -> io::Result<()> {
         self.evict_to_fit(data.len() as u64);

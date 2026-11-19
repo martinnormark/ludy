@@ -43,6 +43,19 @@ impl RangeSet {
         }
     }
 
+    /// Every range as `(start, end)`, in order.
+    pub fn ranges(&self) -> Vec<(u64, u64)> {
+        self.ranges.iter().map(|(s, e)| (*s, *e)).collect()
+    }
+
+    pub fn from_ranges(ranges: &[(u64, u64)]) -> RangeSet {
+        let mut set = RangeSet::default();
+        for &(s, e) in ranges {
+            set.insert(s, e);
+        }
+        set
+    }
+
     pub fn total(&self) -> u64 {
         self.ranges.iter().map(|(s, e)| e - s).sum()
     }
