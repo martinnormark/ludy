@@ -8,7 +8,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use serde::Deserialize;
 
-pub use ludy_cloud::store::{DriveInfo, Listing, ObjectInfo, Share, Version};
+pub use ludy_cloud::store::{Changes, DriveInfo, Listing, ObjectInfo, Share, Version};
 pub use ludy_cloud::shard::{Manifest, Segment};
 pub use ludy_cloud::LogEntry;
 
@@ -202,6 +202,13 @@ impl CloudClient {
         Ok(Self::ok(resp, "list").await?.json().await?)
     }
 
+    /// What changed in a drive since sequence number `since` (as seen in
+    /// `epoch`). `reset` in the answer means: fetch the full listing.
+    pub async fn changes(&self, drive: &str, since: u64, epoch: u64) -> Result<Changes> {
+        let resp = self.http.get(format!("{}?feed&since={since}&epoch={epoch}", self.url(drive, ""))).send().await?;
+        Ok(Self::ok(resp, "changes").await?.json().await?)
+    }
+
     /// One folder level: objects directly under `prefix` plus sub-prefixes.
     pub async fn list_folder(&self, drive: &str, prefix: &str) -> Result<Listing> {
         let resp = self
@@ -314,6 +321,47 @@ impl CloudClient {
             return Ok(Err(resp.json::<MissingBody>().await?.missing));
         }
         let resp = Self::ok(resp, "commit manifest").await?;
+        Ok(Ok(Self::committed(&resp)?))
+    }
+
+    /// Commit `manifest` and send the shards in `inline` in the same request:
+    /// one round trip for a small patch. The cloud checks each shard against
+    /// its name. `Err(hashes)` lists shards the manifest names that the cloud
+    /// has neither stored nor received here.
+    pub async fn commit_manifest_inline(
+        &self,
+        drive: &str,
+        key: &str,
+        manifest: &Manifest,
+        inline: &[(String, Bytes)],
+        mtime_ms: Option<u64>,
+    ) -> Result<std::result::Result<Committed, Vec<String>>> {
+        let head = serde_json::to_vec(&serde_json::json!({
+            "size": manifest.size,
+            "segments": manifest.segments,
+            "inline": inline.iter().map(|(h, _)| h.as_str()).collect::<Vec<_>>(),
+        }))?;
+        let sent: u64 = inline.iter().map(|(_, d)| d.len() as u64).sum();
+        let mut body = Vec::with_capacity(head.len() + sent as usize);
+        body.extend_from_slice(&head);
+        for (_, data) in inline {
+            body.extend_from_slice(data);
+        }
+        let mut req = self
+            .http
+            .put(format!("{}?manifest", self.url(drive, key)))
+            .header("x-ludy-manifest-bytes", head.len())
+            .timeout(transfer_timeout(sent))
+            .body(body);
+        if let Some(m) = mtime_ms {
+            req = req.header("x-ludy-mtime-ms", m);
+        }
+        let resp = req.send().await?;
+        if resp.status() == reqwest::StatusCode::CONFLICT {
+            return Ok(Err(resp.json::<MissingBody>().await?.missing));
+        }
+        let resp = Self::ok(resp, "commit manifest").await?;
+        Stats::add(&self.stats.bytes_up, sent);
         Ok(Ok(Self::committed(&resp)?))
     }
 

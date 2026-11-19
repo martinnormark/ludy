@@ -127,6 +127,20 @@ pub fn run(args: &[String]) -> Result<()> {
 
 async fn scenarios(o: &Opts) -> Result<Vec<Row>> {
     let cfg = Config { data_dir: o.dir.join("cloud"), addr: "127.0.0.1:0".parse()?, latency_ms: o.latency_ms, mbps: o.mbps, print_log: false };
+    // A large drive, written straight into the cloud's data folder before it
+    // starts: folders of 100 synthetic clips each.
+    let huge: u64 = if o.quick { 5_000 } else { 50_000 };
+    {
+        let mut objects = serde_json::Map::new();
+        for i in 0..huge {
+            let version = serde_json::json!({ "id": format!("{:012x}{:04x}", 1_700_000_000_000u64 + i / 65536, i % 65536), "size": 1000 + i * 7919, "mtime_ms": 1_700_000_000_000u64 + i,
+                "seq": i + 2, "content": { "kind": "synthetic", "seed": i } });
+            objects.insert(format!("shoot_{:03}/clip_{:02}.mov", i / 100, i % 100), serde_json::json!([version]));
+        }
+        let catalog = serde_json::json!({ "created_ms": 1_700_000_000_000u64, "seq": huge + 2, "forked_from": null, "shares": [], "objects": objects });
+        std::fs::create_dir_all(o.dir.join("cloud/drives"))?;
+        std::fs::write(o.dir.join("cloud/drives/huge.json"), serde_json::to_vec(&catalog)?)?;
+    }
     let server = Harness::start(cfg).await?;
     let cloud = server.cloud();
     let stats = Arc::new(Stats::default());
@@ -278,7 +292,76 @@ async fn scenarios(o: &Opts) -> Result<Vec<Row>> {
         note: "Space states about 34x for 64 KiB of 64 MiB".into(),
     });
 
-    for fs in [fs, fs_many, work] {
+    // ---- the same engine at 100 ms, where round trips dominate
+    client.set_server_config(Some(100), Some(o.mbps)).await?;
+    let slow = work.create(ROOT_ID, "slow link.bin", false).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let data = synth::bytes(4343, 0, copy_len as usize);
+    for (i, piece) in data.chunks(BLOCK_SIZE as usize).enumerate() {
+        work.write(slow, i as u64 * BLOCK_SIZE, piece).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    }
+    let t = Instant::now();
+    if !work.flush(Duration::from_secs(600)).await {
+        bail!("slow copy did not upload: {:?}", work.pending());
+    }
+    let slow_upload = t.elapsed();
+    work.refresh().await?;
+    work.write(slow, copy_len / 2 + 777, &synth::bytes(78, 0, 4096)).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let t = Instant::now();
+    if !work.flush(Duration::from_secs(600)).await {
+        bail!("slow patch did not upload: {:?}", work.pending());
+    }
+    let slow_patch = t.elapsed();
+    rows.push(Row {
+        name: "Change 4 KiB in a file, at 100 ms latency",
+        result: format!("{} ({:.1}x faster than the {} re-upload)", secs(slow_patch), slow_upload.as_secs_f64() / slow_patch.as_secs_f64(), secs(slow_upload)),
+        note: format!("{} MiB file; round trips dominate here", copy_len / MIB),
+    });
+    client.set_server_config(Some(o.latency_ms), Some(o.mbps)).await?;
+
+    // ---- a large drive
+    let big = rig.drive("huge")?;
+    let t = Instant::now();
+    big.refresh().await?;
+    rows.push(Row { name: "Open a large drive", result: secs(t.elapsed()), note: format!("{huge} files in {} folders", huge / 100) });
+    client.put_synthetic("huge", "arrivals/new clip.mov", 123_456, 1).await?;
+    let t = Instant::now();
+    if !big.refresh().await? {
+        bail!("the large drive did not take the remote change");
+    }
+    let noticed = t.elapsed();
+    if big.find_path("arrivals/new clip.mov").is_none() {
+        bail!("the remote change did not appear");
+    }
+    rows.push(Row { name: "Pick up one remote change in it", result: secs(noticed), note: "after the long-poll woke: fetch what changed and apply it".into() });
+
+    let (into, gone) = if o.quick { (100u64, 200u64) } else { (500, 1000) };
+    let incoming = big.mkdir(ROOT_ID, "incoming").map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    for i in 0..into {
+        let id = big.create(incoming, &format!("note_{i:04}.txt"), false).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        big.write(id, 0, &synth::bytes(9000 + i, 0, 4096)).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    }
+    let t = Instant::now();
+    if !big.flush(Duration::from_secs(1800)).await {
+        bail!("uploads into the large drive did not finish: {:?}", big.pending());
+    }
+    let up = t.elapsed();
+    rows.push(Row { name: "Upload small files into it", result: format!("{} ({:.0} files/s)", secs(up), into as f64 / up.as_secs_f64()), note: format!("{into} files of 4 KiB") });
+    for i in 0..gone {
+        let dir = big.find_path(&format!("shoot_{:03}", i / 100)).context("shoot folder")?;
+        big.remove(dir, &format!("clip_{:02}.mov", i % 100)).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    }
+    let t = Instant::now();
+    if !big.flush(Duration::from_secs(1800)).await {
+        bail!("deletes in the large drive did not finish: {:?}", big.pending());
+    }
+    let del = t.elapsed();
+    rows.push(Row { name: "Delete files from it", result: format!("{} ({:.0} files/s)", secs(del), gone as f64 / del.as_secs_f64()), note: format!("{gone} deletes, replayed in order") });
+    let left = client.list("huge").await?.objects.iter().filter(|o| !o.key.ends_with('/')).count() as u64;
+    if left != huge + 1 + into - gone {
+        bail!("the large drive holds {left} files, expected {}", huge + 1 + into - gone);
+    }
+
+    for fs in [fs, fs_many, work, big] {
         fs.stop();
     }
     drop(server);

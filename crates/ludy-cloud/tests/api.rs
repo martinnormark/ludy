@@ -544,3 +544,137 @@ async fn a_data_dir_from_before_shards_still_serves_and_migrates_on_write() {
     assert_eq!(std::fs::read_dir(dir.path().join("blobs")).unwrap().count(), 0);
     assert_eq!(shard_files(dir.path()), (0, 0));
 }
+
+// ---------------------------------------------------------------- catalog log and change feed
+
+#[tokio::test]
+async fn commits_are_appended_to_a_log_and_replayed_at_the_next_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Config { data_dir: dir.path().to_path_buf(), addr: "127.0.0.1:0".parse().unwrap(), latency_ms: 0, mbps: 0, print_log: false };
+    let http = Client::new();
+    let snapshot = dir.path().join("drives/d.json");
+    let log = dir.path().join("drives/d.log");
+    let before;
+    {
+        let (addr, _c, task) = ludy_cloud::serve(cfg.clone()).await.unwrap();
+        let base = format!("http://{addr}");
+        http.put(format!("{base}/d")).send().await.unwrap();
+        let created = std::fs::metadata(&snapshot).unwrap().len();
+        for i in 0..40 {
+            http.put(format!("{base}/d/folder/file {i:02}.txt")).body(format!("content {i}")).send().await.unwrap();
+        }
+        http.put(format!("{base}/d/folder/file 05.txt")).body("changed").send().await.unwrap();
+        http.delete(format!("{base}/d/folder/file 06.txt")).send().await.unwrap();
+        http.post(format!("{base}/d/folder?rename=moved")).send().await.unwrap();
+        // The snapshot was not rewritten for any of that; the log grew by a line per commit.
+        assert_eq!(std::fs::metadata(&snapshot).unwrap().len(), created);
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 43);
+        before = http.get(format!("{base}/d")).send().await.unwrap().json::<Value>().await.unwrap();
+        task.abort();
+    }
+    // A crash in the middle of an append leaves a torn last line.
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        f.write_all(b"{\"seq\": 99, \"set\": {\"torn").unwrap();
+    }
+    let (addr, _c, _task) = ludy_cloud::serve(cfg).await.unwrap();
+    let base = format!("http://{addr}");
+    let after = http.get(format!("{base}/d")).send().await.unwrap().json::<Value>().await.unwrap();
+    assert_eq!(after["objects"], before["objects"]);
+    assert_eq!(after["seq"], before["seq"]);
+    assert_eq!(after["objects"].as_array().unwrap().len(), 39);
+    assert_eq!(http.get(format!("{base}/d/moved/file 05.txt")).send().await.unwrap().text().await.unwrap(), "changed");
+
+    // Forking, renaming and deleting a drive deal with both files.
+    http.post(format!("{base}/d?fork=copy")).send().await.unwrap();
+    http.post(format!("{base}/d?rename=renamed")).send().await.unwrap();
+    assert!(!log.exists() && !snapshot.exists());
+    assert_eq!(http.get(format!("{base}/renamed")).send().await.unwrap().json::<Value>().await.unwrap()["objects"], before["objects"]);
+    assert_eq!(http.get(format!("{base}/copy")).send().await.unwrap().json::<Value>().await.unwrap()["objects"], before["objects"]);
+    http.put(format!("{base}/renamed/one more.txt")).body("x").send().await.unwrap();
+    assert!(dir.path().join("drives/renamed.log").exists());
+    http.delete(format!("{base}/renamed")).send().await.unwrap();
+    assert!(!dir.path().join("drives/renamed.log").exists() && !dir.path().join("drives/renamed.json").exists());
+    assert_eq!(http.get(format!("{base}/copy/moved/file 07.txt")).send().await.unwrap().text().await.unwrap(), "content 7");
+}
+
+#[tokio::test]
+async fn the_change_feed_reports_what_changed_and_says_when_it_cannot() {
+    let s = server(0, 0).await;
+    s.put("a.txt", b"1").await;
+    s.put("dir/b.txt", b"22").await;
+    let listing = s.json("/d").await;
+    let (seq, epoch) = (listing["seq"].as_u64().unwrap(), listing["epoch"].as_u64().unwrap());
+    assert!(epoch > 0);
+    let feed = |since: u64, epoch: u64| {
+        let path = format!("/d?feed&since={since}&epoch={epoch}");
+        let s = &s;
+        async move { s.json(&path).await }
+    };
+
+    // Nothing happened yet.
+    let none = feed(seq, epoch).await;
+    assert_eq!(none["reset"], false);
+    assert_eq!(none["objects"].as_array().unwrap().len() + none["deleted"].as_array().unwrap().len(), 0);
+
+    s.put("a.txt", b"one, changed").await;
+    s.put("new.txt", b"333").await;
+    s.http.delete(format!("{}/d/dir/b.txt", s.base)).send().await.unwrap();
+    s.put("gone again.txt", b"x").await;
+    s.http.delete(format!("{}/d/gone again.txt", s.base)).send().await.unwrap();
+    let changes = feed(seq, epoch).await;
+    assert_eq!(changes["reset"], false);
+    assert_eq!(changes["seq"], seq + 5);
+    let keys: Vec<&str> = changes["objects"].as_array().unwrap().iter().map(|o| o["key"].as_str().unwrap()).collect();
+    assert_eq!(keys, ["a.txt", "new.txt"]);
+    assert_eq!(changes["objects"][0]["size"], 12);
+    assert_eq!(changes["deleted"], serde_json::json!(["dir/b.txt", "gone again.txt"]));
+
+    // A folder rename is its old keys gone and its new keys present.
+    s.put("shoot/one.mov", b"1").await;
+    s.put("shoot/two.mov", b"2").await;
+    let mid = s.json("/d").await["seq"].as_u64().unwrap();
+    s.http.post(format!("{}/d/shoot?rename=selects", s.base)).send().await.unwrap();
+    let renamed = feed(mid, epoch).await;
+    assert_eq!(renamed["deleted"], serde_json::json!(["shoot/one.mov", "shoot/two.mov"]));
+    assert_eq!(renamed["objects"].as_array().unwrap().len(), 2);
+    // A partial question gets a partial answer.
+    assert_eq!(feed(mid + 1, epoch).await["objects"].as_array().unwrap().len(), 0);
+
+    // Questions it cannot answer: another epoch, or a sequence number from the future.
+    assert_eq!(feed(seq, epoch + 1).await["reset"], true);
+    assert_eq!(feed(seq + 1000, epoch).await["reset"], true);
+    // A drive deleted and created again is a new one.
+    s.http.delete(format!("{}/d", s.base)).send().await.unwrap();
+    s.http.put(format!("{}/d", s.base)).send().await.unwrap();
+    let fresh = feed(1, epoch).await;
+    assert_eq!(fresh["reset"], true);
+    assert_ne!(fresh["epoch"], epoch);
+}
+
+#[tokio::test]
+async fn a_patch_can_carry_its_shards_in_the_commit_request() {
+    let s = server(0, 0).await;
+    let (old, new) = (synth::bytes(91, 0, 400_000), synth::bytes(92, 0, 300_000));
+    let h_old = s.put_shard(&old).await;
+    let h_new = sha256_hex(&new);
+    let head = serde_json::to_vec(&serde_json::json!({
+        "size": 700_000, "segments": [{ "h": h_old, "n": 400_000 }, { "h": h_new, "n": 300_000 }], "inline": [h_new],
+    }))
+    .unwrap();
+    let send = |shard: &[u8]| {
+        let mut body = head.clone();
+        body.extend_from_slice(shard);
+        s.http.put(format!("{}/d/patched.bin?manifest", s.base)).header("x-ludy-manifest-bytes", head.len()).body(body).send()
+    };
+    // Bytes that do not hash to the name are refused, and nothing is committed.
+    assert_eq!(send(&synth::bytes(93, 0, 300_000)).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    assert_eq!(send(&new[..1000]).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    assert_eq!(s.get("patched.bin", None).await.status(), StatusCode::NOT_FOUND);
+
+    assert_eq!(send(&new).await.unwrap().status(), StatusCode::CREATED);
+    let got = s.get("patched.bin", None).await.bytes().await.unwrap();
+    assert!(got[..400_000] == old[..] && got[400_000..] == new[..]);
+    assert_eq!(s.shards(), (2, 700_000));
+}

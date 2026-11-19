@@ -419,6 +419,14 @@ async fn drive_get(State(c): State<AppState>, Path(drive): Path<String>, Query(q
         return Ok(Json(json!({ "seq": seq })).into_response());
     }
     c.latency().await;
+    // `?feed&since=N&epoch=E`: only what changed since then.
+    if q.contains_key("feed") {
+        let since = q.get("since").and_then(|s| s.parse().ok()).unwrap_or(0);
+        let epoch = q.get("epoch").and_then(|s| s.parse().ok()).unwrap_or(0);
+        let changes = c.store.changes(&drive, since, epoch).await?;
+        c.record(&Method::GET, &drive, &format!("?feed ({} changed, {} deleted{})", changes.objects.len(), changes.deleted.len(), if changes.reset { ", reset" } else { "" }), None, StatusCode::OK, 0, t0);
+        return Ok(Json(changes).into_response());
+    }
     let prefix = q.get("prefix").map(String::as_str).unwrap_or("");
     let listing = c.store.list(&drive, prefix, q.get("delimiter").map(String::as_str)).await?;
     c.record(&Method::GET, &drive, "", None, StatusCode::OK, 0, t0);
@@ -595,6 +603,16 @@ async fn to_the_end<T: Send + 'static>(change: impl std::future::Future<Output =
     tokio::spawn(change).await.unwrap_or_else(|e| Err(StoreError::Io(std::io::Error::other(format!("the cloud is shutting down: {e}")))))
 }
 
+/// The body of a manifest commit: the manifest, and optionally the names of
+/// shards whose bytes follow it in the same request.
+#[derive(Deserialize)]
+struct ManifestEnvelope {
+    size: u64,
+    segments: Vec<shard::Segment>,
+    #[serde(default)]
+    inline: Vec<String>,
+}
+
 /// One reference to stored content, given up when this is dropped. A
 /// request can be cancelled at any await (the client hung up); holding the
 /// reference in a value makes sure it is released whichever way the
@@ -646,7 +664,41 @@ async fn object_put(
             }
             c.faults.commits_held.fetch_sub(1, Ordering::Relaxed);
         }
-        let manifest: Manifest = serde_json::from_slice(&raw).map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("manifest: {e}")))?;
+        // With `x-ludy-manifest-bytes: N` the first N bytes are the manifest
+        // and the rest are the shards it lists under "inline", end to end:
+        // a small patch in one request.
+        let head = headers.get("x-ludy-manifest-bytes").and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<usize>().ok()).unwrap_or(raw.len());
+        if head > raw.len() {
+            return Err(ApiError(StatusCode::BAD_REQUEST, "x-ludy-manifest-bytes is longer than the body".into()));
+        }
+        let envelope: ManifestEnvelope = serde_json::from_slice(&raw[..head]).map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("manifest: {e}")))?;
+        let manifest = Manifest { size: envelope.size, segments: envelope.segments };
+        let mut at = head;
+        for hash in &envelope.inline {
+            let n = manifest.segments.iter().find_map(|s| match s {
+                shard::Segment::Shard { h, n } if h == hash => Some(*n as usize),
+                _ => None,
+            });
+            let Some(n) = n.filter(|n| at + n <= raw.len()) else {
+                return Err(ApiError(StatusCode::BAD_REQUEST, format!("inline shard {hash} does not fit the body")));
+            };
+            let data = raw.slice(at..at + n);
+            at += n;
+            c.throttle.take(n as u64).await;
+            c.counters.bytes_in.fetch_add(n as u64, Ordering::Relaxed);
+            let (cloud, name) = (c.clone(), hash.clone());
+            let stored = tokio::task::spawn_blocking(move || cloud.store.put_shard(&name, &data))
+                .await
+                .unwrap_or_else(|e| Err(StoreError::Io(std::io::Error::other(format!("the cloud is shutting down: {e}")))));
+            let status = match &stored {
+                Ok(true) => StatusCode::CREATED,
+                Ok(false) => StatusCode::OK,
+                Err(e) => ApiError::status(e),
+            };
+            // Logged like a shard upload of its own, which is what it is.
+            c.record(&Method::PUT, "_shards", hash, Some((0, n as u64 - 1)), status, n as u64, t0);
+            stored?;
+        }
         match c.store.put_manifest(&manifest) {
             Ok(id) => (manifest.size, Held { cloud: c.clone(), content: Content::Manifest { id } }, 0, 0),
             Err(StoreError::MissingShards(missing)) => {

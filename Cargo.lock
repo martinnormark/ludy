@@ -2659,6 +2659,7 @@ dependencies = [
  "anyhow",
  "ludy-cloud",
  "ludy-core",
+ "serde_json",
  "tokio",
 ]
 

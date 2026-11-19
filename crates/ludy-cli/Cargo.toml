@@ -13,3 +13,4 @@ ludy-core = { path = "../ludy-core" }
 ludy-cloud = { path = "../ludy-cloud" }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
+serde_json = "1"

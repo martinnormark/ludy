@@ -669,6 +669,190 @@ async fn replacing_a_cloud_file_with_a_new_one_and_deleting_that_leaves_nothing(
     c.converge().await;
 }
 
+// ------------------------------------------------- the change feed
+
+/// Everything the drive shows: (path, is a folder, size).
+fn tree_of(fs: &DriveFs) -> std::collections::BTreeSet<(String, bool, u64)> {
+    let mut out = std::collections::BTreeSet::new();
+    let mut stack = vec![(ROOT_ID, String::new())];
+    while let Some((dir, path)) = stack.pop() {
+        for (name, attr) in fs.readdir(dir).unwrap() {
+            let child = if path.is_empty() { name } else { format!("{path}/{name}") };
+            out.insert((child.clone(), attr.is_dir, attr.size));
+            if attr.is_dir {
+                stack.push((attr.id, child));
+            }
+        }
+    }
+    out
+}
+
+/// What a full listing says the drive should show.
+fn tree_from(listing: &ludy_core::client::Listing) -> std::collections::BTreeSet<(String, bool, u64)> {
+    let mut out = std::collections::BTreeSet::new();
+    for o in &listing.objects {
+        let (path, is_marker) = match o.key.strip_suffix('/') {
+            Some(p) => (p, true),
+            None => (o.key.as_str(), false),
+        };
+        let mut folder = String::new();
+        let parts: Vec<&str> = path.split('/').collect();
+        for part in &parts[..parts.len() - usize::from(!is_marker)] {
+            if !folder.is_empty() {
+                folder.push('/');
+            }
+            folder.push_str(part);
+            out.insert((folder.clone(), true, 0));
+        }
+        if !is_marker {
+            out.insert((o.key.clone(), false, o.size));
+        }
+    }
+    out
+}
+
+/// Someone else works in the drive. After every change the drive asks only
+/// for what changed, and must end up showing exactly what a full listing
+/// would: files, folders that exist only through their content, folders
+/// kept by a marker, renames, restores, a file and a folder trading names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn applying_only_what_changed_matches_a_full_listing() {
+    let seed: u64 = std::env::var("CHAOS_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(7);
+    let mut c = chaos(0).await;
+    let mut n = 0u64;
+    let mut rnd = move |below: u64| {
+        n += 1;
+        synth::word(seed ^ 0xfeed, n) % below.max(1)
+    };
+    let folders = ["", "a", "a/b", "c", "c/d/e"];
+    for step in 0..400u64 {
+        let listing = c.client.list("media").await.unwrap();
+        let files: Vec<&str> = listing.objects.iter().map(|o| o.key.as_str()).filter(|k| !k.ends_with('/')).collect();
+        let folder = folders[rnd(folders.len() as u64) as usize];
+        let at = |name: &str| if folder.is_empty() { name.to_string() } else { format!("{folder}/{name}") };
+        let what = match rnd(20) {
+            0..=6 => {
+                let key = at(&format!("f{}", rnd(8)));
+                c.client.put_bytes("media", &key, synth::bytes(step, 0, 8 * (1 + rnd(300) as usize)).into()).await.unwrap();
+                format!("put {key}")
+            }
+            7..=9 if !files.is_empty() => {
+                let key = files[rnd(files.len() as u64) as usize].to_string();
+                c.client.delete("media", &key).await.unwrap();
+                format!("delete {key}")
+            }
+            10 if !folder.is_empty() => {
+                c.client.delete("media", &format!("{folder}/")).await.unwrap();
+                format!("delete folder {folder}")
+            }
+            11 => {
+                let key = at(&format!("empty{}/", rnd(3)));
+                c.client.put_bytes("media", &key, Vec::new().into()).await.unwrap();
+                format!("marker {key}")
+            }
+            12..=13 if !files.is_empty() => {
+                let from = files[rnd(files.len() as u64) as usize].to_string();
+                let to = at(&format!("f{}", rnd(8)));
+                c.client.rename("media", &from, &to).await.unwrap();
+                format!("rename {from} -> {to}")
+            }
+            14 => {
+                let (from, to) = (folders[1 + rnd(4) as usize], format!("moved{}", rnd(2)));
+                c.client.rename("media", from, &to).await.unwrap();
+                format!("rename folder {from} -> {to}")
+            }
+            15 if !files.is_empty() => {
+                let key = files[rnd(files.len() as u64) as usize].to_string();
+                let versions = c.client.versions("media", &key).await.unwrap();
+                c.client.restore("media", &key, &versions[0].id).await.unwrap();
+                format!("restore {key}")
+            }
+            // A file and a folder trade the name "swap".
+            16 => {
+                c.client.delete("media", "swap/").await.unwrap();
+                c.client.put_bytes("media", "swap", b"a file now".to_vec().into()).await.unwrap();
+                "swap becomes a file".to_string()
+            }
+            17 => {
+                c.client.delete("media", "swap").await.unwrap();
+                c.client.put_bytes("media", "swap/inner.txt", b"a folder now".to_vec().into()).await.unwrap();
+                "swap becomes a folder".to_string()
+            }
+            _ => "nothing".to_string(),
+        };
+        assert!(c.fs.refresh().await.unwrap(), "step {step}: {what}: not applied");
+        let want = tree_from(&c.client.list("media").await.unwrap());
+        let have = tree_of(&c.fs);
+        let extra: Vec<_> = have.difference(&want).collect();
+        let missing: Vec<_> = want.difference(&have).collect();
+        assert!(extra.is_empty() && missing.is_empty(), "seed {seed}, step {step} ({what}): the drive shows extra {extra:?}, lacks {missing:?}");
+    }
+    // It really was incremental: one listing by the drive at the start, then feeds.
+    let log = c.log();
+    assert!(log.iter().filter(|e| e.method == "GET" && e.key.starts_with("?feed")).count() >= 300);
+
+    // After a redeploy the cloud cannot say what changed; the drive falls
+    // back to a full listing and carries on from there.
+    c.client.put_bytes("media", "before the restart.txt", b"x".to_vec().into()).await.unwrap();
+    c.server.restart().await.unwrap();
+    c.client.put_bytes("media", "after the restart.txt", b"y".to_vec().into()).await.unwrap();
+    assert!(c.fs.refresh().await.unwrap());
+    assert_eq!(tree_of(&c.fs), tree_from(&c.client.list("media").await.unwrap()));
+    let feeds: Vec<String> = c.log().iter().filter(|e| e.key.starts_with("?feed")).map(|e| e.key.clone()).collect();
+    assert_eq!(feeds.len(), 1);
+    assert!(feeds[0].contains("reset"), "{feeds:?}");
+    c.client.put_bytes("media", "and then.txt", b"z".to_vec().into()).await.unwrap();
+    assert!(c.fs.refresh().await.unwrap());
+    assert!(c.fs.find_path("and then.txt").is_some());
+    assert!(c.log().iter().any(|e| e.key.starts_with("?feed") && !e.key.contains("reset")));
+}
+
+/// A small patch is one request: the manifest it is planned against is
+/// remembered, and its shards travel with the commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_small_patch_is_a_single_request() {
+    let mut c = chaos(0).await;
+    let mut data = synth::bytes(95, 0, 20 * MIB);
+    let file = c.put(ROOT_ID, "film.bin", data.clone());
+    assert!(c.fs.flush(Duration::from_secs(30)).await);
+    let before = c.log().len();
+
+    for (round, at) in [(0u64, 7 * MIB + 5), (1, 13 * MIB + 9)] {
+        let patch = synth::bytes(96 + round, 0, 4096);
+        c.fs.write(file, at as u64, &patch).unwrap();
+        data[at..at + 4096].copy_from_slice(&patch);
+        assert!(c.fs.flush(Duration::from_secs(30)).await);
+    }
+    c.expect.insert("film.bin".into(), data);
+    let log = c.log();
+    let mine: Vec<&LogEntry> = log[before..].iter().filter(|e| e.method != "GET" || !e.key.is_empty()).collect();
+    let asked = mine.iter().filter(|e| e.method == "POST" && e.drive == "_shards").count();
+    let manifests = mine.iter().filter(|e| e.key.contains("?manifest")).count();
+    let commits = mine.iter().filter(|e| e.method == "PUT" && e.key == "film.bin").count();
+    let shards = mine.iter().filter(|e| e.method == "PUT" && e.drive == "_shards").count();
+    assert_eq!((asked, manifests, commits), (0, 0, 2), "two patches, two requests: {mine:?}");
+    assert!((2..=6).contains(&shards), "{shards} shards travelled inside those requests");
+    c.converge().await;
+
+    // A file someone else uploaded: the first patch has to ask for its manifest, the second does not.
+    let mut theirs = synth::bytes(97, 0, 12 * MIB);
+    c.client.put_bytes("media", "theirs.bin", theirs.clone().into()).await.unwrap();
+    c.fs.refresh().await.unwrap();
+    let file = id(&c.fs, "theirs.bin");
+    let before = c.log().len();
+    for (round, at) in [(0u64, 3 * MIB), (1, 9 * MIB)] {
+        c.fs.write(file, at as u64, &synth::bytes(98 + round, 0, 1000)).unwrap();
+        theirs[at..at + 1000].copy_from_slice(&synth::bytes(98 + round, 0, 1000));
+        assert!(c.fs.flush(Duration::from_secs(30)).await);
+        c.fs.refresh().await.unwrap();
+    }
+    let log = c.log();
+    assert_eq!(log[before..].iter().filter(|e| e.key.contains("?manifest")).count(), 1);
+    c.expect.insert("theirs.bin".into(), theirs);
+    c.converge().await;
+    c.assert_no_leaks().await;
+}
+
 // ------------------------------------------------- soak
 
 /// A long random run: an application doing ordinary and unkind things to a
@@ -691,13 +875,15 @@ async fn soak() {
         synth::word(seed, n) % below.max(1)
     };
     let mut dirs: Vec<String> = vec![String::new()];
+    // Someone else's files, in a folder the local side never touches.
+    let mut remote: Vec<String> = Vec::new();
     let mut down = false;
     let mut trace: Vec<String> = Vec::new();
 
     for step in 0..steps {
-        let files: Vec<String> = c.expect.keys().cloned().collect();
+        let files: Vec<String> = c.expect.keys().filter(|k| !k.starts_with("remote/")).cloned().collect();
         let pick_file = |r: u64| files.get(r as usize % files.len().max(1)).cloned();
-        let what = rnd(100);
+        let what = rnd(108);
         let line;
         match what {
             // create or overwrite a file
@@ -885,6 +1071,62 @@ async fn soak() {
                 uploader = tokio::spawn(c.fs.clone().run_uploader());
                 poller = tokio::spawn(c.fs.clone().run_poller());
             }
+            // someone else adds, replaces, renames or deletes a file in the cloud
+            100..=107 => {
+                if down {
+                    continue;
+                }
+                let key = format!("remote/r{}", rnd(12));
+                let op = rnd(4);
+                let done = if op <= 1 {
+                    let data = synth::bytes(seed ^ step, 0, 8 * (1 + rnd(400) as usize));
+                    line = format!("remote put {key}");
+                    c.client.put_bytes("media", &key, data.clone().into()).await.map(|_| {
+                        c.expect.insert(key.clone(), data);
+                        if !remote.contains(&key) {
+                            remote.push(key.clone());
+                        }
+                    })
+                } else if remote.is_empty() {
+                    continue;
+                } else if op == 2 {
+                    let from = remote.swap_remove(rnd(remote.len() as u64) as usize);
+                    line = format!("remote rename {from} -> {key}");
+                    c.client.rename("media", &from, &key).await.map(|_| {
+                        let data = c.expect.remove(&from).unwrap();
+                        c.expect.insert(key.clone(), data);
+                        remote.retain(|k| k != &key);
+                        remote.push(key.clone());
+                    })
+                } else {
+                    let gone = remote.swap_remove(rnd(remote.len() as u64) as usize);
+                    line = format!("remote delete {gone}");
+                    c.client.delete("media", &gone).await.map(|_| {
+                        c.expect.remove(&gone);
+                    })
+                };
+                // The cloud may be refusing or stalled at this moment; then
+                // the other side simply did not get its change in. But a
+                // request that failed may still have been carried out.
+                if done.is_err() {
+                    let listing = within(60, "a listing after a failed remote change", async {
+                        loop {
+                            if let Ok(l) = c.client.list("media").await {
+                                break l;
+                            }
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    })
+                    .await;
+                    c.expect.retain(|k, _| !k.starts_with("remote/"));
+                    remote.clear();
+                    for o in listing.objects.iter().filter(|o| o.key.starts_with("remote/")) {
+                        let data = c.client.get_range("media", &o.key, &o.version, 0, o.size).await.unwrap().to_vec();
+                        c.expect.insert(o.key.clone(), data);
+                        remote.push(o.key.clone());
+                    }
+                }
+            }
             // let time pass, so the uploader's quiet period can elapse
             _ => {
                 line = "pause".into();
@@ -893,7 +1135,8 @@ async fn soak() {
         }
         trace.push(format!("{step}: {line}"));
         // The drive's own view must match the model after every step.
-        for (key, want) in &c.expect {
+        // (The other side's files arrive when the poller gets to them.)
+        for (key, want) in c.expect.iter().filter(|(k, _)| !k.starts_with("remote/")) {
             let Some(node) = c.fs.find_path(key) else {
                 panic!("after step {step} ({line}) {key} is missing from the drive\n{}", trace[trace.len().saturating_sub(15)..].join("\n"));
             };

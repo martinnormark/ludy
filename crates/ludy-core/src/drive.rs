@@ -19,7 +19,7 @@ use ludy_cloud::shard;
 use tokio::sync::Semaphore;
 
 use crate::cache::{BlockCache, BLOCK_SIZE};
-use crate::client::{http_status, is_rejection, CloudClient, Committed, Listing, Manifest, Segment};
+use crate::client::{http_status, is_rejection, Changes, CloudClient, Committed, Listing, Manifest, ObjectInfo, Segment};
 use crate::patch::{self, Piece as Patch};
 use crate::rangeset::RangeSet;
 use crate::stats::Stats;
@@ -35,6 +35,14 @@ const FETCH_PARALLELISM: usize = 8;
 const UPLOAD_FILES: usize = 8;
 /// The longest key the cloud accepts, in bytes.
 pub const MAX_KEY_BYTES: usize = 1024;
+/// How many deletes are replayed at the same time (they do not depend on
+/// each other; everything else in the queue keeps its order).
+const DELETES_AT_ONCE: usize = 16;
+/// A patch whose new shards add up to no more than this goes up in one
+/// request, shards and commit together.
+const INLINE_PATCH_BYTES: u64 = 8 << 20;
+/// How many manifests are remembered, to plan the next patch without asking.
+const MANIFESTS_REMEMBERED: usize = 256;
 /// How many shards one upload sends at a time.
 const UPLOAD_PARALLELISM: usize = 4;
 /// Read size when streaming a run through the chunker.
@@ -154,8 +162,15 @@ struct Tree {
     /// Drive sequence number of the last listing applied.
     seq: u64,
     ops: VecDeque<NsOp>,
+    /// How many ops have ever left the front of the queue.
+    ops_done: u64,
     /// A namespace op or upload is executing right now.
     busy: bool,
+    /// See [`Changes::epoch`]: which run of the drive `seq` belongs to.
+    epoch: u64,
+    /// Folders the cloud has a marker object for. A folder without one
+    /// exists only as long as something is in it.
+    marked: HashSet<u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -243,6 +258,10 @@ pub struct DriveFs {
     /// Unsent writes from an earlier run, until the first listing arrives.
     recovered: Mutex<Option<Recovered>>,
     stopped: AtomicBool,
+    /// How much of the op queue is in `ops.log`: (ops appended, pops appended, lines).
+    ops_logged: Mutex<(u64, u64, u64)>,
+    /// Manifests of versions this drive uploaded or patched, by version id.
+    manifests: Mutex<HashMap<String, Arc<Manifest>>>,
     /// Only one pass of the uploader runs at a time, whoever asks for it.
     sync_lock: tokio::sync::Mutex<()>,
     /// Counts every change this drive has made in the cloud. A listing
@@ -272,7 +291,7 @@ impl Tree {
     fn new() -> Tree {
         let mut nodes = HashMap::new();
         nodes.insert(ROOT_ID, Node { parent: ROOT_ID, name: String::new(), mtime_ms: now_ms(), kind: Kind::Dir(BTreeMap::new()) });
-        Tree { nodes, next_id: ROOT_ID + 1, seq: 0, ops: VecDeque::new(), busy: false }
+        Tree { nodes, next_id: ROOT_ID + 1, seq: 0, ops: VecDeque::new(), ops_done: 0, busy: false, epoch: 0, marked: HashSet::new() }
     }
 
     fn dir(&self, id: u64) -> FsResult<&BTreeMap<String, u64>> {
@@ -344,6 +363,7 @@ impl Tree {
     fn detach(&mut self, id: u64) -> Vec<Node> {
         let mut out = Vec::new();
         let Some(node) = self.nodes.remove(&id) else { return out };
+        self.marked.remove(&id);
         if let Ok(children) = self.dir_mut(node.parent) {
             children.remove(&node.name);
         }
@@ -354,6 +374,7 @@ impl Tree {
         };
         out.push(node);
         while let Some(child) = stack.pop() {
+            self.marked.remove(&child);
             if let Some(n) = self.nodes.remove(&child) {
                 if let Kind::Dir(c) = &n.kind {
                     stack.extend(c.values().copied());
@@ -426,6 +447,29 @@ impl Tree {
         }
     }
 
+    fn pop_op(&mut self) {
+        if self.ops.pop_front().is_some() {
+            self.ops_done += 1;
+        }
+    }
+
+    /// Remove `dir` if nothing the cloud knows keeps it alive: no marker
+    /// object and nothing inside but files that never leave this Mac. Then
+    /// look at its parent the same way.
+    fn prune_upwards(&mut self, mut dir: u64) {
+        while dir != ROOT_ID {
+            let Some(node) = self.nodes.get(&dir) else { break };
+            let Kind::Dir(children) = &node.kind else { break };
+            let empty = children.values().all(|c| matches!(self.nodes.get(c).map(|n| &n.kind), Some(Kind::File(f)) if f.local_only));
+            if self.marked.contains(&dir) || !empty {
+                break;
+            }
+            let parent = node.parent;
+            drop_local(self.detach(dir));
+            dir = parent;
+        }
+    }
+
     fn has_unsynced(&self) -> bool {
         self.busy
             || !self.ops.is_empty()
@@ -477,7 +521,17 @@ fn load_journal(dir: &std::path::Path) -> (Option<Recovered>, u64) {
         }
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
-    let ops: Vec<NsOp> = std::fs::read(dir.join("ops.json")).ok().and_then(|raw| serde_json::from_slice(&raw).ok()).unwrap_or_default();
+    // The op log: `+<op>` joined the queue, `-` left its front. A torn last
+    // line (a crash mid-append) is ignored.
+    let mut queue: VecDeque<NsOp> = VecDeque::new();
+    for line in std::fs::read_to_string(dir.join("ops.log")).unwrap_or_default().lines() {
+        if line == "-" {
+            queue.pop_front();
+        } else if let Some(op) = line.strip_prefix('+').and_then(|json| serde_json::from_str::<NsOp>(json).ok()) {
+            queue.push_back(op);
+        }
+    }
+    let ops: Vec<NsOp> = queue.into();
     if files.is_empty() && ops.is_empty() {
         (None, next)
     } else {
@@ -508,14 +562,42 @@ impl DriveFs {
         write_atomic(&path, &serde_json::to_vec(&meta).expect("meta serializes"));
     }
 
-    /// Save the queue of namespace changes still to be replayed.
+    /// Save the queue of namespace changes still to be replayed. The file is
+    /// a log: `+<op>` for an op that joined the queue, `-` for one that left
+    /// its front. Each call appends what happened since the last one, so a
+    /// long queue is not rewritten for every change; now and then the log is
+    /// replaced by the queue as it stands.
     fn persist_ops(&self, t: &Tree) {
-        let path = self.journal_dir.join("ops.json");
+        let path = self.journal_dir.join("ops.log");
+        let mut logged = self.ops_logged.lock().unwrap();
+        let (pushed, popped) = (t.ops_done + t.ops.len() as u64, t.ops_done);
         if t.ops.is_empty() {
-            let _ = std::fs::remove_file(path);
-        } else {
-            write_atomic(&path, &serde_json::to_vec(&t.ops).expect("ops serialize"));
+            let _ = std::fs::remove_file(&path);
+            *logged = (pushed, popped, 0);
+            return;
         }
+        let line = |op: &NsOp| format!("+{}\n", serde_json::to_string(op).expect("op serializes"));
+        if logged.2 > 2 * t.ops.len() as u64 + 1000 || logged.0 > pushed || logged.1 > popped {
+            let text: String = t.ops.iter().map(line).collect();
+            write_atomic(&path, text.as_bytes());
+            *logged = (pushed, popped, t.ops.len() as u64);
+            return;
+        }
+        let mut text = "-\n".repeat((popped - logged.1) as usize);
+        let fresh = (pushed - logged.0) as usize;
+        for op in t.ops.iter().skip(t.ops.len().saturating_sub(fresh)) {
+            text.push_str(&line(op));
+        }
+        if text.is_empty() {
+            return;
+        }
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = f.write_all(text.as_bytes());
+        }
+        logged.2 += (popped - logged.1) + fresh as u64;
+        logged.0 = pushed;
+        logged.1 = popped;
     }
 
     /// Put back what an earlier run had not sent: replay its queued
@@ -527,7 +609,9 @@ impl DriveFs {
         for op in rec.ops {
             match &op {
                 NsOp::Mkdir { key } => {
-                    t.ensure_dir(key.trim_end_matches('/'), now_ms());
+                    if let Some(id) = t.ensure_dir(key.trim_end_matches('/'), now_ms()) {
+                        t.marked.insert(id);
+                    }
                 }
                 NsOp::Delete { key } => {
                     if let Some(id) = t.find_path(key.trim_end_matches('/')).filter(|id| *id != ROOT_ID) {
@@ -601,6 +685,8 @@ impl DriveFs {
                 }
             }
         }
+        // The file on disk is from the last run: write it anew.
+        *self.ops_logged.lock().unwrap() = (u64::MAX, 0, 0);
         self.persist_ops(t);
     }
 
@@ -624,6 +710,8 @@ impl DriveFs {
             journal_seq: AtomicU64::new(next_journal),
             recovered: Mutex::new(recovered),
             stopped: AtomicBool::new(false),
+            ops_logged: Mutex::new((0, 0, 0)),
+            manifests: Mutex::new(HashMap::new()),
             sync_lock: tokio::sync::Mutex::new(()),
             sync_gen: AtomicU64::new(0),
         }))
@@ -640,10 +728,96 @@ impl DriveFs {
     // ------------------------------------------------------------ listing
 
     /// Fetch the drive's listing and fold it into the tree.
+    ///
+    /// After the first listing this asks the cloud only for what changed
+    /// since the last look, so the cost follows the changes and not the
+    /// size of the drive. The full listing is the fallback whenever the
+    /// cloud cannot answer that (it restarted, the drive is a new one).
     pub async fn refresh(&self) -> anyhow::Result<bool> {
         let token = self.sync_token();
+        let (seq, epoch) = {
+            let t = self.tree.lock().unwrap();
+            (t.seq, t.epoch)
+        };
+        // Journal recovery and a forced re-read (seq 0) need the whole picture.
+        if seq > 0 && self.recovered.lock().unwrap().is_none() {
+            let changes = self.client.changes(&self.name, seq, epoch).await?;
+            if !changes.reset {
+                return Ok(self.apply_changes(&changes, token));
+            }
+        }
         let listing = self.client.list(&self.name).await?;
         Ok(self.apply_listing_if_current(&listing, token))
+    }
+
+    /// Fold a set of changes into the tree: deletes, then what they leave
+    /// empty, then additions and new versions. Same conditions as a listing:
+    /// nothing unsent locally, and nothing changed in the cloud by this
+    /// drive since `token` was taken.
+    pub fn apply_changes(&self, changes: &Changes, token: u64) -> bool {
+        let mut t = self.tree.lock().unwrap();
+        if changes.reset || changes.epoch != t.epoch || t.has_unsynced() || token != self.sync_gen.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut emptied: Vec<u64> = Vec::new();
+        for key in &changes.deleted {
+            let Some(id) = t.find_path(key.trim_end_matches('/')).filter(|id| *id != ROOT_ID) else { continue };
+            let parent = t.nodes[&id].parent;
+            match (&t.nodes[&id].kind, key.ends_with('/')) {
+                // A folder's marker object went away; the folder stays while it has content.
+                (Kind::Dir(_), true) => {
+                    t.marked.remove(&id);
+                    emptied.push(id);
+                }
+                (Kind::File(f), false) if !f.local_only => {
+                    drop_local(t.detach(id));
+                    self.readahead.lock().unwrap().remove(&id);
+                    emptied.push(parent);
+                }
+                _ => {}
+            }
+        }
+        for dir in emptied {
+            t.prune_upwards(dir);
+        }
+        for o in &changes.objects {
+            self.upsert(&mut t, o);
+        }
+        t.seq = changes.seq;
+        true
+    }
+
+    /// Make the tree show one object of the cloud: a file at its current
+    /// version, or a folder's marker.
+    fn upsert(&self, t: &mut Tree, o: &ObjectInfo) {
+        let (dir_path, is_marker) = match o.key.strip_suffix('/') {
+            Some(d) => (d, true),
+            None => (o.key.rsplit_once('/').map(|(d, _)| d).unwrap_or(""), false),
+        };
+        let Some(parent) = t.ensure_dir(dir_path, o.mtime_ms) else { return };
+        if is_marker {
+            t.marked.insert(parent);
+            return;
+        }
+        let name = o.key.rsplit('/').next().unwrap_or(&o.key);
+        let remote = Remote { version: o.version.as_str().into(), size: o.size, key: o.key.as_str().into() };
+        match t.dir(parent).ok().and_then(|c| c.get(name).copied()) {
+            Some(id) => {
+                let Some(node) = t.nodes.get_mut(&id) else { return };
+                if let Kind::File(f) = &mut node.kind {
+                    if f.remote.as_ref().map(|r| &*r.version) != Some(&*remote.version) {
+                        f.remote = Some(remote);
+                        f.size = o.size;
+                        node.mtime_ms = o.mtime_ms;
+                        self.readahead.lock().unwrap().remove(&id);
+                    }
+                }
+            }
+            None => {
+                let file = FileNode { size: o.size, remote: Some(remote), local: None, local_only: false, uploading: false };
+                t.insert(parent, name, o.mtime_ms, Kind::File(file));
+            }
+        }
     }
 
     /// Take this before fetching a listing and hand it back with the listing.
@@ -677,6 +851,7 @@ impl DriveFs {
         }
         let mut want_files: HashSet<&str> = HashSet::new();
         let mut want_dirs: HashSet<String> = HashSet::new();
+        t.marked.clear();
         for o in &listing.objects {
             let (dir_path, is_marker) = match o.key.strip_suffix('/') {
                 Some(d) => (d, true),
@@ -690,31 +865,10 @@ impl DriveFs {
                 acc.push_str(part);
                 want_dirs.insert(acc.clone());
             }
-            if is_marker {
-                t.ensure_dir(dir_path, o.mtime_ms);
-                continue;
+            if !is_marker {
+                want_files.insert(o.key.as_str());
             }
-            want_files.insert(o.key.as_str());
-            let Some(parent) = t.ensure_dir(dir_path, o.mtime_ms) else { continue };
-            let name = o.key.rsplit('/').next().unwrap_or(&o.key);
-            let remote = Remote { version: o.version.as_str().into(), size: o.size, key: o.key.as_str().into() };
-            match t.dir(parent).ok().and_then(|c| c.get(name).copied()) {
-                Some(id) => {
-                    let Some(node) = t.nodes.get_mut(&id) else { continue };
-                    if let Kind::File(f) = &mut node.kind {
-                        if f.remote.as_ref().map(|r| &*r.version) != Some(&*remote.version) {
-                            f.remote = Some(remote);
-                            f.size = o.size;
-                            node.mtime_ms = o.mtime_ms;
-                            self.readahead.lock().unwrap().remove(&id);
-                        }
-                    }
-                }
-                None => {
-                    let file = FileNode { size: o.size, remote: Some(remote), local: None, local_only: false, uploading: false };
-                    t.insert(parent, name, o.mtime_ms, Kind::File(file));
-                }
-            }
+            self.upsert(&mut t, o);
         }
         // Remove what the cloud no longer has. Children before parents.
         let mut ids: Vec<(usize, u64)> = t.nodes.keys().filter(|id| **id != ROOT_ID).map(|id| (t.key_of(*id).matches('/').count(), *id)).collect();
@@ -734,6 +888,7 @@ impl DriveFs {
             }
         }
         t.seq = listing.seq;
+        t.epoch = listing.epoch;
         if let Some(rec) = self.recovered.lock().unwrap().take() {
             self.recover(&mut t, rec);
         }
@@ -1145,6 +1300,7 @@ impl DriveFs {
         }
         let id = t.insert(dir, name, now_ms(), Kind::Dir(BTreeMap::new()));
         if !is_local_only(name) {
+            t.marked.insert(id);
             let key = format!("{}/", t.key_of(id));
             t.ops.push_back(NsOp::Mkdir { key });
             self.persist_ops(&t);
@@ -1278,50 +1434,65 @@ impl DriveFs {
         let _one_pass = self.sync_lock.lock().await;
         let mut worked = false;
         loop {
-            // Namespace changes first, strictly in order.
+            // Namespace changes first, in order. Deletes at the front of the
+            // queue do not depend on each other and go out together.
             loop {
-                let op = {
+                let run: Vec<NsOp> = {
                     let mut t = self.tree.lock().unwrap();
-                    let op = t.ops.front().cloned();
-                    t.busy = op.is_some();
-                    op
+                    let deletes = t.ops.iter().take(DELETES_AT_ONCE).take_while(|op| matches!(op, NsOp::Delete { .. })).count();
+                    let run: Vec<NsOp> = t.ops.iter().take(deletes.max(1)).cloned().collect();
+                    t.busy = !run.is_empty();
+                    run
                 };
-                let Some(op) = op else { break };
-                let result = match &op {
-                    NsOp::Delete { key } => self.client.delete(&self.name, key).await,
-                    NsOp::Rename { from, to } => self.client.rename(&self.name, from, to).await.map(|_| ()),
-                    NsOp::Mkdir { key } => self.client.put_bytes(&self.name, key, Bytes::new()).await.map(|_| ()),
-                };
+                if run.is_empty() {
+                    break;
+                }
+                let results = futures_util::future::join_all(run.iter().map(|op| async move {
+                    match op {
+                        NsOp::Delete { key } => self.client.delete(&self.name, key).await,
+                        NsOp::Rename { from, to } => self.client.rename(&self.name, from, to).await.map(|_| ()),
+                        NsOp::Mkdir { key } => self.client.put_bytes(&self.name, key, Bytes::new()).await.map(|_| ()),
+                    }
+                }))
+                .await;
                 let mut t = self.tree.lock().unwrap();
                 t.busy = false;
-                match result {
-                    Ok(()) => {
-                        // The queue only grows at the back, so the front is still `op`.
-                        t.ops.pop_front();
-                        self.persist_ops(&t);
-                        if let NsOp::Rename { from, to } = &op {
-                            t.cloud_renamed(from, to);
+                // Take them off the queue in order, up to the first that failed.
+                let mut failed = None;
+                for (op, result) in run.iter().zip(results) {
+                    match result {
+                        Ok(()) => {
+                            // The queue only grows at the back, so the front is still `op`.
+                            t.pop_op();
+                            if let NsOp::Rename { from, to } = op {
+                                t.cloud_renamed(from, to);
+                            }
+                            self.sync_gen.fetch_add(1, Ordering::Relaxed);
+                            *self.last_error.lock().unwrap() = None;
+                            worked = true;
                         }
-                        self.sync_gen.fetch_add(1, Ordering::Relaxed);
-                        *self.last_error.lock().unwrap() = None;
-                        worked = true;
-                    }
-                    // The cloud will never take this one. Repeating it would
-                    // hold up everything queued behind it for ever.
-                    Err(e) if is_rejection(&e) => {
-                        t.ops.pop_front();
-                        self.persist_ops(&t);
-                        *self.last_error.lock().unwrap() = Some(format!("the cloud refused {op:?}: {e:#}"));
-                        worked = true;
-                    }
-                    Err(e) => {
-                        *self.last_error.lock().unwrap() = Some(format!("{e:#}"));
-                        return worked;
+                        // The cloud will never take this one. Repeating it would
+                        // hold up everything queued behind it for ever.
+                        Err(e) if is_rejection(&e) => {
+                            t.pop_op();
+                            *self.last_error.lock().unwrap() = Some(format!("the cloud refused {op:?}: {e:#}"));
+                            worked = true;
+                        }
+                        Err(e) => {
+                            failed = Some(format!("{e:#}"));
+                            break;
+                        }
                     }
                 }
+                self.persist_ops(&t);
+                if let Some(e) = failed {
+                    *self.last_error.lock().unwrap() = Some(e);
+                    return worked;
+                }
             }
-            // Then files, several at a time.
-            let batch: Vec<u64> = {
+            // Then files, several at a time. The tree is scanned once per
+            // pass, not once per batch.
+            let ready: Vec<u64> = {
                 let t = self.tree.lock().unwrap();
                 if !t.ops.is_empty() {
                     continue;
@@ -1334,17 +1505,27 @@ impl DriveFs {
                         }
                         _ => None,
                     })
-                    .take(UPLOAD_FILES)
                     .collect()
             };
-            if batch.is_empty() {
+            if ready.is_empty() {
                 break;
             }
-            let results = futures_util::future::join_all(batch.into_iter().map(|id| self.upload(id))).await;
-            worked |= results.iter().any(|r| matches!(r, Ok(true)));
-            // A failure usually means the cloud is away: come back later
-            // rather than spin. The files that did upload are done.
-            if results.iter().any(|r| r.is_err()) {
+            let mut failed = false;
+            for batch in ready.chunks(UPLOAD_FILES) {
+                // A rename or delete came in: it goes first.
+                if !self.tree.lock().unwrap().ops.is_empty() {
+                    break;
+                }
+                let results = futures_util::future::join_all(batch.iter().map(|id| self.upload(*id))).await;
+                worked |= results.iter().any(|r| matches!(r, Ok(true)));
+                // A failure usually means the cloud is away: come back later
+                // rather than spin. The files that did upload are done.
+                if results.iter().any(|r| r.is_err()) {
+                    failed = true;
+                    break;
+                }
+            }
+            if failed {
                 break;
             }
         }
@@ -1374,7 +1555,18 @@ impl DriveFs {
         let pieces = match base {
             // Everything was rewritten locally: the old version does not matter.
             Some((remote, base_key)) if size > 0 && !extents.covers(0, size) => {
-                match self.client.manifest(&self.name, base_key, Some(&remote.version)).await? {
+                let known = self.manifests.lock().unwrap().get(&*remote.version).cloned();
+                let base_manifest = match known {
+                    Some(m) => Some(m),
+                    None => {
+                        let fetched = self.client.manifest(&self.name, base_key, Some(&remote.version)).await?.map(Arc::new);
+                        if let Some(m) = &fetched {
+                            self.remember_manifest(&remote.version, m.clone());
+                        }
+                        fetched
+                    }
+                };
+                match base_manifest {
                     Some(m) => {
                         let dirty: Vec<(u64, u64)> = extents.segments(0, size).into_iter().filter(|s| s.2).map(|s| (s.0, s.1)).collect();
                         patch::plan(&m.segments, (*base_len).min(remote.size), size, &dirty)
@@ -1389,9 +1581,13 @@ impl DriveFs {
         // Pass 1: cut every run into shards, keeping only (offset, length, hash).
         let mut manifest = Manifest { size, segments: Vec::with_capacity(pieces.len()) };
         let mut fresh: Vec<(u64, u64, String)> = Vec::new();
+        let mut kept = false;
         for piece in pieces {
             match piece {
-                Patch::Keep(seg) => manifest.segments.push(seg),
+                Patch::Keep(seg) => {
+                    kept = true;
+                    manifest.segments.push(seg)
+                }
                 Patch::Run { start, end } => {
                     for (offset, n, hash) in self.cut_run(snap, start, end).await? {
                         manifest.segments.push(Segment::Shard { h: hash.clone(), n });
@@ -1402,12 +1598,6 @@ impl DriveFs {
         }
         manifest.coalesce();
 
-        // Ask once which of them the cloud lacks.
-        let hashes: Vec<String> = fresh.iter().map(|s| s.2.clone()).collect::<HashSet<_>>().into_iter().collect();
-        let mut missing: HashSet<String> = self.client.missing_shards(&hashes).await?.into_iter().collect();
-        let skipped: u64 = fresh.iter().filter(|s| !missing.contains(&s.2)).map(|s| s.1).sum();
-        Stats::add(&self.stats.bytes_skipped, skipped);
-
         // Where each shard of the new file starts, to read any of them back.
         let mut at: HashMap<String, (u64, u64)> = HashMap::new();
         let mut pos = 0;
@@ -1416,6 +1606,41 @@ impl DriveFs {
                 at.entry(h.clone()).or_insert((pos, *n));
             }
             pos += seg.len();
+        }
+        let manifest = Arc::new(manifest);
+
+        let fresh_bytes: u64 = fresh.iter().map(|s| s.1).sum();
+        let mut missing: HashSet<String>;
+        if kept && !fresh.is_empty() && fresh_bytes <= INLINE_PATCH_BYTES {
+            // A small patch: its shards were cut from what was just written,
+            // so the cloud will not have them. Send them with the commit, in
+            // one request, instead of asking, sending and committing.
+            let mut inline: Vec<(String, Bytes)> = Vec::new();
+            for (offset, n, hash) in &fresh {
+                if inline.iter().any(|(h, _)| h == hash) {
+                    continue;
+                }
+                let data = self.read_snap(snap, *offset, *n).await.map_err(|e| anyhow::anyhow!("read {offset}+{n}: {e:?}"))?;
+                if shard::sha256_hex(&data) != *hash {
+                    anyhow::bail!("the file changed while it was uploading");
+                }
+                inline.push((hash.clone(), Bytes::from(data)));
+            }
+            match self.client.commit_manifest_inline(&self.name, key, &manifest, &inline, Some(mtime_ms)).await? {
+                Ok(committed) => {
+                    self.remember_manifest(&committed.version, manifest);
+                    return Ok(committed);
+                }
+                // A shard this patch keeps from the old version has been
+                // cleaned up in the cloud: send it the ordinary way.
+                Err(gone) => missing = gone.into_iter().collect(),
+            }
+        } else {
+            // Ask once which of them the cloud lacks.
+            let hashes: Vec<String> = fresh.iter().map(|s| s.2.clone()).collect::<HashSet<_>>().into_iter().collect();
+            missing = self.client.missing_shards(&hashes).await?.into_iter().collect();
+            let skipped: u64 = fresh.iter().filter(|s| !missing.contains(&s.2)).map(|s| s.1).sum();
+            Stats::add(&self.stats.bytes_skipped, skipped);
         }
 
         for _attempt in 0..2 {
@@ -1438,12 +1663,25 @@ impl DriveFs {
             }
             drop(sends);
             match self.client.commit_manifest(&self.name, key, &manifest, Some(mtime_ms)).await? {
-                Ok(committed) => return Ok(committed),
+                Ok(committed) => {
+                    self.remember_manifest(&committed.version, manifest);
+                    return Ok(committed);
+                }
                 // A shard the cloud held was cleaned up in between: send it too.
                 Err(gone) => missing = gone.into_iter().collect(),
             }
         }
         anyhow::bail!("{key}: the cloud keeps reporting missing shards")
+    }
+
+    /// Keep a version's manifest, so the next patch over it is planned
+    /// without a round trip to ask for it.
+    fn remember_manifest(&self, version: &str, manifest: Arc<Manifest>) {
+        let mut known = self.manifests.lock().unwrap();
+        if known.len() >= MANIFESTS_REMEMBERED {
+            known.clear();
+        }
+        known.insert(version.to_string(), manifest);
     }
 
     /// Cut bytes `start..end` of a snapshot into shards and return their

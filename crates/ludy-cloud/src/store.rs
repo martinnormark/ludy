@@ -1,7 +1,8 @@
 //! On-disk state of the simulated cloud.
 //!
 //! ```text
-//! <data>/drives/<drive>.json        catalog: key -> version history (last = current)
+//! <data>/drives/<drive>.json        catalog snapshot: key -> version history (last = current)
+//! <data>/drives/<drive>.log         commits since the snapshot, one JSON line each
 //! <data>/manifests/<id>.json        ordered segments of one version's content
 //! <data>/shards/<hh>/<sha256>       shard bytes, named by their hash, stored once
 //! <data>/blobs/<id>                 whole-object content from before shards (read only)
@@ -14,7 +15,7 @@
 //! version (or an upload in flight) refers to it, and a shard lives while
 //! any manifest does.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -110,6 +111,48 @@ struct DriveState {
     #[serde(default)]
     shares: Vec<Share>,
     objects: BTreeMap<String, Vec<Version>>,
+    /// Identifies this run of this drive. It changes when the server
+    /// restarts or the drive is created anew, which is when a client's idea
+    /// of "what changed since sequence N" stops being answerable.
+    #[serde(skip)]
+    epoch: u64,
+    /// Which keys each recent commit touched: (sequence number, key).
+    #[serde(skip)]
+    feed: VecDeque<(u64, String)>,
+    /// Commits at or below this sequence number are no longer in `feed`.
+    #[serde(skip)]
+    feed_floor: u64,
+    /// Lines in the log file since the last snapshot.
+    #[serde(skip)]
+    log_lines: usize,
+}
+
+/// One commit in a drive's log file: the new history of every key it
+/// touched (`None` = the key is gone).
+#[derive(Serialize, Deserialize)]
+struct LogLine {
+    seq: u64,
+    set: BTreeMap<String, Option<Vec<Version>>>,
+}
+
+/// How many commits a drive remembers for its change feed.
+const FEED_CAPACITY: usize = 200_000;
+/// The log is folded into a fresh snapshot after this many commits.
+const COMPACT_AFTER: usize = 4_000;
+
+/// What changed in a drive since a client last looked.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Changes {
+    pub drive: String,
+    pub seq: u64,
+    pub epoch: u64,
+    /// The question cannot be answered (the server restarted, the drive is
+    /// a new one, or `since` is too old): fetch the full listing instead.
+    pub reset: bool,
+    /// Objects added or changed, in their current state.
+    pub objects: Vec<ObjectInfo>,
+    /// Keys that no longer exist.
+    pub deleted: Vec<String>,
 }
 
 struct Drive {
@@ -145,6 +188,9 @@ pub struct ObjectInfo {
 pub struct Listing {
     pub drive: String,
     pub seq: u64,
+    /// See [`Changes::epoch`]; pass it back when asking for changes.
+    #[serde(default)]
+    pub epoch: u64,
     pub objects: Vec<ObjectInfo>,
     pub prefixes: Vec<String>,
 }
@@ -242,8 +288,29 @@ impl Store {
                 continue;
             }
             let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else { continue };
-            let state: DriveState = serde_json::from_slice(&std::fs::read(&path)?)
+            let mut state: DriveState = serde_json::from_slice(&std::fs::read(&path)?)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display())))?;
+            // Commits made after the snapshot. Lines the snapshot already
+            // covers are skipped; a torn last line (a crash mid-append) ends
+            // the replay.
+            if let Ok(log) = std::fs::read_to_string(path.with_extension("log")) {
+                for line in log.lines() {
+                    let Ok(entry) = serde_json::from_str::<LogLine>(line) else { break };
+                    if entry.seq <= state.seq {
+                        continue;
+                    }
+                    for (key, history) in entry.set {
+                        match history {
+                            Some(h) => state.objects.insert(key, h),
+                            None => state.objects.remove(&key),
+                        };
+                    }
+                    state.seq = entry.seq;
+                    state.log_lines += 1;
+                }
+            }
+            state.epoch = now_ms() << 16 | (drives.len() as u64 & 0xffff);
+            state.feed_floor = state.seq;
             let (seq_tx, _) = watch::channel(state.seq);
             drives.insert(name, Arc::new(Drive { state: Mutex::new(state), seq_tx }));
         }
@@ -455,6 +522,7 @@ impl Store {
         self.drive(name).await.map(|_| ())
     }
 
+    /// Write a full snapshot of a drive's catalog.
     async fn persist(&self, name: &str, state: &DriveState) -> io::Result<()> {
         let path = self.root.join("drives").join(format!("{name}.json"));
         let tmp = self.root.join("tmp").join(format!("{name}.{}.json", self.new_id()));
@@ -462,12 +530,76 @@ impl Store {
         tokio::fs::rename(&tmp, &path).await
     }
 
-    /// Bump the sequence number, write the catalog and wake long-pollers.
-    async fn commit_state(&self, name: &str, drive: &Drive, state: &mut DriveState) -> io::Result<()> {
-        state.seq += 1;
+    /// Snapshot, then drop the log the snapshot now covers. A crash between
+    /// the two leaves log lines that the next start skips by their number.
+    async fn compact(&self, name: &str, state: &mut DriveState) -> io::Result<()> {
         self.persist(name, state).await?;
+        let _ = tokio::fs::remove_file(self.root.join("drives").join(format!("{name}.log"))).await;
+        state.log_lines = 0;
+        Ok(())
+    }
+
+    fn new_epoch(&self) -> u64 {
+        now_ms() << 16 | (self.counter.fetch_add(1, Ordering::Relaxed) & 0xffff)
+    }
+
+    /// One commit: bump the sequence number, make it durable and wake
+    /// long-pollers. `touched` are the keys whose history changed; their new
+    /// state is appended to the drive's log as one line, so the cost of a
+    /// commit does not grow with the size of the drive. With no keys (a
+    /// change to the drive itself) the whole snapshot is written.
+    async fn commit_state(&self, name: &str, drive: &Drive, state: &mut DriveState, touched: &[String]) -> io::Result<()> {
+        state.seq += 1;
+        if touched.is_empty() || state.log_lines >= COMPACT_AFTER {
+            self.compact(name, state).await?;
+        } else {
+            let line = LogLine { seq: state.seq, set: touched.iter().map(|k| (k.clone(), state.objects.get(k).cloned())).collect() };
+            let mut text = serde_json::to_vec(&line).expect("log line serializes");
+            text.push(b'\n');
+            let mut log = tokio::fs::OpenOptions::new().create(true).append(true).open(self.root.join("drives").join(format!("{name}.log"))).await?;
+            log.write_all(&text).await?;
+            state.log_lines += 1;
+        }
+        for key in touched {
+            state.feed.push_back((state.seq, key.clone()));
+        }
+        while state.feed.len() > FEED_CAPACITY {
+            if let Some((seq, _)) = state.feed.pop_front() {
+                state.feed_floor = seq;
+            }
+        }
         let _ = drive.seq_tx.send(state.seq);
         Ok(())
+    }
+
+    /// What changed in a drive after sequence number `since`, for a client
+    /// that last saw it in `epoch`. Cost follows the number of changes, not
+    /// the size of the drive.
+    pub async fn changes(&self, name: &str, since: u64, epoch: u64) -> Result<Changes> {
+        let drive = self.drive(name).await?;
+        let s = drive.state.lock().await;
+        let mut out = Changes { drive: name.to_string(), seq: s.seq, epoch: s.epoch, reset: false, objects: Vec::new(), deleted: Vec::new() };
+        if epoch != s.epoch || since < s.feed_floor || since > s.seq {
+            out.reset = true;
+            return Ok(out);
+        }
+        // The feed is in sequence order: everything after `since` is at the back.
+        let start = s.feed.partition_point(|(seq, _)| *seq <= since);
+        let keys: BTreeSet<&str> = s.feed.range(start..).map(|(_, k)| k.as_str()).collect();
+        for key in keys {
+            match s.objects.get(key).and_then(|h| h.last().map(|v| (v, h.len()))) {
+                Some((v, versions)) => out.objects.push(ObjectInfo {
+                    key: key.to_string(),
+                    size: v.size,
+                    mtime_ms: v.mtime_ms,
+                    version: v.id.clone(),
+                    synthetic: self.synthetic_bytes(v) > 0,
+                    versions,
+                }),
+                None => out.deleted.push(key.to_string()),
+            }
+        }
+        Ok(out)
     }
 
     // ------------------------------------------------------------ drives
@@ -506,7 +638,7 @@ impl Store {
         if drives.contains_key(name) {
             return Err(StoreError::DriveExists);
         }
-        let state = DriveState { created_ms: now_ms(), seq: 1, ..Default::default() };
+        let state = DriveState { created_ms: now_ms(), seq: 1, epoch: self.new_epoch(), feed_floor: 1, ..Default::default() };
         self.persist(name, &state).await?;
         let (seq_tx, _) = watch::channel(state.seq);
         drives.insert(name.to_string(), Arc::new(Drive { state: Mutex::new(state), seq_tx }));
@@ -523,6 +655,7 @@ impl Store {
         let versions: Vec<Version> = state.objects.values().flatten().cloned().collect();
         // Catalog first, content after (see `commit`).
         let _ = tokio::fs::remove_file(self.root.join("drives").join(format!("{name}.json"))).await;
+        let _ = tokio::fs::remove_file(self.root.join("drives").join(format!("{name}.log"))).await;
         self.release_all(&versions);
         drop(drives);
         drop(state);
@@ -544,6 +677,10 @@ impl Store {
         state.seq = 1;
         state.forked_from = Some(from.to_string());
         state.shares.clear();
+        state.epoch = self.new_epoch();
+        state.feed.clear();
+        state.feed_floor = 1;
+        state.log_lines = 0;
         let mut drives = self.drives.write().await;
         if drives.contains_key(to) {
             return Err(StoreError::DriveExists);
@@ -567,6 +704,11 @@ impl Store {
         }
         let drive = drives.remove(from).ok_or(StoreError::NoSuchDrive)?;
         let dir = self.root.join("drives");
+        {
+            // Fold the log into the snapshot, so there is one file to move.
+            let mut state = drive.state.lock().await;
+            self.compact(from, &mut state).await?;
+        }
         tokio::fs::rename(dir.join(format!("{from}.json")), dir.join(format!("{to}.json"))).await?;
         drives.insert(to.to_string(), drive);
         Ok(())
@@ -581,7 +723,7 @@ impl Store {
         let mut s = drive.state.lock().await;
         s.shares.retain(|sh| sh.email != email);
         s.shares.push(Share { email: email.to_string(), role: role.to_string() });
-        self.commit_state(name, &drive, &mut s).await?;
+        self.commit_state(name, &drive, &mut s, &[]).await?;
         Ok(())
     }
 
@@ -589,7 +731,7 @@ impl Store {
         let drive = self.drive(name).await?;
         let mut s = drive.state.lock().await;
         s.shares.retain(|sh| sh.email != email);
-        self.commit_state(name, &drive, &mut s).await?;
+        self.commit_state(name, &drive, &mut s, &[]).await?;
         Ok(())
     }
 
@@ -641,7 +783,7 @@ impl Store {
                 versions: history.len(),
             });
         }
-        Ok(Listing { drive: name.to_string(), seq: s.seq, objects, prefixes: prefixes.into_iter().collect() })
+        Ok(Listing { drive: name.to_string(), seq: s.seq, epoch: s.epoch, objects, prefixes: prefixes.into_iter().collect() })
     }
 
     pub async fn head(&self, name: &str, key: &str, version: Option<&str>) -> Result<Version> {
@@ -707,7 +849,7 @@ impl Store {
             // The catalog goes to disk before any content is released: a
             // crash in between leaves unreferenced files (swept at the next
             // start), never a catalog that points at something deleted.
-            self.commit_state(name, &drive, &mut s).await?;
+            self.commit_state(name, &drive, &mut s, &[key.to_string()]).await?;
             self.release_all(&dropped);
             version
         };
@@ -740,7 +882,7 @@ impl Store {
                     removed.extend(h);
                 }
             }
-            self.commit_state(name, &drive, &mut s).await?;
+            self.commit_state(name, &drive, &mut s, &doomed).await?;
             self.release_all(&removed);
         }
         let n = removed.len();
@@ -777,7 +919,8 @@ impl Store {
                     replaced.extend(prev);
                 }
             }
-            self.commit_state(name, &drive, &mut s).await?;
+            let touched: Vec<String> = moves.iter().flat_map(|(old, new)| [old.clone(), new.clone()]).collect();
+            self.commit_state(name, &drive, &mut s, &touched).await?;
             self.release_all(&replaced);
             moves.len()
         };
