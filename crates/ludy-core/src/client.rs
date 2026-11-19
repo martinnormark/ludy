@@ -21,6 +21,44 @@ pub struct CloudClient {
     stats: Arc<Stats>,
 }
 
+/// The cloud answered, and the answer was an error status.
+#[derive(Debug)]
+pub struct HttpError {
+    pub status: u16,
+    pub what: String,
+    pub body: String,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {} {}", self.what, self.status, self.body)
+    }
+}
+
+impl std::error::Error for HttpError {}
+
+/// The HTTP status behind an error, if the cloud answered at all.
+pub fn http_status(e: &anyhow::Error) -> Option<u16> {
+    e.downcast_ref::<HttpError>().map(|h| h.status)
+}
+
+/// A request the cloud will refuse however often it is repeated.
+pub fn is_rejection(e: &anyhow::Error) -> bool {
+    matches!(http_status(e), Some(400 | 413 | 414))
+}
+
+/// How long a transfer may go without a single byte arriving before it is
+/// given up. Shorter than the NFS client's own 10 s timeout, so a stalled
+/// cloud turns into an I/O error for the reader and the mount stays alive.
+const STALL: Duration = Duration::from_secs(8);
+/// Total time for a small request (listing, commit, rename).
+const SMALL_REQUEST: Duration = Duration::from_secs(30);
+
+/// Total time allowed for sending `n` bytes: generous even for a slow link.
+fn transfer_timeout(n: u64) -> Duration {
+    SMALL_REQUEST + Duration::from_secs(n / 50_000)
+}
+
 /// What a successful PUT reports back.
 #[derive(Clone, Debug)]
 pub struct Committed {
@@ -94,6 +132,9 @@ impl CloudClient {
     pub fn new(base: &str, stats: Arc<Stats>) -> CloudClient {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(3))
+            // Nothing waits for ever: every request has a total time limit,
+            // raised per request where a body is large.
+            .timeout(SMALL_REQUEST)
             .pool_max_idle_per_host(16)
             .build()
             .expect("http client");
@@ -116,9 +157,9 @@ impl CloudClient {
         if resp.status().is_success() {
             return Ok(resp);
         }
-        let status = resp.status();
+        let status = resp.status().as_u16();
         let body = resp.text().await.unwrap_or_default();
-        bail!("{what}: {status} {body}")
+        Err(HttpError { status, what: what.to_string(), body }.into())
     }
 
     pub async fn drives(&self) -> Result<Vec<DriveInfo>> {
@@ -191,19 +232,20 @@ impl CloudClient {
             return Ok(Bytes::new());
         }
         Stats::add(&self.stats.range_requests, 1);
-        let mut resp = self
+        let send = self
             .http
             .get(self.url(drive, key))
             .query(&[("version", version)])
             .header("range", format!("bytes={start}-{}", start + len - 1))
-            .send()
-            .await
-            .with_context(|| format!("GET {drive}/{key}"))?;
+            .timeout(transfer_timeout(len).max(Duration::from_secs(600)))
+            .send();
+        let stalled = || anyhow!("GET {drive}/{key}: the cloud sent nothing for {} s", STALL.as_secs());
+        let mut resp = tokio::time::timeout(STALL, send).await.map_err(|_| stalled())?.with_context(|| format!("GET {drive}/{key}"))?;
         if !resp.status().is_success() {
-            bail!("GET {drive}/{key} bytes={start}+{len}: {}", resp.status());
+            return Err(HttpError { status: resp.status().as_u16(), what: format!("GET {drive}/{key} bytes={start}+{len}"), body: String::new() }.into());
         }
         let mut buf = Vec::with_capacity(len as usize);
-        while let Some(chunk) = resp.chunk().await? {
+        while let Some(chunk) = tokio::time::timeout(STALL, resp.chunk()).await.map_err(|_| stalled())?? {
             Stats::add(&self.stats.bytes_down, chunk.len() as u64);
             buf.extend_from_slice(&chunk);
         }
@@ -248,7 +290,7 @@ impl CloudClient {
     /// Upload one shard. The cloud checks that `data` hashes to `hash`.
     pub async fn put_shard(&self, hash: &str, data: Bytes) -> Result<()> {
         let n = data.len() as u64;
-        let resp = self.http.put(format!("{}/_shards/{hash}", self.base)).body(data).send().await?;
+        let resp = self.http.put(format!("{}/_shards/{hash}", self.base)).timeout(transfer_timeout(n)).body(data).send().await?;
         Self::ok(resp, "put shard").await?;
         Stats::add(&self.stats.bytes_up, n);
         Ok(())
@@ -320,7 +362,7 @@ impl CloudClient {
 
     /// Upload a body of known length. `body` may be a stream.
     pub async fn put(&self, drive: &str, key: &str, body: reqwest::Body, len: u64, mtime_ms: Option<u64>) -> Result<Committed> {
-        let mut req = self.http.put(self.url(drive, key)).header("content-length", len).body(body);
+        let mut req = self.http.put(self.url(drive, key)).header("content-length", len).timeout(transfer_timeout(len)).body(body);
         if let Some(m) = mtime_ms {
             req = req.header("x-ludy-mtime-ms", m);
         }

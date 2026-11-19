@@ -398,6 +398,22 @@ impl Store {
         }
     }
 
+    /// Delete shards no manifest lists: uploads that were abandoned before
+    /// their commit. An upload in flight loses its shards too; its commit is
+    /// then refused with the list of what is missing, and the client sends
+    /// them again. Returns how many were removed.
+    pub fn sweep_orphans(&self) -> usize {
+        let mut index = self.index.lock().unwrap();
+        let orphans: Vec<String> = index.shards.iter().filter(|(_, e)| e.refs == 0).map(|(h, _)| h.clone()).collect();
+        for h in &orphans {
+            if let Some(e) = index.shards.remove(h) {
+                index.shard_bytes -= e.len;
+            }
+            let _ = std::fs::remove_file(shard_path(&self.root, h));
+        }
+        orphans.len()
+    }
+
     pub fn shard_stats(&self) -> ShardStats {
         let index = self.index.lock().unwrap();
         ShardStats { shards: index.shards.len() as u64, shard_bytes: index.shard_bytes, manifests: index.manifests.len() as u64 }

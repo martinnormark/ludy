@@ -10,6 +10,7 @@
 //! * synthetic objects generate their bytes from the offset (see [`synth`])
 //! * configurable latency and bandwidth, and a log of every range served
 
+pub mod harness;
 pub mod shard;
 pub mod store;
 pub mod synth;
@@ -17,7 +18,7 @@ pub mod synth;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -80,24 +81,46 @@ struct Throttle {
 }
 
 impl Throttle {
+    /// Account for `n` bytes and wait until the link would have carried them.
+    /// Waits shorter than a few milliseconds are skipped and made up for
+    /// later: timers are no finer than a millisecond, so sleeping for every
+    /// 64 KiB piece would hold a fast link to half its rate.
     async fn take(&self, n: u64) {
         let rate = self.bytes_per_sec.load(Ordering::Relaxed);
         if rate == 0 {
             return;
         }
         let cost = Duration::from_secs_f64(n as f64 / rate as f64);
+        let now = Instant::now();
         let until = {
             let mut next = self.next_free.lock().unwrap();
-            let start = (*next).max(Instant::now());
+            let start = (*next).max(now);
             *next = start + cost;
             *next
         };
-        tokio::time::sleep_until(until.into()).await;
+        if until > now + Duration::from_millis(5) {
+            tokio::time::sleep_until(until.into()).await;
+        }
     }
+}
+
+/// Ways to make the cloud misbehave, for tests of what clients do about it.
+/// Set over HTTP with `PUT /_config?stall=1&unavailable=0&hold_commits=0`.
+#[derive(Default)]
+pub struct Faults {
+    /// Accept every request and never answer it.
+    pub stall: AtomicBool,
+    /// Answer every request with 503 at once.
+    pub unavailable: AtomicBool,
+    /// Keep manifest commits waiting until this is cleared.
+    pub hold_commits: AtomicBool,
+    /// How many commits are waiting right now.
+    pub commits_held: AtomicU64,
 }
 
 pub struct Cloud {
     pub store: Store,
+    pub faults: Faults,
     latency_ms: AtomicU64,
     throttle: Throttle,
     counters: Counters,
@@ -113,6 +136,7 @@ impl Cloud {
     pub fn open(cfg: &Config) -> std::io::Result<Arc<Cloud>> {
         Ok(Arc::new(Cloud {
             store: Store::open(&cfg.data_dir)?,
+            faults: Faults::default(),
             latency_ms: AtomicU64::new(cfg.latency_ms),
             throttle: Throttle {
                 bytes_per_sec: AtomicU64::new(cfg.mbps * 1_000_000 / 8),
@@ -211,6 +235,7 @@ pub fn router(cloud: Arc<Cloud>) -> Router {
         )
         // Shards are up to 16 MiB; object bodies are streamed and unlimited.
         .layer(DefaultBodyLimit::max(shard::MAX_SHARD as usize + 1024))
+        .layer(axum::middleware::from_fn_with_state(cloud.clone(), inject_faults))
         .with_state(cloud)
 }
 
@@ -224,6 +249,22 @@ pub async fn serve(cfg: Config) -> std::io::Result<(SocketAddr, Arc<Cloud>, toki
         let _ = axum::serve(listener, app).await;
     });
     Ok((addr, cloud, task))
+}
+
+/// Applies [`Faults`] to everything except the admin endpoints, so a test
+/// can always switch a fault off again.
+async fn inject_faults(State(c): State<AppState>, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let path = req.uri().path();
+    let admin = path == "/_config" || path == "/_log" || path == "/_stats";
+    if !admin {
+        if c.faults.stall.load(Ordering::Relaxed) {
+            std::future::pending::<()>().await;
+        }
+        if c.faults.unavailable.load(Ordering::Relaxed) {
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "the cloud is unavailable" }))).into_response();
+        }
+    }
+    next.run(req).await
 }
 
 // ---------------------------------------------------------------- errors
@@ -294,6 +335,19 @@ async fn put_config(State(c): State<AppState>, Query(q): Params) -> ApiResult {
     }
     if let Some(v) = q.get("mbps").and_then(|s| s.parse::<u64>().ok()) {
         c.throttle.bytes_per_sec.store(v * 1_000_000 / 8, Ordering::Relaxed);
+    }
+    let flag = |name: &str| q.get(name).map(|v| v == "1" || v == "true");
+    if let Some(on) = flag("stall") {
+        c.faults.stall.store(on, Ordering::Relaxed);
+    }
+    if let Some(on) = flag("unavailable") {
+        c.faults.unavailable.store(on, Ordering::Relaxed);
+    }
+    if let Some(on) = flag("hold_commits") {
+        c.faults.hold_commits.store(on, Ordering::Relaxed);
+    }
+    if flag("sweep") == Some(true) {
+        c.store.sweep_orphans();
     }
     get_stats(State(c)).await
 }
@@ -556,6 +610,13 @@ async fn object_put(
     // (or were in the cloud to begin with). Committing it moves no content.
     let (size, content, new_shards, new_bytes) = if q.contains_key("manifest") {
         let raw = axum::body::to_bytes(body, 64 << 20).await.map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
+        if c.faults.hold_commits.load(Ordering::Relaxed) {
+            c.faults.commits_held.fetch_add(1, Ordering::Relaxed);
+            while c.faults.hold_commits.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            c.faults.commits_held.fetch_sub(1, Ordering::Relaxed);
+        }
         let manifest: Manifest = serde_json::from_slice(&raw).map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("manifest: {e}")))?;
         match c.store.put_manifest(&manifest) {
             Ok(id) => (manifest.size, Content::Manifest { id }, 0, 0),

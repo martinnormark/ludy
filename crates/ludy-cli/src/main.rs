@@ -1,5 +1,7 @@
 //! `ludy`: the engine without the window.
 
+mod bench;
+
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -18,6 +20,8 @@ USAGE:
     ludy log [--follow]                      print the cloud's request log
     ludy mount <drive> [--read-only] [--nobrowse] [--root DIR]
                                              mount until Ctrl-C, then eject
+    ludy bench [--quick] [--latency-ms N] [--mbps N] [--label NAME] [--out FILE] [--dir DIR]
+                                             time fixed scenarios against a cloud of its own
 
 The cloud is at $LUDY_SERVER (default http://127.0.0.1:9000).
 ";
@@ -35,6 +39,10 @@ fn run() -> Result<()> {
         print!("{USAGE}");
         return Ok(());
     };
+    // The benchmark brings its own cloud and never touches the user's folders.
+    if cmd == "bench" {
+        return bench::run(&args[1..]);
+    }
     let mut cfg = EngineConfig::from_env();
     let mut rest: Vec<&str> = Vec::new();
     let mut follow = false;
