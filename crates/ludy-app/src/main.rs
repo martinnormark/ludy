@@ -1,13 +1,17 @@
 //! Ludy: cloud drives that mount in the Finder and stream on demand.
 //!
-//! usage: ludy-app [--mount DRIVE]... [--open DRIVE[/FOLDER]]
+//! usage: ludy-app [--mount DRIVE]... [--open DRIVE[/FOLDER]] [--list]
 //!
-//! `--mount` mounts a drive at launch; `--open` starts in the file browser.
+//! `--mount` mounts a drive at launch; `--open` starts in the file browser,
+//! `--list` in its list view. For checking the app without a hand on the
+//! mouse: `--demo menu|entry-menu|share|new-drive` opens that surface, and
+//! `--perf` scrolls the open folder by itself and prints frame times.
 //!
 //! Configuration comes from the environment (see `EngineConfig::from_env`):
 //! `LUDY_SERVER` (default http://127.0.0.1:9000), `LUDY_CACHE_MB`,
 //! `LUDY_MOUNT_ROOT` (default ~/Ludy), `LUDY_READ_ONLY`, `LUDY_NOBROWSE`.
 
+mod assets;
 mod theme;
 mod ui;
 
@@ -20,14 +24,17 @@ actions!(ludy, [Quit]);
 
 fn main() {
     let mut automount: Vec<String> = Vec::new();
-    let mut open: Option<String> = None;
+    let mut opts = ui::UiOptions::default();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--mount" => automount.extend(args.next()),
-            "--open" => open = args.next(),
+            "--open" => opts.open = args.next(),
+            "--list" => opts.list = true,
+            "--demo" => opts.demo = args.next(),
+            "--perf" => opts.perf = true,
             "-h" | "--help" => {
-                println!("usage: ludy-app [--mount DRIVE]... [--open DRIVE[/FOLDER]]\n\nStart the simulated cloud first: cargo run -p ludy-cloud");
+                println!("usage: ludy-app [--mount DRIVE]... [--open DRIVE[/FOLDER]] [--list]\n\nStart the simulated cloud first: cargo run -p ludy-cloud");
                 return;
             }
             other => {
@@ -56,7 +63,7 @@ fn main() {
         std::process::exit(130);
     });
 
-    Application::new().run(move |cx: &mut App| {
+    Application::new().with_assets(assets::Assets).run(move |cx: &mut App| {
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.set_menus(vec![Menu { name: "Ludy".into(), items: vec![MenuItem::action("Quit Ludy", Quit)] }]);
@@ -78,11 +85,11 @@ fn main() {
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(820.), px(560.))),
-            titlebar: Some(TitlebarOptions { title: Some("Ludy".into()), appears_transparent: true, traffic_light_position: Some(point(px(14.), px(14.))) }),
+            titlebar: Some(TitlebarOptions { title: Some("Ludy".into()), appears_transparent: true, traffic_light_position: Some(point(px(16.), px(18.))) }),
             ..Default::default()
         };
         let engine = engine.clone();
-        cx.open_window(options, move |window, cx| cx.new(|cx| ui::LudyApp::new(engine, open, window, cx))).expect("open the Ludy window");
+        cx.open_window(options, move |window, cx| cx.new(|cx| ui::LudyApp::new(engine, opts, window, cx))).expect("open the Ludy window");
         cx.activate(true);
     });
 }

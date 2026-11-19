@@ -35,7 +35,8 @@ Useful variations:
 | Command | What it does |
 |---|---|
 | `cargo run -p ludy-app -- --mount Footage` | Mount a drive at launch |
-| `cargo run -p ludy-app -- --open Footage/raw` | Start in the file browser |
+| `cargo run -p ludy-app -- --open Footage/raw` | Start in the file browser (`--list` for the list view) |
+| `cargo run -p ludy-app -- --open Footage --perf` | Scroll the folder by itself for a few seconds, print frame times, quit |
 | `cargo run -p ludy-cli -- mount Footage` | Mount from the terminal, no window; Ctrl-C ejects |
 | `cargo run -p ludy-cli -- log --follow` | Tail the cloud's range log |
 | `curl -X PUT 'http://127.0.0.1:9000/_config?mbps=50&latency_ms=120'` | Slow the link down while running |
@@ -79,6 +80,19 @@ What Ludy does about it:
 - If the app is killed outright, the mounts are soft with a 45-second dead timeout. Tested twice with `kill -9`: the kernel dropped the mount by itself 55 to 57 seconds later, and an `ls` of the dead mount in the meantime failed with "Operation timed out" instead of hanging.
 
 If you ever see a stuck eject: look for a macOS permission prompt and answer it. Do not `ls -la` the mount root in the meantime.
+
+## The app
+
+A plain file explorer in a light theme: drives in the sidebar, a toolbar with the path and the actions, the folder as a grid or a list, and a status bar with the live numbers (streamed, uploads, cache). The drives screen has one card per drive with Mount, Open, Show in Finder and eject. Right-click a drive or a file for the rest (Open in Terminal, Copy path, Rename, Share, Fork, Keep offline, Versions, Delete).
+
+Folders are drawn with a virtual list, so only the rows on screen are built each frame. Measured with `--perf` on a 60 Hz display, in the unoptimized dev build, scrolling a folder of 5,000 files at 2,400 points a second for six seconds:
+
+| View | Frames | Frame time p50 / p99 / max | Slow frames | Building elements |
+|---|---|---|---|---|
+| Grid | 361 (60.0 fps) | 16.67 / 18.62 / 18.68 ms | 0 | 0.79 ms a frame |
+| List | 361 (60.0 fps) | 16.67 / 18.69 / 18.78 ms | 0 | 0.68 ms a frame |
+
+That is the display's limit, with most of each frame to spare on the part the app controls; a 120 Hz display has not been tried. Colours are one `Theme` constant in [`theme.rs`](crates/ludy-app/src/theme.rs); there is no dark variant yet, and no thumbnails.
 
 ## How it works
 
@@ -150,7 +164,7 @@ Checked against real mounts on macOS 27.0.1, with the CLI and with the app (`--m
 Checked by hand, without a mount:
 
 - The server, with `curl`: upload of the 95 MB video, range reads compared against the source file, and mid-file bytes of a synthetic 50 GB object compared against the Python generator.
-- The app: it launches, lists drives with live totals from the server, and the file browser shows a drive's folders and files (screenshots of both screens).
+- The app, from screenshots of every surface: the drives screen with a drive mounted and not, the folder grid and list, a context menu and the share dialog (the last two opened with `--demo`).
 
 **Not verified:**
 
