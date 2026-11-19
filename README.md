@@ -4,7 +4,7 @@ Cloud drives that mount in the Finder and stream on demand. A drive holding hund
 
 The "cloud" here is simulated: a local S3-like server with configurable latency and bandwidth. The Mac app is written in Rust with [gpui](https://gpui.rs/).
 
-**Status (2026-11-19):** the server, the engine and the app are built and covered by automated tests that run without a kernel mount. **Nothing in this repository has been mounted yet.** A throwaway spike showed that the read path of the chosen mechanism works, but the real NFS adapter, mount and eject code here has never run against the kernel, and Finder, Quick Look and eject are untested. The reason is a hazard found during the spike; read [Eject and the "network volume" prompt](#eject-and-the-network-volume-prompt) before mounting.
+**Status (2026-11-19):** the server, the engine and the app are built, covered by automated tests, and checked against real mounts: listing, range-only reads, video playback, writes, remote changes, eject and the crash case all work (see [What works](#what-works-and-how-it-was-checked)). Not checked: clicking the app's buttons, and the Quick Look panel itself. One thing does not work as intended: the Finder shows a file's full size as its size "on disk". Read [Eject and the "network volume" prompt](#eject-and-the-network-volume-prompt) for a hazard to know about.
 
 ## Run it
 
@@ -28,7 +28,7 @@ Start the app.
 cargo run -p ludy-app
 ```
 
-Click **Mount** on a drive. It mounts at `~/Ludy/<drive>` and, being a browsable volume, should appear under Locations in the Finder sidebar (not yet observed). **Open** browses the drive inside the app, mounted or not. Quitting the app, or Ctrl-C in its terminal, ejects mounted drives first.
+Click **Mount** on a drive. It mounts at `~/Ludy/<drive>` and appears under Locations in the Finder sidebar as the server `ludy.localhost`, with the drive inside it and an eject button. **Open** browses the drive inside the app, mounted or not. Quitting the app, or Ctrl-C in its terminal, ejects mounted drives first.
 
 Useful variations:
 
@@ -46,7 +46,7 @@ Building needs only the Xcode Command Line Tools. gpui is built with its `runtim
 
 ## The mount mechanism: loopback NFSv3
 
-Each mounted drive is an NFSv3 server inside the app's own process (the [`nfsserve`](https://crates.io/crates/nfsserve) crate), bound to a random port on 127.0.0.1 and attached with `/sbin/mount_nfs`. This needs no driver, no kernel extension and no root.
+Each mounted drive is an NFSv3 server inside the app's own process (the [`nfsserve`](https://crates.io/crates/nfsserve) crate), bound to a random port on 127.0.0.1 and attached with `/sbin/mount_nfs`. This needs no driver, no kernel extension and no root. The mount source is `ludy.localhost:/<drive>`: macOS resolves any `*.localhost` name to the loopback address, and the Finder sidebar shows that name instead of `127.0.0.1`.
 
 Why this one:
 
@@ -58,11 +58,7 @@ Why this one:
 | Loopback SMB (what Space's CLI uses) | Would need an SMB2/3 server written from scratch. |
 | WebDAV (`mount_webdav`) | macOS's WebDAV client downloads a file to a local cache when it is opened, which defeats the purpose for a 50 GB file. Not tested here; ruled out on that basis. |
 
-What the spike measured, on a throwaway NFS server in front of an HTTP range server (that code is not in the repository):
-
-- `mount_nfs` succeeded as a normal user, and the mount had no `nobrowse` flag. Whether the Finder showed it was not observed.
-- `ls -la` showed a 50 GB and a 95 MB file with correct sizes and caused **zero** HTTP requests.
-- One 64 KiB `dd` at the 25 GB mark of the 50 GB file caused **one** NFS READ and **one** HTTP range request of 114,688 bytes.
+A throwaway spike confirmed this before anything else was built, and the measurements against the real code are under [What works](#what-works-and-how-it-was-checked): a listing causes no object request, and a 64 KiB read in the middle of a 50 GB file causes one 256 KiB range request.
 
 Mount options are in [`mount.rs`](crates/ludy-core/src/mount.rs): 256 KiB reads to match the cache block size, kernel read-ahead of 8 blocks, a one-second attribute cache so remote changes show up quickly, and a soft mount with a dead timeout so a crashed app cannot hang the Finder for long.
 
@@ -70,7 +66,7 @@ Mount options are in [`mount.rs`](crates/ludy-core/src/mount.rs): 256 KiB reads 
 
 During the spike a plain `umount` blocked forever inside the kernel's `unmount` call and could not be killed. While it was stuck, `diskarbitrationd`, `lsd`, Finder and Raycast each had a thread blocked on the half-unmounted mount point.
 
-The cause, as far as it can be established without kernel stacks: macOS asks for consent the first time an app touches a network volume (*"Raycast" would like to access files on a network volume*). Raycast's file indexer started crawling the new volume under the home folder, and the consent daemon's log shows it began prompting for Raycast seven seconds before the `umount`. Raycast's `lstat` and `getxattr` calls sat suspended on that prompt, which was still on screen an hour later, and the unmount waited behind them. Apple's NFS client has several waits without a timeout on the unmount path; which one was hit is not known. Two later mount and unmount cycles with nothing crawling the volume were clean. Whether answering the prompt releases the stuck unmount has not been tested.
+The cause, as far as it can be established without kernel stacks: macOS asks for consent the first time an app touches a network volume (*"Raycast" would like to access files on a network volume*). Raycast's file indexer started crawling the new volume under the home folder, and the consent daemon's log shows it began prompting for Raycast seven seconds before the `umount`. Raycast's `lstat` and `getxattr` calls sat suspended on that prompt, which was still on screen an hour later, and the unmount waited behind them. Apple's NFS client has several waits without a timeout on the unmount path; which one was hit is not known. Answering the prompt released it: the consent log shows the answer at 07:02:26 the next morning, and the `umount` and the blocked threads were gone without a reboot. Eight mount and eject cycles since then, hidden and Finder-visible, were clean, each eject taking one to two seconds.
 
 What Ludy does about it:
 
@@ -80,7 +76,7 @@ What Ludy does about it:
 - If the watchdog expires, the drive is shown as "eject did not finish" with a hint to answer any pending permission prompt, and the eject completes by itself once the kernel lets it through. A force-unmount probably cannot beat a call held by a prompt; the watchdog is the real protection.
 - A stuck eject is recorded on disk with the `umount` process id. While that process is alive, Ludy refuses to mount at the same path, even after a restart.
 - The mount table is read with `getmntinfo(MNT_NOWAIT)`. The app's own process never stats, creates or removes a mount-point path; `mkdir` and `rmdir` run as child processes.
-- If the app is killed outright, the mounts are soft with a 45-second dead timeout, so the kernel should drop them. This is untested.
+- If the app is killed outright, the mounts are soft with a 45-second dead timeout. Tested with `kill -9`: the kernel dropped the mount by itself about 55 seconds later, and an `ls` of the dead mount in the meantime returned instead of hanging.
 
 If you ever see a stuck eject: look for a macOS permission prompt and answer it. Do not `ls -la` the mount root in the meantime.
 
@@ -106,7 +102,7 @@ If you ever see a stuck eject: look for a macOS permission prompt and answer it.
 
 **Reads.** A read maps to the 256 KiB blocks that cover it. Blocks already in the cache are read from disk. Missing neighbours are fetched with one range request of at most 2 MiB, several requests run in parallel, and concurrent readers of the same block share one request. A sequential reader gets read-ahead that grows to 8 MiB; a random read fetches only what it asked for.
 
-**Cache.** Blocks are keyed by `(version id, block index)`. A version never changes, so a cached block is never stale. The cache has a byte cap and evicts the least recently used blocks. Finder's "on disk" size for a file is the number of bytes of it held locally, so an untouched file shows zero bytes on disk.
+**Cache.** Blocks are keyed by `(version id, block index)`. A version never changes, so a cached block is never stale. The cache has a byte cap and evicts the least recently used blocks. The NFS server reports each file's locally held bytes as its space used, but the macOS NFS client ignores that and reports the full size, so the Finder's "on disk" figure and `du` show the cloud size (a test with a fixed value confirmed the client does not use it). What the Mac really holds is shown in the app, under "On this Mac".
 
 **Writes.** A write goes to a sparse journal file and returns. An existing cloud file is not downloaded first: the journal records which byte ranges were written and reads merge them with the cloud version underneath. When a file has been quiet for 1.5 seconds it is uploaded as a new version. Renames, deletes and new folders are queued and replayed on the cloud in order. `.DS_Store` and `._*` files stay on the Mac.
 
@@ -138,18 +134,33 @@ Checked by `cargo test` (25 integration tests and 15 unit tests, no kernel mount
 - The NFS adapter serves lookups, paginated listings, reads and writes, and rejects file handles from an earlier mount.
 - Server: HTTP range semantics, versions and restore, `If-Match` races, rename, fork without copying, long-poll, throttling, the range log, and persistence across restarts.
 
-Checked by hand:
+Checked against real mounts on macOS 27.0.1, with the CLI and with the app (`--mount`), using the demo data from `scripts/seed-demo.sh`:
 
-- The server, with `curl`: upload of the 95 MB video, range reads compared against the source file, and mid-file bytes of a synthetic 50 GB object compared against an independent SplitMix64 written in Python.
+- **Listing.** `ls -la` shows every file at its real size, the 50 GB one included, and causes no object request.
+- **Mid-file read.** A 64 KiB `dd` at the 25 GiB mark of the 50 GB file returns bytes equal to an independent SplitMix64 written in Python, and the server log shows one request: `bytes=26843545600-26843807743` (256 KiB). The cache grew by 256 KiB.
+- **Video.** Playing `demo.mp4` (95 MB, 104 s) from the mount with AVPlayer, the framework Quick Look uses: first frame after 0.18 s, 7.7 s played in 8 s of wall time, 14 range requests of 256 KiB to 2 MiB covering the first 16 MB, cache at 15 MB. A Quick Look thumbnail (`qlmanage -t`) was produced from the mount.
+- **Finder.** The mount has no `nobrowse` flag, the sidebar lists `ludy.localhost` under Locations with an eject button, and the computer view lists the drive as a remote volume.
+- **Writes.** `cp` of a 3 MB file returned in 0.08 s; the PUT followed in the background and the server's copy has the same SHA-256. `mkdir`, `mv` and `rm` reached the server in order. `._*` files stayed local.
+- **Remote changes.** A file put on the server with `curl`, and one deleted there, showed in `ls` within three seconds.
+- **Eject.** Ctrl-C in the CLI and SIGTERM to the app both ejected in one to two seconds, with a Finder window open on the volume, and a write made just before the eject was uploaded first. No mount was left behind in eight cycles.
+- **The app.** Started with `--mount Footage`, it mounted the drive, showed the card as mounted with its path, and the status panel counted the range request and the cache blocks.
+- **Crash.** See the previous section: the kernel drops the mount of a killed process after about 55 seconds.
+
+Checked by hand, without a mount:
+
+- The server, with `curl`: upload of the 95 MB video, range reads compared against the source file, and mid-file bytes of a synthetic 50 GB object compared against the Python generator.
 - The app: it launches, lists drives with live totals from the server, and the file browser shows a drive's folders and files (screenshots of both screens).
 
-**Not yet verified:**
+**Not verified:**
 
-- Any real mount of this code. `mount_nfs` against the real NFS adapter, and the eject path, have never run.
-- Mount, Open, Show in Finder and Eject from the app.
-- The drive appearing in the Finder sidebar, and Quick Look playing the video while the cache stays smaller than the file.
-- Writes through the Finder (copying a file in), and how quickly the Finder notices a server-side change. The engine picks changes up within two seconds; when the Finder redraws is up to the Finder.
-- Clicks in the app. Every button was wired and compiles, but only the two screens' rendering was looked at.
+- **Clicks in the app.** Every button is wired and compiles, and Mount and quit-ejects were exercised through `--mount` and SIGTERM, which call the same engine functions. No button, menu or dialog has been clicked: synthetic clicks need an Accessibility permission this build was not given.
+- **The Quick Look panel** (space bar in the Finder). `qlmanage -p` crashes on any movie on this macOS version, the local file included, so playback was checked with AVPlayer instead.
+- **Dragging a file in with the Finder**, and how quickly a Finder window redraws after a server-side change. Both were checked from the shell only.
+- **Another app raising the "network volume" prompt during an eject.** The watchdog path for that is written but has only been reasoned about.
+
+**Does not work as intended:**
+
+- The Finder's "on disk" size is the full file size, not the cached bytes (see Cache above).
 
 ## Not built
 

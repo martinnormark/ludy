@@ -63,7 +63,7 @@ pub fn is_mounted(mountpoint: &Path) -> bool {
 
 /// Loopback NFS mounts under `root` (leftovers if no server of ours owns them).
 pub fn ludy_mounts(root: &Path) -> Vec<MountEntry> {
-    mount_table().into_iter().filter(|m| m.fstype == "nfs" && m.from.starts_with("127.0.0.1:/") && m.on.starts_with(root)).collect()
+    mount_table().into_iter().filter(|m| m.fstype == "nfs" && m.from.starts_with(&format!("{MOUNT_HOST}:/")) && m.on.starts_with(root)).collect()
 }
 
 /// Start serving `fs` over NFSv3 on a free loopback port.
@@ -141,6 +141,10 @@ pub struct AttachOptions {
     pub browse: bool,
 }
 
+/// The name the volume's server gets in the Finder sidebar. macOS resolves any
+/// `*.localhost` name to the loopback address without configuration.
+pub const MOUNT_HOST: &str = "ludy.localhost";
+
 pub fn mount_options(port: u16, opts: &AttachOptions) -> String {
     let mut o = vec![
         // No lock daemon on our side; NFSv3 over TCP on our port.
@@ -186,7 +190,7 @@ pub async fn attach(port: u16, export: &str, mountpoint: &Path, opts: &AttachOpt
     let mut child = Command::new("/sbin/mount_nfs")
         .arg("-o")
         .arg(mount_options(port, opts))
-        .arg(format!("127.0.0.1:/{export}"))
+        .arg(format!("{MOUNT_HOST}:/{export}"))
         .arg(mountpoint)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
