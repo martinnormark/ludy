@@ -1193,12 +1193,19 @@ impl DriveFs {
         }
         // Replace whatever is at the destination.
         if let Some(target) = t.dir(to_dir)?.get(to_name).copied() {
-            if let Kind::Dir(children) = &t.nodes[&target].kind {
-                if !children.is_empty() {
-                    return Err(FsError::NotEmpty);
-                }
-            }
+            let replaced = match &t.nodes[&target].kind {
+                Kind::Dir(children) if !children.is_empty() => return Err(FsError::NotEmpty),
+                Kind::Dir(_) => (!is_local_only(to_name)).then(|| format!("{}/", t.key_of(target))),
+                Kind::File(f) => (!f.local_only && (f.remote.is_some() || f.uploading)).then(|| t.key_of(target)),
+            };
             drop_local(t.detach(target));
+            // What the cloud has there has to go, whatever takes its place:
+            // the file moving in may never have been uploaded, and may be
+            // deleted again before it is.
+            if let Some(key) = replaced {
+                t.ops.push_back(NsOp::Delete { key });
+                self.persist_ops(&t);
+            }
         }
         t.dir_mut(from_dir)?.remove(from_name);
         t.touch(from_dir);

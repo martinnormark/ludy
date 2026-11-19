@@ -96,7 +96,9 @@ impl Chaos {
         let files: Vec<_> = listing.objects.iter().filter(|o| !o.key.ends_with('/')).collect();
         let have: Vec<&str> = files.iter().map(|o| o.key.as_str()).collect();
         let want: Vec<&str> = self.expect.keys().map(String::as_str).collect();
-        assert_eq!(have, want, "the cloud's files differ from what was written");
+        let extra: Vec<&&str> = have.iter().filter(|k| !want.contains(k)).collect();
+        let missing: Vec<&&str> = want.iter().filter(|k| !have.contains(k)).collect();
+        assert!(extra.is_empty() && missing.is_empty(), "the cloud's files differ from what was written: extra {extra:?}, missing {missing:?}");
         for o in files {
             let want = &self.expect[&o.key];
             assert_eq!(o.size, want.len() as u64, "{} has the wrong size", o.key);
@@ -492,4 +494,419 @@ async fn unsent_writes_survive_a_quit_with_the_cloud_down() {
     // A clean stop with nothing pending leaves no journal behind.
     c.fs.stop();
     assert_eq!(std::fs::read_dir(c.dir.path().join("journal")).map(|d| d.count()).unwrap_or(0), 0);
+}
+
+// ------------------------------------------------- second pass: nastier interleavings
+
+/// `mv` on a cloud file, then open it at once: the rename has not reached
+/// the cloud yet, so the content still lives under the old name there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cloud_file_renamed_locally_can_be_read_and_patched_before_the_rename_syncs() {
+    let mut c = chaos(0).await;
+    let body = synth::bytes(51, 0, 3 * MIB);
+    c.client.put_bytes("media", "rushes/take one.mov", body.clone().into()).await.unwrap();
+    c.fs.refresh().await.unwrap();
+    let dir = id(&c.fs, "rushes");
+    c.fs.rename(dir, "take one.mov", dir, "take 1 (selected).mov").unwrap();
+    c.fs.rename(ROOT_ID, "rushes", ROOT_ID, "selects").unwrap();
+    let file = id(&c.fs, "selects/take 1 (selected).mov");
+
+    // Nothing has synced. Reading must go to the cloud's old key.
+    let (got, _) = within(10, "reading a renamed file", c.fs.read(file, MIB as u64, 5000)).await.unwrap();
+    assert!(got == body[MIB..MIB + 5000]);
+    // Patch it under its new name, then let everything sync.
+    c.fs.write(file, 2 * MIB as u64, b"cut here").unwrap();
+    let mut want = body.clone();
+    want[2 * MIB..2 * MIB + 8].copy_from_slice(b"cut here");
+    let (got, _) = c.fs.read(file, 2 * MIB as u64 - 4, 16).await.unwrap();
+    assert!(got == want[2 * MIB - 4..2 * MIB + 12]);
+    c.expect.insert("selects/take 1 (selected).mov".into(), want);
+    c.converge().await;
+    // A patch, not a re-upload: under 3 MiB went up.
+    assert!(c.stats.sample().bytes_up < 3 * MIB as u64 + 3 * MIB as u64, "{}", c.stats.sample().bytes_up);
+    c.assert_no_leaks().await;
+}
+
+/// The application keeps working on files whose upload is in flight:
+/// writes more, renames one, deletes another.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn files_changed_renamed_and_deleted_while_they_upload_end_up_right() {
+    let mut c = chaos(0).await;
+    let cloud = c.server.cloud();
+    cloud.faults.hold_commits.store(true, Ordering::Relaxed);
+    let grows = c.put(ROOT_ID, "grows.bin", synth::bytes(61, 0, 2 * MIB));
+    c.put(ROOT_ID, "moves.bin", synth::bytes(62, 0, 2 * MIB));
+    c.put(ROOT_ID, "dies.bin", synth::bytes(63, 0, 2 * MIB));
+    let fs = c.fs.clone();
+    let flush = tokio::spawn(async move { fs.flush(Duration::from_secs(60)).await });
+    until(20, "three commits reaching the cloud", || cloud.faults.commits_held.load(Ordering::Relaxed) == 3).await;
+
+    // All three are mid-upload now.
+    c.fs.write(grows, 2 * MIB as u64, b" and a tail").unwrap();
+    c.expect.get_mut("grows.bin").unwrap().extend_from_slice(b" and a tail");
+    c.fs.rename(ROOT_ID, "moves.bin", ROOT_ID, "moved.bin").unwrap();
+    let moved = c.expect.remove("moves.bin").unwrap();
+    c.expect.insert("moved.bin".into(), moved);
+    c.fs.remove(ROOT_ID, "dies.bin").unwrap();
+    c.expect.remove("dies.bin");
+
+    cloud.faults.hold_commits.store(false, Ordering::Relaxed);
+    assert!(within(70, "the flush", flush).await.unwrap(), "{:?}", c.fs.pending());
+    c.converge().await;
+    c.assert_no_leaks().await;
+}
+
+/// Names that need care in a URL, in a path, or in a JSON file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn awkward_names_round_trip() {
+    let mut c = chaos(0).await;
+    let names = [
+        "100% done?.txt",
+        "a#b&c=d+e.txt",
+        "naïve café — résumé.txt",
+        "日本語のファイル.txt",
+        "emoji 🎬🎞.mov",
+        " leading and trailing space ",
+        "back\\slash and \"quotes\".txt",
+        "semi;colon,comma.txt",
+        "..hidden..dots..",
+        "tab\there.txt",
+    ];
+    let dir = c.fs.mkdir(ROOT_ID, "strange names & folders #1").unwrap();
+    for (i, name) in names.iter().enumerate() {
+        c.put(dir, name, synth::bytes(700 + i as u64, 0, 1000 + i));
+    }
+    let longest = "n".repeat(255);
+    c.put(dir, &longest, b"255 byte name".to_vec());
+    c.fs.rename(dir, "100% done?.txt", dir, "200% done??.txt").unwrap();
+    let moved = c.expect.remove("strange names & folders #1/100% done?.txt").unwrap();
+    c.expect.insert("strange names & folders #1/200% done??.txt".into(), moved);
+    c.fs.remove(dir, "tab\there.txt").unwrap();
+    c.expect.remove("strange names & folders #1/tab\there.txt");
+    c.converge().await;
+
+    // And they survive a crash on their way up.
+    c.server.kill();
+    c.put(dir, "written offline ✈.txt", b"offline".to_vec());
+    c.fs.rename(dir, "emoji 🎬🎞.mov", dir, "emoji renamed 🎬.mov").unwrap();
+    let moved = c.expect.remove("strange names & folders #1/emoji 🎬🎞.mov").unwrap();
+    c.expect.insert("strange names & folders #1/emoji renamed 🎬.mov".into(), moved);
+    c.server.restart().await.unwrap();
+    c.fs = DriveFs::new("media", c.client.clone(), c.cache.clone(), c.stats.clone(), c.dir.path().join("journal")).unwrap();
+    c.fs.refresh().await.unwrap();
+    c.converge().await;
+}
+
+/// Two writers: someone else replaces a file in the cloud while a local
+/// patch to the old version is waiting. The local save lands last and wins;
+/// the other version stays in the history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_patch_and_a_remote_edit_both_end_up_in_the_history() {
+    let mut c = chaos(0).await;
+    let v1 = synth::bytes(71, 0, 3 * MIB);
+    c.client.put_bytes("media", "shared.bin", v1.clone().into()).await.unwrap();
+    c.fs.refresh().await.unwrap();
+    let file = id(&c.fs, "shared.bin");
+    c.fs.write(file, 100, b"mine").unwrap();
+    let theirs = synth::bytes(72, 0, 2 * MIB);
+    c.client.put_bytes("media", "shared.bin", theirs.clone().into()).await.unwrap();
+
+    let mut mine = v1.clone();
+    mine[100..104].copy_from_slice(b"mine");
+    c.expect.insert("shared.bin".into(), mine);
+    c.converge().await;
+    let versions = c.client.versions("media", "shared.bin").await.unwrap();
+    assert_eq!(versions.len(), 3, "original, theirs, mine");
+    let second = c.client.get_range("media", "shared.bin", &versions[1].id, 0, versions[1].size).await.unwrap();
+    assert!(second[..] == theirs[..], "the other writer's version is still there");
+}
+
+/// Quit in the middle of an upload, start again: the upload is done over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_quit_in_the_middle_of_an_upload_is_finished_by_the_next_start() {
+    let mut c = chaos(0).await;
+    let cloud = c.server.cloud();
+    cloud.faults.hold_commits.store(true, Ordering::Relaxed);
+    c.put(ROOT_ID, "half sent.bin", synth::bytes(81, 0, 6 * MIB));
+    c.put(ROOT_ID, "small.txt", b"also on its way".to_vec());
+    let fs = c.fs.clone();
+    let flush = tokio::spawn(async move { fs.flush(Duration::from_secs(60)).await });
+    until(20, "a commit reaching the cloud", || cloud.faults.commits_held.load(Ordering::Relaxed) >= 1).await;
+    // The process goes away with requests in flight.
+    flush.abort();
+    c.fs.stop();
+    cloud.faults.hold_commits.store(false, Ordering::Relaxed);
+
+    c.fs = DriveFs::new("media", c.client.clone(), c.cache.clone(), c.stats.clone(), c.dir.path().join("journal")).unwrap();
+    c.fs.refresh().await.unwrap();
+    c.converge().await;
+    c.assert_no_leaks().await;
+}
+
+/// Found by the soak: a new file is renamed over a file the cloud has, and
+/// deleted again before it was ever uploaded. The cloud's file must go too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replacing_a_cloud_file_with_a_new_one_and_deleting_that_leaves_nothing() {
+    let mut c = chaos(0).await;
+    c.client.put_bytes("media", "report.txt", b"the old report".to_vec().into()).await.unwrap();
+    c.client.put_bytes("media", "notes/keep.txt", b"keep".to_vec().into()).await.unwrap();
+    c.fs.refresh().await.unwrap();
+    c.expect.insert("notes/keep.txt".into(), b"keep".to_vec());
+
+    let draft = c.fs.create(ROOT_ID, "draft.txt", false).unwrap();
+    c.fs.write(draft, 0, b"the new report").unwrap();
+    c.fs.rename(ROOT_ID, "draft.txt", ROOT_ID, "report.txt").unwrap();
+    c.fs.remove(ROOT_ID, "report.txt").unwrap();
+    c.converge().await;
+
+    // The same, but the replacement is kept: one file, the new content.
+    c.client.put_bytes("media", "plan.txt", b"old plan".to_vec().into()).await.unwrap();
+    c.fs.refresh().await.unwrap();
+    let draft = c.fs.create(ROOT_ID, "plan draft.txt", false).unwrap();
+    c.fs.write(draft, 0, b"new plan").unwrap();
+    c.fs.rename(ROOT_ID, "plan draft.txt", ROOT_ID, "plan.txt").unwrap();
+    c.expect.insert("plan.txt".into(), b"new plan".to_vec());
+    c.converge().await;
+}
+
+// ------------------------------------------------- soak
+
+/// A long random run: an application doing ordinary and unkind things to a
+/// drive while the cloud is killed, restarted, stalled and made to refuse
+/// requests, and the app itself is killed and started again. The seed is
+/// printed; `CHAOS_SEED=n CHAOS_STEPS=n cargo test -p ludy-core --test chaos soak -- --ignored --nocapture`
+/// repeats a run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "minutes long; run on demand"]
+async fn soak() {
+    let seed: u64 = std::env::var("CHAOS_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or_else(|| ludy_cloud::now_ms() % 100_000);
+    let steps: u64 = std::env::var("CHAOS_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(400);
+    eprintln!("soak: CHAOS_SEED={seed} CHAOS_STEPS={steps}");
+    let mut c = chaos(1).await;
+    let mut uploader = tokio::spawn(c.fs.clone().run_uploader());
+    let mut poller = tokio::spawn(c.fs.clone().run_poller());
+    let mut n = 0u64;
+    let mut rnd = move |below: u64| {
+        n += 1;
+        synth::word(seed, n) % below.max(1)
+    };
+    let mut dirs: Vec<String> = vec![String::new()];
+    let mut down = false;
+    let mut trace: Vec<String> = Vec::new();
+
+    for step in 0..steps {
+        let files: Vec<String> = c.expect.keys().cloned().collect();
+        let pick_file = |r: u64| files.get(r as usize % files.len().max(1)).cloned();
+        let what = rnd(100);
+        let line;
+        match what {
+            // create or overwrite a file
+            0..=29 => {
+                let dir = dirs[rnd(dirs.len() as u64) as usize].clone();
+                let name = format!("f{}", rnd(40));
+                let size = match rnd(10) {
+                    0 => 0,
+                    1 => 600_000 + rnd(900_000) as usize,
+                    _ => 1 + rnd(5000) as usize,
+                };
+                let key = if dir.is_empty() { name.clone() } else { format!("{dir}/{name}") };
+                line = format!("create {key} ({size} bytes)");
+                let parent = c.fs.find_path(&dir).unwrap();
+                let data = synth::bytes(seed ^ step, 0, size.next_multiple_of(8))[..size].to_vec();
+                match c.fs.create(parent, &name, false) {
+                    Ok(file) => {
+                        c.fs.set_size(file, 0).unwrap();
+                        for (i, piece) in data.chunks(BLOCK_SIZE as usize).enumerate() {
+                            c.fs.write(file, i as u64 * BLOCK_SIZE, piece).unwrap();
+                        }
+                        c.expect.insert(key, data);
+                    }
+                    Err(FsError::IsDir) => {}
+                    Err(e) => panic!("step {step}: {line}: {e:?}"),
+                }
+            }
+            // patch a file in place
+            30..=44 => {
+                let Some(key) = pick_file(rnd(1000)) else { continue };
+                let len = c.expect[&key].len();
+                if len == 0 {
+                    continue;
+                }
+                let at = rnd(len as u64) as usize;
+                let patch = synth::bytes(step, 0, 64)[..(1 + rnd(60) as usize)].to_vec();
+                line = format!("patch {key} at {at} (+{})", patch.len());
+                // Reading the rest of a cloud file needs the cloud; writing never does.
+                c.fs.write(id(&c.fs, &key), at as u64, &patch).unwrap();
+                let data = c.expect.get_mut(&key).unwrap();
+                if data.len() < at + patch.len() {
+                    data.resize(at + patch.len(), 0);
+                }
+                data[at..at + patch.len()].copy_from_slice(&patch);
+            }
+            // truncate or grow
+            45..=49 => {
+                let Some(key) = pick_file(rnd(1000)) else { continue };
+                let new_len = rnd(c.expect[&key].len() as u64 + 2000) as usize;
+                line = format!("resize {key} to {new_len}");
+                c.fs.set_size(id(&c.fs, &key), new_len as u64).unwrap();
+                c.expect.get_mut(&key).unwrap().resize(new_len, 0);
+            }
+            // rename a file
+            50..=59 => {
+                let Some(key) = pick_file(rnd(1000)) else { continue };
+                let (from_dir, from_name) = key.rsplit_once('/').unwrap_or(("", &key));
+                let to_dir = dirs[rnd(dirs.len() as u64) as usize].clone();
+                let to_name = format!("f{}", rnd(40));
+                let to_key = if to_dir.is_empty() { to_name.clone() } else { format!("{to_dir}/{to_name}") };
+                line = format!("rename {key} -> {to_key}");
+                match c.fs.rename(c.fs.find_path(from_dir).unwrap(), from_name, c.fs.find_path(&to_dir).unwrap(), &to_name) {
+                    Ok(()) => {
+                        if to_key != key {
+                            let data = c.expect.remove(&key).unwrap();
+                            c.expect.insert(to_key, data);
+                        }
+                    }
+                    Err(FsError::NotEmpty) | Err(FsError::IsDir) => {}
+                    Err(e) => panic!("step {step}: {line}: {e:?}"),
+                }
+            }
+            // delete a file
+            60..=67 => {
+                let Some(key) = pick_file(rnd(1000)) else { continue };
+                line = format!("delete {key}");
+                let (dir, name) = key.rsplit_once('/').unwrap_or(("", &key));
+                c.fs.remove(c.fs.find_path(dir).unwrap(), name).unwrap();
+                c.expect.remove(&key);
+            }
+            // make a folder
+            68..=73 => {
+                let parent = dirs[rnd(dirs.len() as u64) as usize].clone();
+                if parent.matches('/').count() >= 3 {
+                    continue;
+                }
+                let name = format!("d{}", rnd(6));
+                let path = if parent.is_empty() { name.clone() } else { format!("{parent}/{name}") };
+                line = format!("mkdir {path}");
+                match c.fs.mkdir(c.fs.find_path(&parent).unwrap(), &name) {
+                    Ok(_) => dirs.push(path),
+                    Err(FsError::Exists) => {}
+                    Err(e) => panic!("step {step}: {line}: {e:?}"),
+                }
+            }
+            // rename a folder, with everything in it
+            74..=77 => {
+                if dirs.len() < 2 {
+                    continue;
+                }
+                let from = dirs[1 + rnd(dirs.len() as u64 - 1) as usize].clone();
+                let (parent, name) = from.rsplit_once('/').unwrap_or(("", &from));
+                let to_name = format!("d{}", rnd(6));
+                let to = if parent.is_empty() { to_name.clone() } else { format!("{parent}/{to_name}") };
+                line = format!("rename folder {from} -> {to}");
+                let p = c.fs.find_path(parent).unwrap();
+                match c.fs.rename(p, name, p, &to_name) {
+                    Ok(()) if to != from => {
+                        let prefix = format!("{from}/");
+                        // An empty folder at the destination was replaced.
+                        dirs.retain(|d| d != &to && !d.starts_with(&format!("{to}/")));
+                        for d in dirs.iter_mut() {
+                            if *d == from {
+                                *d = to.clone();
+                            } else if let Some(rest) = d.strip_prefix(&prefix) {
+                                *d = format!("{to}/{rest}");
+                            }
+                        }
+                        c.expect = c.expect.iter().map(|(k, v)| (k.strip_prefix(&prefix).map(|rest| format!("{to}/{rest}")).unwrap_or_else(|| k.clone()), v.clone())).collect();
+                    }
+                    Ok(()) => {}
+                    Err(FsError::NotEmpty) | Err(FsError::NotDir) => {}
+                    Err(e) => panic!("step {step}: {line}: {e:?}"),
+                }
+            }
+            // read something back and compare (only what cannot need a dead cloud)
+            78..=85 => {
+                let Some(key) = pick_file(rnd(1000)) else { continue };
+                let want = &c.expect[&key];
+                if want.is_empty() || down {
+                    continue;
+                }
+                let at = rnd(want.len() as u64) as usize;
+                let len = (1 + rnd(8000) as usize).min(want.len() - at);
+                line = format!("read {key} at {at}+{len}");
+                match within(30, &line, c.fs.read(id(&c.fs, &key), at as u64, len as u32)).await {
+                    Ok((got, _)) => assert!(got[..] == want[at..at + len], "step {step}: {line}: wrong bytes"),
+                    // The cloud may be refusing or stalled; an error is allowed, wrong bytes never.
+                    Err(FsError::Io(_)) => {}
+                    Err(e) => panic!("step {step}: {line}: {e:?}"),
+                }
+            }
+            // the cloud dies, or comes back
+            86..=89 => {
+                if down {
+                    line = "cloud restarts".into();
+                    c.server.restart().await.unwrap();
+                    down = false;
+                } else {
+                    line = "cloud is killed".into();
+                    c.server.kill();
+                    down = true;
+                }
+            }
+            // the cloud refuses or stalls for a moment
+            90..=93 => {
+                if down {
+                    continue;
+                }
+                let stall = rnd(2) == 0;
+                line = format!("cloud {} for a moment", if stall { "stalls" } else { "refuses" });
+                let cloud = c.server.cloud();
+                let flag = if stall { &cloud.faults.stall } else { &cloud.faults.unavailable };
+                flag.store(true, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(50 + rnd(250))).await;
+                flag.store(false, Ordering::Relaxed);
+            }
+            // the app is killed and started again (it needs the cloud to start)
+            94..=96 => {
+                if down {
+                    continue;
+                }
+                line = "app is killed and restarted".into();
+                uploader.abort();
+                poller.abort();
+                let _ = (&mut uploader).await;
+                let _ = (&mut poller).await;
+                c.fs = DriveFs::new("media", c.client.clone(), c.cache.clone(), c.stats.clone(), c.dir.path().join("journal")).unwrap();
+                within(60, "the listing after a restart", async {
+                    while c.fs.refresh().await.is_err() {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                })
+                .await;
+                uploader = tokio::spawn(c.fs.clone().run_uploader());
+                poller = tokio::spawn(c.fs.clone().run_poller());
+            }
+            // let time pass, so the uploader's quiet period can elapse
+            _ => {
+                line = "pause".into();
+                tokio::time::sleep(Duration::from_millis(rnd(400))).await;
+            }
+        }
+        trace.push(format!("{step}: {line}"));
+        // The drive's own view must match the model after every step.
+        for (key, want) in &c.expect {
+            let Some(node) = c.fs.find_path(key) else {
+                panic!("after step {step} ({line}) {key} is missing from the drive\n{}", trace[trace.len().saturating_sub(15)..].join("\n"));
+            };
+            let size = c.fs.getattr(node).unwrap().size;
+            assert_eq!(size, want.len() as u64, "after step {step} ({line}) {key} has the wrong size\n{}", trace[trace.len().saturating_sub(15)..].join("\n"));
+        }
+    }
+    if down {
+        c.server.restart().await.unwrap();
+    }
+    poller.abort();
+    eprintln!("soak: {} files, {} folders at the end; converging", c.expect.len(), dirs.len());
+    c.converge().await;
+    uploader.abort();
+    c.assert_no_leaks().await;
 }

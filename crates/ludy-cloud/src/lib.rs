@@ -400,7 +400,10 @@ async fn drive_put(State(c): State<AppState>, Path(drive): Path<String>) -> ApiR
 async fn drive_delete(State(c): State<AppState>, Path(drive): Path<String>) -> ApiResult {
     let t0 = Instant::now();
     c.latency().await;
-    c.store.delete_drive(&drive).await?;
+    {
+        let (c, drive) = (c.clone(), drive.clone());
+        to_the_end(async move { c.store.delete_drive(&drive).await }).await?;
+    }
     c.record(&Method::DELETE, &drive, "", None, StatusCode::NO_CONTENT, 0, t0);
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -584,6 +587,29 @@ async fn object_get(
     Ok((status, h, Body::from_stream(stream)).into_response())
 }
 
+/// Run a change to the store to its end even if the request that asked for
+/// it is cancelled (the client hung up). A change does two things in order,
+/// write the catalog and release what it no longer lists, and must not be
+/// dropped between them.
+async fn to_the_end<T: Send + 'static>(change: impl std::future::Future<Output = Result<T, StoreError>> + Send + 'static) -> Result<T, StoreError> {
+    tokio::spawn(change).await.unwrap_or_else(|e| Err(StoreError::Io(std::io::Error::other(format!("the cloud is shutting down: {e}")))))
+}
+
+/// One reference to stored content, given up when this is dropped. A
+/// request can be cancelled at any await (the client hung up); holding the
+/// reference in a value makes sure it is released whichever way the
+/// handler ends.
+struct Held {
+    cloud: Arc<Cloud>,
+    content: Content,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.cloud.store.release(&self.content);
+    }
+}
+
 async fn object_put(
     State(c): State<AppState>,
     Path((drive, key)): Path<(String, String)>,
@@ -599,7 +625,10 @@ async fn object_put(
     // A synthetic object is declared by size alone; no body is stored.
     if let Some(size) = headers.get("x-ludy-synthetic-size").and_then(|v| v.to_str().ok()).and_then(parse_size) {
         let seed = headers.get("x-ludy-synthetic-seed").and_then(|v| v.to_str().ok()).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let v = c.store.commit(&drive, &key, size, Content::Synthetic { seed }, if_match.as_deref(), mtime_ms).await?;
+        let v = {
+            let (c, drive, key) = (c.clone(), drive.clone(), key.clone());
+            to_the_end(async move { c.store.commit(&drive, &key, size, Content::Synthetic { seed }, if_match.as_deref(), mtime_ms).await }).await?
+        };
         c.record(&Method::PUT, &drive, &key, None, StatusCode::CREATED, 0, t0);
         return Ok((StatusCode::CREATED, version_headers(&c, &v)).into_response());
     }
@@ -608,7 +637,7 @@ async fn object_put(
 
     // `?manifest`: the body is a manifest whose shards were uploaded already
     // (or were in the cloud to begin with). Committing it moves no content.
-    let (size, content, new_shards, new_bytes) = if q.contains_key("manifest") {
+    let (size, held, new_shards, new_bytes) = if q.contains_key("manifest") {
         let raw = axum::body::to_bytes(body, 64 << 20).await.map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
         if c.faults.hold_commits.load(Ordering::Relaxed) {
             c.faults.commits_held.fetch_add(1, Ordering::Relaxed);
@@ -619,7 +648,7 @@ async fn object_put(
         }
         let manifest: Manifest = serde_json::from_slice(&raw).map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("manifest: {e}")))?;
         match c.store.put_manifest(&manifest) {
-            Ok(id) => (manifest.size, Content::Manifest { id }, 0, 0),
+            Ok(id) => (manifest.size, Held { cloud: c.clone(), content: Content::Manifest { id } }, 0, 0),
             Err(StoreError::MissingShards(missing)) => {
                 c.record(&Method::PUT, &drive, &key, None, StatusCode::CONFLICT, 0, t0);
                 return Ok((StatusCode::CONFLICT, Json(json!({ "error": "shards missing", "missing": missing }))).into_response());
@@ -641,15 +670,25 @@ async fn object_put(
         }
         let tmp = upload.finish().await.map_err(StoreError::Io)?;
         let (cloud, path) = (c.clone(), tmp.clone());
-        let ingested = tokio::task::spawn_blocking(move || cloud.store.ingest(&path)).await.expect("ingest does not panic");
-        let _ = tokio::fs::remove_file(&tmp).await;
-        let i = ingested?;
-        (i.size, i.content, i.new_shards, i.new_bytes)
+        // The reference is wrapped inside the blocking task, so it is given
+        // up even if nobody is waiting for the result any more.
+        let ingested = tokio::task::spawn_blocking(move || {
+            let done = cloud.store.ingest(&path);
+            let _ = std::fs::remove_file(&path);
+            done.map(|i| (i.size, i.new_shards, i.new_bytes, Held { cloud: cloud.clone(), content: i.content }))
+        })
+        .await
+        .unwrap_or_else(|e| Err(StoreError::Io(std::io::Error::other(format!("the cloud is shutting down: {e}")))));
+        let (size, new_shards, new_bytes, held) = ingested?;
+        (size, held, new_shards, new_bytes)
     };
 
-    let committed = c.store.commit(&drive, &key, size, content.clone(), if_match.as_deref(), mtime_ms).await;
+    let committed = {
+        let (c, drive, key, content) = (c.clone(), drive.clone(), key.clone(), held.content.clone());
+        to_the_end(async move { c.store.commit(&drive, &key, size, content, if_match.as_deref(), mtime_ms).await }).await
+    };
     // The version now holds its own reference (or the commit failed).
-    c.store.release(&content);
+    drop(held);
     let v = match committed {
         Ok(v) => v,
         Err(e) => {
@@ -673,12 +712,18 @@ async fn object_post(State(c): State<AppState>, Path((drive, key)): Path<(String
     let t0 = Instant::now();
     c.latency().await;
     if let Some(to) = q.get("rename") {
-        let moved = c.store.rename(&drive, &key, to).await?;
+        let moved = {
+            let (c, drive, key, to) = (c.clone(), drive.clone(), key.clone(), to.clone());
+            to_the_end(async move { c.store.rename(&drive, &key, &to).await }).await?
+        };
         c.record(&Method::POST, &drive, &format!("{key} -> {to}"), None, StatusCode::OK, 0, t0);
         return Ok(Json(json!({ "moved": moved })).into_response());
     }
     if let Some(version) = q.get("restore") {
-        let v = c.store.restore(&drive, &key, version).await?;
+        let v = {
+            let (c, drive, key, version) = (c.clone(), drive.clone(), key.clone(), version.clone());
+            to_the_end(async move { c.store.restore(&drive, &key, &version).await }).await?
+        };
         c.record(&Method::POST, &drive, &format!("{key} restore {version}"), None, StatusCode::OK, 0, t0);
         return Ok((StatusCode::OK, version_headers(&c, &v)).into_response());
     }
@@ -688,7 +733,10 @@ async fn object_post(State(c): State<AppState>, Path((drive, key)): Path<(String
 async fn object_delete(State(c): State<AppState>, Path((drive, key)): Path<(String, String)>) -> ApiResult {
     let t0 = Instant::now();
     c.latency().await;
-    let res = c.store.delete(&drive, &key).await;
+    let res = {
+        let (c, drive, key) = (c.clone(), drive.clone(), key.clone());
+        to_the_end(async move { c.store.delete(&drive, &key).await }).await
+    };
     let status = if res.is_ok() { StatusCode::NO_CONTENT } else { StatusCode::NOT_FOUND };
     c.record(&Method::DELETE, &drive, &key, None, status, 0, t0);
     res?;

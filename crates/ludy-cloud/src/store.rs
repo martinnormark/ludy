@@ -514,10 +514,19 @@ impl Store {
     }
 
     pub async fn delete_drive(&self, name: &str) -> Result<()> {
-        let drive = self.drives.write().await.remove(name).ok_or(StoreError::NoSuchDrive)?;
+        let drive = self.drive(name).await?;
+        let state = drive.state.lock().await;
+        let mut drives = self.drives.write().await;
+        if drives.remove(name).is_none() {
+            return Err(StoreError::NoSuchDrive);
+        }
+        let versions: Vec<Version> = state.objects.values().flatten().cloned().collect();
+        // Catalog first, content after (see `commit`).
         let _ = tokio::fs::remove_file(self.root.join("drives").join(format!("{name}.json"))).await;
-        let versions: Vec<Version> = drive.state.lock().await.objects.values().flatten().cloned().collect();
-        self.drop_versions(&versions).await;
+        self.release_all(&versions);
+        drop(drives);
+        drop(state);
+        self.gc(blob_ids(versions.iter())).await;
         Ok(())
     }
 
@@ -695,10 +704,14 @@ impl Store {
             history.push(version.clone());
             let excess = history.len().saturating_sub(MAX_HISTORY);
             dropped = history.drain(..excess).collect::<Vec<_>>();
+            // The catalog goes to disk before any content is released: a
+            // crash in between leaves unreferenced files (swept at the next
+            // start), never a catalog that points at something deleted.
             self.commit_state(name, &drive, &mut s).await?;
+            self.release_all(&dropped);
             version
         };
-        self.drop_versions(&dropped).await;
+        self.gc(blob_ids(dropped.iter())).await;
         Ok(version)
     }
 
@@ -728,9 +741,10 @@ impl Store {
                 }
             }
             self.commit_state(name, &drive, &mut s).await?;
+            self.release_all(&removed);
         }
         let n = removed.len();
-        self.drop_versions(&removed).await;
+        self.gc(blob_ids(removed.iter())).await;
         Ok(n)
     }
 
@@ -764,9 +778,10 @@ impl Store {
                 }
             }
             self.commit_state(name, &drive, &mut s).await?;
+            self.release_all(&replaced);
             moves.len()
         };
-        self.drop_versions(&replaced).await;
+        self.gc(blob_ids(replaced.iter())).await;
         Ok(moved)
     }
 
@@ -790,12 +805,12 @@ impl Store {
     }
 
     /// Versions that left every catalog they were in: give up their content.
-    async fn drop_versions(&self, versions: &[Version]) {
+    fn release_all(&self, versions: &[Version]) {
         for v in versions {
             self.release(&v.content);
         }
-        self.gc(blob_ids(versions.iter())).await;
     }
+
 
     /// Delete the blobs in `candidates` that no catalog refers to any more.
     async fn gc(&self, candidates: BTreeSet<String>) {
@@ -864,8 +879,15 @@ where
                 continue;
             }
             let path = manifest_path(root, id);
-            let manifest: Manifest = serde_json::from_slice(&std::fs::read(&path).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display())))?;
+            // A version whose manifest cannot be read is damage; say so and
+            // keep serving everything else rather than refuse to start.
+            let manifest: Manifest = match std::fs::read(&path).map_err(|e| e.to_string()).and_then(|raw| serde_json::from_slice(&raw).map_err(|e| e.to_string())) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("ludy-cloud: version {} has no readable manifest ({}: {e})", v.id, path.display());
+                    continue;
+                }
+            };
             for s in &manifest.segments {
                 if let Segment::Shard { h, .. } = s {
                     if let Some(sh) = index.shards.get_mut(h) {
