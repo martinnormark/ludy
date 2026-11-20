@@ -190,6 +190,17 @@ async fn scenarios(o: &Opts) -> Result<Vec<Row>> {
         rows.push(Row { name, result: format!("{} / {}", secs(percentile(&times, 0.5)), secs(percentile(&times, 0.99))), note: format!("{reads} reads; {note}") });
     }
 
+    // The start of a file read front to back, before read-ahead has built
+    // up: what opening a clip costs. Nothing above has touched these blocks.
+    let head = 8 * BLOCK_SIZE;
+    let t = Instant::now();
+    let mut off = 0;
+    while off < head {
+        let (data, _) = fs.read(file, off, BLOCK_SIZE as u32).await.map_err(|e| anyhow::anyhow!("read: {e:?}"))?;
+        off += data.len() as u64;
+    }
+    rows.push(Row { name: "First 2 MiB of a file, cold", result: secs(t.elapsed()), note: "256 KiB reads from the start of the file".into() });
+
     // ---- a folder with many files
     let many = if o.quick { 500 } else { 5000 };
     client.create_drive("many").await?;
@@ -208,6 +219,22 @@ async fn scenarios(o: &Opts) -> Result<Vec<Row>> {
     }
     rows.push(Row { name: "Open a drive with many files", result: secs(listed), note: format!("{many} files: fetch the listing and build the tree") });
     rows.push(Row { name: "List that folder again", result: secs(readdir), note: "from the tree in memory".into() });
+    // The kernel's NFS client asks for a folder a page at a time.
+    let page = 100;
+    let t = Instant::now();
+    let (mut after, mut paged) = (0, 0u64);
+    loop {
+        let (entries, end) = fs_many.readdir_page(ROOT_ID, after, page).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        paged += entries.len() as u64;
+        after = entries.last().map(|(_, attr)| attr.id).unwrap_or(0);
+        if end || entries.is_empty() {
+            break;
+        }
+    }
+    if paged != many {
+        bail!("paged through {paged} of {many} files");
+    }
+    rows.push(Row { name: "List that folder in pages", result: secs(t.elapsed()), note: format!("{many} files, {page} at a time, as the NFS client asks for them") });
 
     // ---- writes
     client.create_drive("work").await?;

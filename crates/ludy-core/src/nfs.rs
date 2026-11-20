@@ -166,14 +166,9 @@ impl NFSFileSystem for NfsDrive {
 
     async fn readdir(&self, dirid: fileid3, start_after: fileid3, max_entries: usize) -> Result<ReadDirResult, nfsstat3> {
         self.fs.note_activity();
-        let all = self.fs.readdir(dirid).map_err(stat)?;
         // The cookie is the id of the last entry the client already has.
-        let skip = if start_after == 0 { 0 } else { all.iter().position(|(_, a)| a.id == start_after).map(|p| p + 1).unwrap_or(0) };
-        let mut entries = Vec::new();
-        for (n, a) in all.iter().skip(skip).take(max_entries.max(1)) {
-            entries.push(DirEntry { fileid: a.id, name: n.as_bytes().into(), attr: self.fattr(a) });
-        }
-        let end = skip + entries.len() >= all.len();
+        let (page, end) = self.fs.readdir_page(dirid, start_after, max_entries.max(1)).map_err(stat)?;
+        let entries = page.iter().map(|(n, a)| DirEntry { fileid: a.id, name: n.as_bytes().into(), attr: self.fattr(a) }).collect();
         Ok(ReadDirResult { entries, end })
     }
 

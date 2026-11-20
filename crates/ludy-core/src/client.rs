@@ -54,6 +54,37 @@ const STALL: Duration = Duration::from_secs(8);
 /// Total time for a small request (listing, commit, rename).
 const SMALL_REQUEST: Duration = Duration::from_secs(30);
 
+fn stalled(what: &str) -> anyhow::Error {
+    anyhow!("{what}: the cloud sent nothing for {} s", STALL.as_secs())
+}
+
+/// The body of a range request, arriving.
+pub struct RangeBody {
+    resp: reqwest::Response,
+    stats: Arc<Stats>,
+    what: String,
+    start: u64,
+    len: u64,
+    got: u64,
+}
+
+impl RangeBody {
+    /// The next piece of the body, or `None` once exactly the bytes asked
+    /// for have arrived. A body that is longer or shorter is an error, and
+    /// so is one that stops arriving.
+    pub async fn chunk(&mut self) -> Result<Option<Bytes>> {
+        let chunk = tokio::time::timeout(STALL, self.resp.chunk()).await.map_err(|_| stalled(&self.what))??;
+        if let Some(chunk) = &chunk {
+            Stats::add(&self.stats.bytes_down, chunk.len() as u64);
+            self.got += chunk.len() as u64;
+        }
+        if self.got > self.len || (chunk.is_none() && self.got != self.len) {
+            bail!("{}: wanted {} bytes at {}, got {}{}", self.what, self.len, self.start, self.got, if chunk.is_some() { " and more" } else { "" });
+        }
+        Ok(chunk)
+    }
+}
+
 /// Total time allowed for sending `n` bytes: generous even for a slow link.
 fn transfer_timeout(n: u64) -> Duration {
     SMALL_REQUEST + Duration::from_secs(n / 50_000)
@@ -238,6 +269,18 @@ impl CloudClient {
         if len == 0 {
             return Ok(Bytes::new());
         }
+        let mut body = self.open_range(drive, key, version, start, len).await?;
+        let mut buf = Vec::with_capacity(len as usize);
+        while let Some(chunk) = body.chunk().await? {
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(Bytes::from(buf))
+    }
+
+    /// Start a range request for `len` bytes (more than none) at `start` of
+    /// one specific version, and hand back its body to be read piece by
+    /// piece, so a caller can use the first bytes before the last arrive.
+    pub async fn open_range(&self, drive: &str, key: &str, version: &str, start: u64, len: u64) -> Result<RangeBody> {
         Stats::add(&self.stats.range_requests, 1);
         let send = self
             .http
@@ -246,20 +289,12 @@ impl CloudClient {
             .header("range", format!("bytes={start}-{}", start + len - 1))
             .timeout(transfer_timeout(len).max(Duration::from_secs(600)))
             .send();
-        let stalled = || anyhow!("GET {drive}/{key}: the cloud sent nothing for {} s", STALL.as_secs());
-        let mut resp = tokio::time::timeout(STALL, send).await.map_err(|_| stalled())?.with_context(|| format!("GET {drive}/{key}"))?;
+        let what = format!("GET {drive}/{key}");
+        let resp = tokio::time::timeout(STALL, send).await.map_err(|_| stalled(&what))?.with_context(|| what.clone())?;
         if !resp.status().is_success() {
-            return Err(HttpError { status: resp.status().as_u16(), what: format!("GET {drive}/{key} bytes={start}+{len}"), body: String::new() }.into());
+            return Err(HttpError { status: resp.status().as_u16(), what: format!("{what} bytes={start}+{len}"), body: String::new() }.into());
         }
-        let mut buf = Vec::with_capacity(len as usize);
-        while let Some(chunk) = tokio::time::timeout(STALL, resp.chunk()).await.map_err(|_| stalled())?? {
-            Stats::add(&self.stats.bytes_down, chunk.len() as u64);
-            buf.extend_from_slice(&chunk);
-        }
-        if buf.len() as u64 != len {
-            bail!("GET {drive}/{key}: wanted {len} bytes at {start}, got {}", buf.len());
-        }
-        Ok(Bytes::from(buf))
+        Ok(RangeBody { resp, stats: self.stats.clone(), what, start, len, got: 0 })
     }
 
     fn committed(resp: &reqwest::Response) -> Result<Committed> {

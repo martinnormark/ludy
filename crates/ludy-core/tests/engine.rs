@@ -73,6 +73,53 @@ async fn listing_shows_real_sizes_and_downloads_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folder_is_listed_in_pages_with_every_entry_once() {
+    let r = rig().await;
+    for i in 0..21u64 {
+        r.client.put_synthetic("media", &format!("shots/clip-{i:02}.mov"), 1000 + i, i).await.unwrap();
+    }
+    r.client.put_synthetic("media", "other/take.mov", 5, 5).await.unwrap();
+    r.fs.refresh().await.unwrap();
+    let dir = id(&r.fs, "shots");
+    let all: Vec<String> = r.fs.readdir(dir).unwrap().into_iter().map(|(n, _)| n).collect();
+    assert_eq!(all.len(), 21);
+
+    // 7 divides 21: the third page is full and is still the last one.
+    for max in [1usize, 5, 7, 21, 100] {
+        let (mut names, mut after, mut pages) = (Vec::new(), 0, 0);
+        loop {
+            let (page, end) = r.fs.readdir_page(dir, after, max).unwrap();
+            assert!(!page.is_empty() && page.len() <= max, "a page of {} with {max} asked for", page.len());
+            pages += 1;
+            after = page.last().unwrap().1.id;
+            names.extend(page.into_iter().map(|(n, _)| n));
+            if end {
+                break;
+            }
+        }
+        assert_eq!(names, all, "pages of {max}");
+        assert_eq!(pages, 21usize.div_ceil(max), "pages of {max}");
+    }
+
+    // Continuing after the last entry is an empty page at the end.
+    let last = id(&r.fs, "shots/clip-20.mov");
+    assert_eq!(r.fs.readdir_page(dir, last, 5).unwrap(), (Vec::new(), true));
+
+    // An entry that is gone, or one of another folder, is no place to
+    // continue from: the listing starts over.
+    let gone = id(&r.fs, "shots/clip-07.mov");
+    r.fs.remove(dir, "clip-07.mov").unwrap();
+    for after in [gone, id(&r.fs, "other/take.mov"), 999_999] {
+        let (page, end) = r.fs.readdir_page(dir, after, 5).unwrap();
+        assert_eq!(page[0].0, "clip-00.mov");
+        assert_eq!((page.len(), end), (5, false));
+    }
+    let after = id(&r.fs, "shots/clip-06.mov");
+    assert_eq!(r.fs.readdir_page(dir, after, 1).unwrap().0[0].0, "clip-08.mov");
+    assert!(r.fs.readdir_page(last, 0, 5).is_err(), "a file has no pages");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reading_the_middle_of_a_50gb_file_fetches_only_that_range() {
     let r = rig().await;
     r.client.put_synthetic("media", "huge.bin", 50 * GIB, 99).await.unwrap();
@@ -138,6 +185,11 @@ async fn sequential_reads_trigger_read_ahead_in_coalesced_ranges() {
     assert!(furthest >= off + 4 * BLOCK_SIZE, "read-ahead should be well past the reader: read to {off}, fetched to {furthest}");
     assert!(ranges.iter().all(|e| e.bytes <= 8 * BLOCK_SIZE), "each request is at most 2 MiB");
     assert!(ranges.len() < 12, "sequential blocks are coalesced: {} requests for 12 reads", ranges.len());
+    // Read-ahead goes out in whole requests, with no single block left over
+    // at the end of one: only the first two reads, made before it starts,
+    // ask for one block.
+    let single = ranges.iter().filter(|e| e.bytes == BLOCK_SIZE).count();
+    assert_eq!(single, 2, "requests for a single block: {:?}", ranges.iter().map(|e| e.range.unwrap()).collect::<Vec<_>>());
     // No block is fetched twice.
     let total: u64 = ranges.iter().map(|e| e.bytes).sum();
     assert_eq!(total, r.cache.snapshot().bytes);
@@ -173,6 +225,39 @@ async fn concurrent_readers_of_one_block_share_a_single_fetch() {
         assert_eq!(h.await.unwrap(), synth::bytes(3, 5 * BLOCK_SIZE + i as u64 * 1000, 4096));
     }
     assert_eq!(r.ranges().len(), 1, "six readers of the same block, one request");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_block_is_served_when_it_arrives_not_when_its_request_ends() {
+    let r = rig().await;
+    r.client.put_synthetic("media", "clip.mov", GIB, 3).await.unwrap();
+    r.fs.refresh().await.unwrap();
+    let file = id(&r.fs, "clip.mov");
+    // At 16 Mbit/s a 2 MiB request takes about a second, one block of it an eighth of that.
+    r.client.set_server_config(None, Some(16)).await.unwrap();
+    let t0 = Instant::now();
+    let whole = {
+        let fs = r.fs.clone();
+        tokio::spawn(async move {
+            let (data, _) = fs.read(file, 40 * BLOCK_SIZE, 8 * BLOCK_SIZE as u32).await.unwrap();
+            (data, t0.elapsed())
+        })
+    };
+    while r.ranges().is_empty() {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    // A second reader wants only the first block of that request.
+    let (first, _) = r.fs.read(file, 40 * BLOCK_SIZE + 1000, 4096).await.unwrap();
+    let first_took = t0.elapsed();
+    assert_eq!(first, synth::bytes(3, 40 * BLOCK_SIZE + 1000, 4096));
+    let cached = r.cache.snapshot().bytes;
+    assert!((BLOCK_SIZE..8 * BLOCK_SIZE).contains(&cached), "the block is in the cache and the request is still arriving: {cached} bytes cached");
+
+    let (data, whole_took) = whole.await.unwrap();
+    assert_eq!(data, synth::bytes(3, 40 * BLOCK_SIZE, 8 * BLOCK_SIZE as usize));
+    assert_eq!(r.ranges().len(), 1, "both readers were served by the one request");
+    assert!(first_took * 3 < whole_took, "the first block took {first_took:?} of the request's {whole_took:?}");
+    assert_eq!(r.cache.snapshot().bytes, 8 * BLOCK_SIZE);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -12,8 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
-use futures_util::future::{BoxFuture, FutureExt, Shared};
+use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use ludy_proto::shard;
 use tokio::sync::Semaphore;
@@ -99,6 +98,30 @@ struct Local {
     last_write: Instant,
 }
 
+/// Node ids are counted up from 1 and nobody outside chooses them, so the
+/// tree's map does not need the standard hasher's defence against chosen
+/// keys, which costs more than the rest of a lookup.
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl std::hash::Hasher for IdHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.write_u64(self.0 ^ *b as u64);
+        }
+    }
+
+    fn write_u64(&mut self, id: u64) {
+        self.0 = id.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type IdMap<V> = HashMap<u64, V, std::hash::BuildHasherDefault<IdHasher>>;
+
 struct FileNode {
     size: u64,
     remote: Option<Remote>,
@@ -118,6 +141,9 @@ struct Node {
     name: String,
     mtime_ms: u64,
     kind: Kind,
+    /// The last full listing that named this node (see `Tree::listings`),
+    /// which is how the one after it finds what the cloud no longer has.
+    listed: u64,
 }
 
 /// What is saved next to a journal file, so the writes in it survive the
@@ -157,7 +183,7 @@ enum NsOp {
 }
 
 struct Tree {
-    nodes: HashMap<u64, Node>,
+    nodes: IdMap<Node>,
     next_id: u64,
     /// Drive sequence number of the last listing applied.
     seq: u64,
@@ -171,6 +197,8 @@ struct Tree {
     /// Folders the cloud has a marker object for. A folder without one
     /// exists only as long as something is in it.
     marked: HashSet<u64>,
+    /// How many full listings have been applied.
+    listings: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -197,16 +225,67 @@ struct ReadAhead {
     ahead_until: u64,
 }
 
+/// One range request for consecutive blocks, in flight. A block is handed
+/// to the readers waiting for it as soon as it has arrived and is in the
+/// cache; nobody waits for the rest of the request.
 struct Run {
     first: u64,
-    data: Bytes,
+    /// The blocks that have arrived, in order from `first`.
+    blocks: Mutex<Vec<Bytes>>,
+    progress: tokio::sync::watch::Sender<Progress>,
 }
 
-type RunFuture = Shared<BoxFuture<'static, Result<Arc<Run>, Arc<str>>>>;
+#[derive(Clone, Default)]
+struct Progress {
+    /// How many blocks have arrived.
+    arrived: u64,
+    /// Why no more will: set when the request ends before its last block.
+    failed: Option<Arc<str>>,
+}
+
+impl Run {
+    /// Block `idx`, once it is here.
+    async fn block(&self, idx: u64) -> Result<Bytes, Arc<str>> {
+        let n = idx - self.first;
+        let mut progress = self.progress.subscribe();
+        let seen = progress.wait_for(|p| p.arrived > n || p.failed.is_some()).await.map_err(|_| Arc::<str>::from("the fetch was abandoned"))?.clone();
+        if seen.arrived > n {
+            return Ok(self.blocks.lock().unwrap()[n as usize].clone());
+        }
+        Err(seen.failed.unwrap_or_else(|| "the fetch failed".into()))
+    }
+}
+
+/// Ends a run however its task ends, including by being dropped half way:
+/// its blocks stop counting as in flight, and readers still waiting for one
+/// that did not arrive get an error instead of waiting for ever.
+struct RunEnd {
+    fs: Arc<DriveFs>,
+    version: Arc<str>,
+    run: Arc<Run>,
+    count: u64,
+    error: Option<String>,
+}
+
+impl Drop for RunEnd {
+    fn drop(&mut self) {
+        if let Ok(mut inflight) = self.fs.inflight.lock() {
+            for idx in self.run.first..self.run.first + self.count {
+                inflight.remove(&(self.version.clone(), idx));
+            }
+        }
+        let (count, error) = (self.count, self.error.take());
+        self.run.progress.send_modify(|p| {
+            if p.arrived < count {
+                p.failed = Some(error.unwrap_or_else(|| "the fetch was abandoned".into()).into());
+            }
+        });
+    }
+}
 
 enum Piece {
     Cached(u64),
-    Pending(u64, RunFuture),
+    Pending(u64, Arc<Run>),
 }
 
 /// Everything needed to read a file's bytes without holding the tree lock.
@@ -247,7 +326,7 @@ pub struct DriveFs {
     stats: Arc<Stats>,
     journal_dir: PathBuf,
     tree: Mutex<Tree>,
-    inflight: Mutex<HashMap<(Arc<str>, u64), RunFuture>>,
+    inflight: Mutex<HashMap<(Arc<str>, u64), Arc<Run>>>,
     readahead: Mutex<HashMap<u64, ReadAhead>>,
     fetch_sem: Arc<Semaphore>,
     uploading: Mutex<Option<String>>,
@@ -289,9 +368,9 @@ fn valid_name(name: &str) -> bool {
 
 impl Tree {
     fn new() -> Tree {
-        let mut nodes = HashMap::new();
-        nodes.insert(ROOT_ID, Node { parent: ROOT_ID, name: String::new(), mtime_ms: now_ms(), kind: Kind::Dir(BTreeMap::new()) });
-        Tree { nodes, next_id: ROOT_ID + 1, seq: 0, ops: VecDeque::new(), ops_done: 0, busy: false, epoch: 0, marked: HashSet::new() }
+        let mut nodes = IdMap::default();
+        nodes.insert(ROOT_ID, Node { parent: ROOT_ID, name: String::new(), mtime_ms: now_ms(), kind: Kind::Dir(BTreeMap::new()), listed: 0 });
+        Tree { nodes, next_id: ROOT_ID + 1, seq: 0, ops: VecDeque::new(), ops_done: 0, busy: false, epoch: 0, marked: HashSet::new(), listings: 0 }
     }
 
     fn dir(&self, id: u64) -> FsResult<&BTreeMap<String, u64>> {
@@ -351,7 +430,7 @@ impl Tree {
     fn insert(&mut self, parent: u64, name: &str, mtime_ms: u64, kind: Kind) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        self.nodes.insert(id, Node { parent, name: name.to_string(), mtime_ms, kind });
+        self.nodes.insert(id, Node { parent, name: name.to_string(), mtime_ms, kind, listed: 0 });
         if let Ok(children) = self.dir_mut(parent) {
             children.insert(name.to_string(), id);
         }
@@ -386,6 +465,13 @@ impl Tree {
     }
 
     fn ensure_dir(&mut self, path: &str, mtime_ms: u64) -> Option<u64> {
+        self.ensure_dir_listed(path, mtime_ms, 0)
+    }
+
+    /// The same, for a full listing: every folder on the way is marked as
+    /// named by listing number `listing`, also when the walk stops at a
+    /// file standing where a folder was expected.
+    fn ensure_dir_listed(&mut self, path: &str, mtime_ms: u64, listing: u64) -> Option<u64> {
         let mut id = ROOT_ID;
         for part in path.split('/').filter(|p| !p.is_empty()) {
             let existing = self.dir(id).ok()?.get(part).copied();
@@ -398,8 +484,22 @@ impl Tree {
                 }
                 None => self.insert(id, part, mtime_ms, Kind::Dir(BTreeMap::new())),
             };
+            if listing != 0 {
+                self.nodes.get_mut(&id)?.listed = listing;
+            }
         }
         Some(id)
+    }
+
+    /// How many folders are above a node.
+    fn depth(&self, mut id: u64) -> usize {
+        let mut depth = 0;
+        while id != ROOT_ID {
+            let Some(n) = self.nodes.get(&id) else { break };
+            id = n.parent;
+            depth += 1;
+        }
+        depth
     }
 
     /// The longest key among a node and everything below it (a folder's own
@@ -490,6 +590,15 @@ impl Tree {
         self.busy
             || !self.ops.is_empty()
             || self.nodes.values().any(|n| matches!(&n.kind, Kind::File(f) if !f.local_only && (f.local.is_some() || f.uploading)))
+    }
+}
+
+/// The folder a key puts its object in, and whether the key is that
+/// folder's own marker object (`a/b/`) and not a file in it (`a/b/c`).
+fn folder_of(key: &str) -> (&str, bool) {
+    match key.strip_suffix('/') {
+        Some(dir) => (dir, true),
+        None => (key.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(""), false),
     }
 }
 
@@ -806,32 +915,35 @@ impl DriveFs {
     /// Make the tree show one object of the cloud: a file at its current
     /// version, or a folder's marker.
     fn upsert(&self, t: &mut Tree, o: &ObjectInfo) {
-        let (dir_path, is_marker) = match o.key.strip_suffix('/') {
-            Some(d) => (d, true),
-            None => (o.key.rsplit_once('/').map(|(d, _)| d).unwrap_or(""), false),
-        };
+        let (dir_path, is_marker) = folder_of(&o.key);
         let Some(parent) = t.ensure_dir(dir_path, o.mtime_ms) else { return };
         if is_marker {
             t.marked.insert(parent);
-            return;
+        } else {
+            self.upsert_file(t, parent, o);
         }
+    }
+
+    /// Make folder `parent` show the file `o` at its current version.
+    /// Returns the file's node, or None when a folder has that name.
+    fn upsert_file(&self, t: &mut Tree, parent: u64, o: &ObjectInfo) -> Option<u64> {
         let name = o.key.rsplit('/').next().unwrap_or(&o.key);
-        let remote = Remote { version: o.version.as_str().into(), size: o.size, key: o.key.as_str().into() };
         match t.dir(parent).ok().and_then(|c| c.get(name).copied()) {
             Some(id) => {
-                let Some(node) = t.nodes.get_mut(&id) else { return };
-                if let Kind::File(f) = &mut node.kind {
-                    if f.remote.as_ref().map(|r| &*r.version) != Some(&*remote.version) {
-                        f.remote = Some(remote);
-                        f.size = o.size;
-                        node.mtime_ms = o.mtime_ms;
-                        self.readahead.lock().unwrap().remove(&id);
-                    }
+                let node = t.nodes.get_mut(&id)?;
+                let Kind::File(f) = &mut node.kind else { return None };
+                if f.remote.as_ref().map(|r| &*r.version) != Some(o.version.as_str()) {
+                    f.remote = Some(Remote { version: o.version.as_str().into(), size: o.size, key: o.key.as_str().into() });
+                    f.size = o.size;
+                    node.mtime_ms = o.mtime_ms;
+                    self.readahead.lock().unwrap().remove(&id);
                 }
+                Some(id)
             }
             None => {
+                let remote = Remote { version: o.version.as_str().into(), size: o.size, key: o.key.as_str().into() };
                 let file = FileNode { size: o.size, remote: Some(remote), local: None, local_only: false, uploading: false };
-                t.insert(parent, name, o.mtime_ms, Kind::File(file));
+                Some(t.insert(parent, name, o.mtime_ms, Kind::File(file)))
             }
         }
     }
@@ -865,43 +977,66 @@ impl DriveFs {
         if t.has_unsynced() || token.is_some_and(|token| token != self.sync_gen.load(Ordering::Relaxed)) {
             return false;
         }
-        let mut want_files: HashSet<&str> = HashSet::new();
-        let mut want_dirs: HashSet<String> = HashSet::new();
+        // Every node the listing names is marked with this listing's number;
+        // what is left unmarked afterwards is what the cloud no longer has.
+        t.listings += 1;
+        let listing_no = t.listings;
         t.marked.clear();
+        // A listing is in key order, so the objects of one folder follow each
+        // other: the folder is looked up once, not once for every file in it.
+        let mut folder: Option<(&str, Option<u64>)> = None;
+        // Objects whose place is taken by a node of the other kind.
+        let mut blocked: Vec<&ObjectInfo> = Vec::new();
         for o in &listing.objects {
-            let (dir_path, is_marker) = match o.key.strip_suffix('/') {
-                Some(d) => (d, true),
-                None => (o.key.rsplit_once('/').map(|(d, _)| d).unwrap_or(""), false),
-            };
-            let mut acc = String::new();
-            for part in dir_path.split('/').filter(|p| !p.is_empty()) {
-                if !acc.is_empty() {
-                    acc.push('/');
+            let (dir_path, is_marker) = folder_of(&o.key);
+            let parent = match folder {
+                Some((path, id)) if path == dir_path => id,
+                _ => {
+                    let id = t.ensure_dir_listed(dir_path, o.mtime_ms, listing_no);
+                    folder = Some((dir_path, id));
+                    id
                 }
-                acc.push_str(part);
-                want_dirs.insert(acc.clone());
+            };
+            let Some(parent) = parent else {
+                blocked.push(o);
+                continue;
+            };
+            if is_marker {
+                t.marked.insert(parent);
+            } else if let Some(node) = self.upsert_file(&mut t, parent, o).and_then(|id| t.nodes.get_mut(&id)) {
+                node.listed = listing_no;
+            } else {
+                blocked.push(o);
             }
-            if !is_marker {
-                want_files.insert(o.key.as_str());
-            }
-            self.upsert(&mut t, o);
         }
-        // Remove what the cloud no longer has. Children before parents.
-        let mut ids: Vec<(usize, u64)> = t.nodes.keys().filter(|id| **id != ROOT_ID).map(|id| (t.key_of(*id).matches('/').count(), *id)).collect();
-        ids.sort_by(|a, b| b.0.cmp(&a.0));
-        for (_, id) in ids {
-            let Some(node) = t.nodes.get(&id) else { continue };
-            let key = t.key_of(id);
-            let gone = match &node.kind {
-                Kind::File(f) => !f.local_only && !want_files.contains(key.as_str()),
-                Kind::Dir(children) => {
-                    !want_dirs.contains(&key)
-                        && children.values().all(|c| matches!(t.nodes.get(c).map(|n| &n.kind), Some(Kind::File(f)) if f.local_only))
-                }
-            };
-            if gone {
+        // Remove what the cloud no longer has: files first, then the folders
+        // that leaves with nothing in them, the deepest first.
+        let mut files: Vec<u64> = Vec::new();
+        let mut dirs: Vec<(usize, u64)> = Vec::new();
+        for (id, node) in &t.nodes {
+            if node.listed == listing_no || *id == ROOT_ID {
+                continue;
+            }
+            match &node.kind {
+                Kind::File(f) if f.local_only => {}
+                Kind::File(_) => files.push(*id),
+                Kind::Dir(_) => dirs.push((t.depth(*id), *id)),
+            }
+        }
+        for id in files {
+            drop_local(t.detach(id));
+        }
+        dirs.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, id) in dirs {
+            let Some(Kind::Dir(children)) = t.nodes.get(&id).map(|n| &n.kind) else { continue };
+            if children.values().all(|c| matches!(t.nodes.get(c).map(|n| &n.kind), Some(Kind::File(f)) if f.local_only)) {
                 drop_local(t.detach(id));
             }
+        }
+        // A name that was a file and is a folder now, or the other way
+        // round: the old node stood in the way, and it has just gone.
+        for o in blocked {
+            self.upsert(&mut t, o);
         }
         t.seq = listing.seq;
         t.epoch = listing.epoch;
@@ -951,6 +1086,31 @@ impl DriveFs {
             }
         }
         Ok(out)
+    }
+
+    /// One page of a folder: up to `max` children in name order, starting
+    /// after the child with id `after` (0 for the start), and whether that
+    /// reaches the end of the folder. The cost is that of the page, not of
+    /// the folder, so listing a large folder page by page stays linear. A
+    /// child that is no longer in the folder is no place to continue from:
+    /// the listing then starts over.
+    pub fn readdir_page(&self, dir: u64, after: u64, max: usize) -> FsResult<(Vec<(String, Attr)>, bool)> {
+        use std::ops::Bound;
+        let t = self.tree.lock().unwrap();
+        let children = t.dir(dir)?;
+        let from = match t.nodes.get(&after) {
+            Some(n) if after != 0 && n.parent == dir && children.get(&n.name) == Some(&after) => Bound::Excluded(n.name.as_str()),
+            _ => Bound::Unbounded,
+        };
+        let mut rest = children.range::<str, _>((from, Bound::Unbounded));
+        let mut out = Vec::with_capacity(max.min(children.len()));
+        for (name, id) in rest.by_ref().take(max) {
+            if let Ok(attr) = self.attr_of(&t, *id) {
+                out.push((name.clone(), attr));
+            }
+        }
+        let end = rest.next().is_none();
+        Ok((out, end))
     }
 
     /// The cloud key (path) of a node.
@@ -1044,12 +1204,16 @@ impl DriveFs {
             }
             let window = (1u64 << s.streak.min(5)).min(MAX_READAHEAD_BLOCKS);
             let from = (last_block + 1).max(s.ahead_until);
-            // Top up only once the reader has used half of what is ahead, so
-            // read-ahead goes out as a few large requests, not many small ones.
-            if from > last_block + 1 + window / 2 {
-                return;
-            }
-            let to = (last_block + 1 + window).min(total_blocks);
+            let limit = (last_block + 1 + window).min(total_blocks);
+            // Top up a whole request at a time, as soon as one fits in the
+            // window: one more goes out each time the reader has used one.
+            // Requests then overlap instead of going out in batches that all
+            // finish together, which leaves the link idle for a round trip
+            // while the next batch is on its way; and read-ahead still goes
+            // out as a few large requests, not many small ones.
+            let step = MAX_RUN_BLOCKS.min(window / 2);
+            let fits = limit.saturating_sub(from) / step * step;
+            let to = if limit == total_blocks { limit } else { from + fits };
             if from >= to {
                 return;
             }
@@ -1066,24 +1230,26 @@ impl DriveFs {
         let mut pieces = Vec::with_capacity((b1 - b0 + 1) as usize);
         let mut inflight = self.inflight.lock().unwrap();
         let mut run: Vec<u64> = Vec::new();
-        let flush = |run: &mut Vec<u64>, pieces: &mut Vec<Piece>, inflight: &mut HashMap<(Arc<str>, u64), RunFuture>| {
+        let mut started: Vec<(Arc<Run>, u64)> = Vec::new();
+        let mut flush = |run: &mut Vec<u64>, pieces: &mut Vec<Piece>, inflight: &mut HashMap<(Arc<str>, u64), Arc<Run>>| {
             if run.is_empty() {
                 return;
             }
-            let fut = self.start_fetch(remote, key, run[0], run.len() as u64);
+            let fetch = Arc::new(Run { first: run[0], blocks: Mutex::new(Vec::with_capacity(run.len())), progress: tokio::sync::watch::channel(Progress::default()).0 });
+            started.push((fetch.clone(), run.len() as u64));
             for idx in run.drain(..) {
-                inflight.insert((remote.version.clone(), idx), fut.clone());
-                pieces.push(Piece::Pending(idx, fut.clone()));
+                inflight.insert((remote.version.clone(), idx), fetch.clone());
+                pieces.push(Piece::Pending(idx, fetch.clone()));
             }
         };
         for idx in b0..=b1 {
             if self.cache.contains(&remote.version, idx) {
                 flush(&mut run, &mut pieces, &mut inflight);
                 pieces.push(Piece::Cached(idx));
-            } else if let Some(fut) = inflight.get(&(remote.version.clone(), idx)) {
-                let fut = fut.clone();
+            } else if let Some(fetch) = inflight.get(&(remote.version.clone(), idx)) {
+                let fetch = fetch.clone();
                 flush(&mut run, &mut pieces, &mut inflight);
-                pieces.push(Piece::Pending(idx, fut));
+                pieces.push(Piece::Pending(idx, fetch));
             } else {
                 run.push(idx);
                 if run.len() as u64 == MAX_RUN_BLOCKS {
@@ -1092,48 +1258,66 @@ impl DriveFs {
             }
         }
         flush(&mut run, &mut pieces, &mut inflight);
+        // The requests go out once the lock is released: ending one takes
+        // the lock, and one can end on the spot, on this thread, when the
+        // runtime is shutting down and will not run it.
+        drop(inflight);
+        for (fetch, count) in started {
+            self.start_fetch(fetch, remote, key, count);
+        }
         pieces.sort_by_key(|p| match p {
             Piece::Cached(i) | Piece::Pending(i, _) => *i,
         });
         pieces
     }
 
-    /// One range request for `count` consecutive blocks starting at `first`.
-    fn start_fetch(self: &Arc<Self>, remote: &Remote, key: &str, first: u64, count: u64) -> RunFuture {
-        let this = self.clone();
-        let remote = remote.clone();
-        let key = key.to_string();
-        let fut: RunFuture = async move {
-            let start = first * BLOCK_SIZE;
-            let len = ((first + count) * BLOCK_SIZE).min(remote.size) - start;
-            let result = async {
-                let _permit = this.fetch_sem.acquire().await.map_err(|e| e.to_string())?;
-                let data = this.client.get_range(&this.name, &key, &remote.version, start, len).await.map_err(|e| format!("{e:#}"))?;
-                let (cache, version, blocks) = (this.cache.clone(), remote.version.clone(), data.clone());
+    /// Send the range request for a run of `count` consecutive blocks. It
+    /// runs whether or not a reader is waiting (read-ahead). Not to be
+    /// called with the `inflight` lock held.
+    fn start_fetch(self: &Arc<Self>, run: Arc<Run>, remote: &Remote, key: &str, count: u64) {
+        let mut end = RunEnd { fs: self.clone(), version: remote.version.clone(), run, count, error: None };
+        let (remote, key) = (remote.clone(), key.to_string());
+        tokio::spawn(async move {
+            let (this, run) = (end.fs.clone(), end.run.clone());
+            end.error = this.fetch_run(&run, &remote, &key, count).await.err();
+            drop(end);
+        });
+    }
+
+    /// Receive a run's bytes and pass them on block by block. A block goes
+    /// into the cache before its readers get it, so a read that has returned
+    /// is always a read that will not need the cloud again.
+    async fn fetch_run(&self, run: &Run, remote: &Remote, key: &str, count: u64) -> Result<(), String> {
+        let start = run.first * BLOCK_SIZE;
+        let len = ((run.first + count) * BLOCK_SIZE).min(remote.size) - start;
+        let _permit = self.fetch_sem.acquire().await.map_err(|e| e.to_string())?;
+        let mut body = self.client.open_range(&self.name, key, &remote.version, start, len).await.map_err(|e| format!("{e:#}"))?;
+        let mut arrived = 0u64;
+        let mut block = BytesMut::new();
+        while let Some(mut chunk) = body.chunk().await.map_err(|e| format!("{e:#}"))? {
+            while !chunk.is_empty() {
+                let block_len = BLOCK_SIZE.min(len - arrived * BLOCK_SIZE) as usize;
+                if block.is_empty() {
+                    block.reserve(block_len);
+                }
+                let take = (block_len - block.len()).min(chunk.len());
+                block.extend_from_slice(&chunk.split_to(take));
+                if block.len() < block_len {
+                    continue;
+                }
+                let data = block.split().freeze();
+                let (cache, version, idx, stored) = (self.cache.clone(), remote.version.clone(), run.first + arrived, data.clone());
                 tokio::task::spawn_blocking(move || {
-                    for (i, block) in blocks.chunks(BLOCK_SIZE as usize).enumerate() {
-                        let _ = cache.put(&version, first + i as u64, block);
-                    }
+                    let _ = cache.put(&version, idx, &stored);
                 })
                 .await
                 .map_err(|e| e.to_string())?;
-                Ok::<Bytes, String>(data)
-            }
-            .await;
-            let mut inflight = this.inflight.lock().unwrap();
-            for idx in first..first + count {
-                inflight.remove(&(remote.version.clone(), idx));
-            }
-            match result {
-                Ok(data) => Ok(Arc::new(Run { first, data })),
-                Err(e) => Err(Arc::<str>::from(e)),
+                run.blocks.lock().unwrap().push(data);
+                arrived += 1;
+                run.progress.send_modify(|p| p.arrived = arrived);
             }
         }
-        .boxed()
-        .shared();
-        // Drive it even if no reader is waiting (read-ahead).
-        tokio::spawn(fut.clone());
-        fut
+        Ok(())
     }
 
     async fn read_remote(self: &Arc<Self>, remote: &Remote, key: &str, offset: u64, len: u64) -> FsResult<Vec<u8>> {
@@ -1163,12 +1347,7 @@ impl DriveFs {
                     // Evicted between planning and reading: fetch it after all.
                     None => (idx, self.fetch_block(remote, key, idx).await?),
                 },
-                Piece::Pending(idx, fut) => {
-                    let run = fut.await.map_err(|e| FsError::Io(e.to_string()))?;
-                    let from = ((idx - run.first) * BLOCK_SIZE) as usize;
-                    let to = (from + BLOCK_SIZE as usize).min(run.data.len());
-                    (idx, run.data.slice(from..to))
-                }
+                Piece::Pending(idx, run) => (idx, run.block(idx).await.map_err(|e| FsError::Io(e.to_string()))?),
             };
             let block_start = idx * BLOCK_SIZE;
             let from = offset.max(block_start);
@@ -1201,8 +1380,8 @@ impl DriveFs {
         while b < total {
             let to = (b + 4 * MAX_RUN_BLOCKS).min(total) - 1;
             for piece in self.plan(&remote, &key, b, to) {
-                if let Piece::Pending(_, fut) = piece {
-                    fut.await.map_err(|e| FsError::Io(e.to_string()))?;
+                if let Piece::Pending(idx, run) = piece {
+                    run.block(idx).await.map_err(|e| FsError::Io(e.to_string()))?;
                 }
             }
             b = to + 1;

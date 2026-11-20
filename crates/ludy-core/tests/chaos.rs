@@ -238,6 +238,40 @@ async fn a_restart_between_the_shards_and_the_commit_loses_nothing() {
     c.assert_no_leaks().await;
 }
 
+/// The cloud dies half way through a range request. The reader waiting for
+/// all of it gets an error, the blocks that had arrived are kept and read
+/// back without the cloud, and nothing is left waiting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_cut_off_half_way_keeps_the_blocks_that_arrived() {
+    let mut c = chaos(0).await;
+    c.client.put_synthetic("media", "clip.mov", 1 << 30, 3).await.unwrap();
+    c.fs.refresh().await.unwrap();
+    let file = id(&c.fs, "clip.mov");
+    let block = BLOCK_SIZE as usize;
+    // Slow enough that the cloud can be killed between two blocks.
+    c.client.set_server_config(None, Some(16)).await.unwrap();
+    let whole = {
+        let fs = c.fs.clone();
+        tokio::spawn(async move { fs.read(file, 0, 8 * BLOCK_SIZE as u32).await })
+    };
+    until(20, "the first block arriving", || c.cache.snapshot().bytes >= BLOCK_SIZE).await;
+    c.server.kill();
+    let cut_off = within(30, "the read that was cut off", whole).await.unwrap().map(|(data, _)| data.len());
+    assert!(matches!(cut_off, Err(FsError::Io(_))), "{cut_off:?}");
+
+    let (data, _) = within(5, "reading a block that arrived", c.fs.read(file, 1000, 4096)).await.unwrap();
+    assert_eq!(data, synth::bytes(3, 1000, 4096));
+    let late = within(30, "reading a block that did not arrive", c.fs.read(file, 7 * BLOCK_SIZE, 4096)).await.map(|(data, _)| data.len());
+    assert!(matches!(late, Err(FsError::Io(_))), "{late:?}");
+
+    c.server.restart().await.unwrap();
+    let (data, _) = within(30, "reading it all once the cloud is back", c.fs.read(file, 0, 8 * BLOCK_SIZE as u32)).await.unwrap();
+    assert_eq!(data, synth::bytes(3, 0, 8 * block));
+    // Only what was missing is fetched again (the log starts with the restart).
+    let again: Vec<(u64, u64)> = c.log().iter().filter(|e| e.method == "GET").filter_map(|e| e.range).collect();
+    assert!(!again.is_empty() && again.iter().all(|r| r.0 >= BLOCK_SIZE), "fetched after the restart: {again:?}");
+}
+
 // ------------------------------------------------- a cloud that accepts and never answers
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -732,6 +766,10 @@ async fn applying_only_what_changed_matches_a_full_listing() {
         synth::word(seed ^ 0xfeed, n) % below.max(1)
     };
     let folders = ["", "a", "a/b", "c", "c/d/e"];
+    // A second drive that is only ever handed full listings, which is what
+    // a drive falls back to when the cloud cannot say what changed. It must
+    // show the same.
+    let relisted = DriveFs::new("media", c.client.clone(), c.cache.clone(), c.stats.clone(), c.dir.path().join("journal-relisted")).unwrap();
     for step in 0..400u64 {
         let listing = c.client.list("media").await.unwrap();
         let files: Vec<&str> = listing.objects.iter().map(|o| o.key.as_str()).filter(|k| !k.ends_with('/')).collect();
@@ -792,11 +830,17 @@ async fn applying_only_what_changed_matches_a_full_listing() {
             continue;
         }
         assert!(c.fs.refresh().await.unwrap(), "step {step}: {what}: not applied");
-        let want = tree_from(&c.client.list("media").await.unwrap());
+        let listing = c.client.list("media").await.unwrap();
+        let want = tree_from(&listing);
         let have = tree_of(&c.fs);
         let extra: Vec<_> = have.difference(&want).collect();
         let missing: Vec<_> = want.difference(&have).collect();
         assert!(extra.is_empty() && missing.is_empty(), "seed {seed}, step {step} ({what}): the drive shows extra {extra:?}, lacks {missing:?}");
+        assert!(relisted.apply_listing(&listing), "step {step}: {what}: full listing not applied");
+        let have = tree_of(&relisted);
+        let extra: Vec<_> = have.difference(&want).collect();
+        let missing: Vec<_> = want.difference(&have).collect();
+        assert!(extra.is_empty() && missing.is_empty(), "seed {seed}, step {step} ({what}): given the full listing, the drive shows extra {extra:?}, lacks {missing:?}");
     }
     // It really was incremental: one listing by the drive at the start, then feeds.
     let log = c.log();
