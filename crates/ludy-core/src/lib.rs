@@ -9,6 +9,8 @@
 pub mod cache;
 pub mod client;
 pub mod drive;
+pub mod sealed_client;
+pub mod sealed_drive;
 #[cfg(feature = "mount")]
 pub mod engine;
 #[cfg(feature = "mount")]

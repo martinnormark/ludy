@@ -23,7 +23,11 @@ bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+# Ids, keys and nonces for the sealed drive come from the system's generator.
+getrandom = "0.2"
 
 [dev-dependencies]
+# The Worker chaos tests signal the process group they start.
+libc = "0.2"
 ludy-cloud = { path = "../ludy-cloud" }
 tempfile = "3"

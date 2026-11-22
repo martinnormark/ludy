@@ -50,11 +50,11 @@ pub fn is_rejection(e: &anyhow::Error) -> bool {
 /// How long a transfer may go without a single byte arriving before it is
 /// given up. Shorter than the NFS client's own 10 s timeout, so a stalled
 /// cloud turns into an I/O error for the reader and the mount stays alive.
-const STALL: Duration = Duration::from_secs(8);
+pub(crate) const STALL: Duration = Duration::from_secs(8);
 /// Total time for a small request (listing, commit, rename).
-const SMALL_REQUEST: Duration = Duration::from_secs(30);
+pub(crate) const SMALL_REQUEST: Duration = Duration::from_secs(30);
 
-fn stalled(what: &str) -> anyhow::Error {
+pub(crate) fn stalled(what: &str) -> anyhow::Error {
     anyhow!("{what}: the cloud sent nothing for {} s", STALL.as_secs())
 }
 
@@ -69,6 +69,10 @@ pub struct RangeBody {
 }
 
 impl RangeBody {
+    pub(crate) fn new(resp: reqwest::Response, stats: Arc<Stats>, what: String, start: u64, len: u64) -> RangeBody {
+        RangeBody { resp, stats, what, start, len, got: 0 }
+    }
+
     /// The next piece of the body, or `None` once exactly the bytes asked
     /// for have arrived. A body that is longer or shorter is an error, and
     /// so is one that stops arriving.
@@ -86,7 +90,7 @@ impl RangeBody {
 }
 
 /// Total time allowed for sending `n` bytes: generous even for a slow link.
-fn transfer_timeout(n: u64) -> Duration {
+pub(crate) fn transfer_timeout(n: u64) -> Duration {
     SMALL_REQUEST + Duration::from_secs(n / 50_000)
 }
 
