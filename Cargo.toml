@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*", "providers/rivet"]
 # `cargo build` and `cargo test` leave the Rivet provider alone: it is a
 # large build. Ask for it with `-p ludy-rivet`. The Cloudflare provider
-# (worker/) only builds for WebAssembly and is a workspace of its own.
+# (providers/cloudflare) only builds for WebAssembly and is a workspace of its own.
 default-members = ["crates/*"]
 
 [workspace.package]

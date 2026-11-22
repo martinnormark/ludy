@@ -92,8 +92,56 @@ async fn ensure_pool(engine: &Engine) {
     }
 }
 
+fn listen_address() -> anyhow::Result<SocketAddr> {
+    var("LUDY_LISTEN").unwrap_or_else(|| "0.0.0.0:8080".into()).parse().context("LUDY_LISTEN is not an address and a port")
+}
+
+/// A drive nobody creates. Asking for it shows whether drives answer.
+pub const PROBE_DRIVE: &str = "ffffffffffffffffffffffffffffffff";
+
+/// `ludy-rivet health`: ask the server on this machine for a drive that does
+/// not exist. "No such drive" came from an actor, so the front, the engine
+/// and this node's actors are all there. It is the image's health check;
+/// the image has no `curl` to do it with.
+///
+/// It keeps asking for four seconds before it says no. A health check is
+/// only run every few seconds, and this way a server that is starting is
+/// found healthy when it becomes so, not at the next check.
+async fn health() -> anyhow::Result<()> {
+    let url = format!("http://127.0.0.1:{}/drives/{PROBE_DRIVE}", listen_address()?.port());
+    let http = reqwest::Client::new();
+    let give_up = std::time::Instant::now() + Duration::from_secs(4);
+    loop {
+        let left = give_up.saturating_duration_since(std::time::Instant::now());
+        let problem = match http.get(&url).timeout(left.max(Duration::from_millis(100))).send().await {
+            Ok(answer) if matches!(answer.status().as_u16(), 200 | 404) => return Ok(()),
+            Ok(answer) => format!("drives do not answer yet: {} {}", answer.status().as_u16(), answer.text().await.unwrap_or_default().trim()),
+            Err(e) => format!("the server did not answer: {e}"),
+        };
+        if std::time::Instant::now() + Duration::from_millis(250) >= give_up {
+            anyhow::bail!(problem);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// SIGTERM, which `docker stop` sends, or Ctrl-C.
+async fn stop_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let Ok(mut term) = signal(SignalKind::terminate()) else { return std::future::pending().await };
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    match std::env::args().nth(1).as_deref() {
+        None => {}
+        Some("health") => return health().await,
+        Some(other) => anyhow::bail!("no such command: {other}. Run it with no arguments to serve, or with `health`"),
+    }
     if var("RIVET_ENDPOINT").is_none() {
         anyhow::bail!("RIVET_ENDPOINT is not set. It is where the Rivet engine is, as http://<namespace>:<token>@<host>:6420");
     }
@@ -101,7 +149,7 @@ async fn main() -> anyhow::Result<()> {
     // The engine is a service of its own here; never start one.
     serve.engine_spawn = EngineSpawnMode::Never;
 
-    let listen: SocketAddr = var("LUDY_LISTEN").unwrap_or_else(|| "0.0.0.0:8080".into()).parse().context("LUDY_LISTEN is not an address and a port")?;
+    let listen = listen_address()?;
     let engine = Engine {
         endpoint: serve.endpoint.trim_end_matches('/').to_string(),
         token: serve.token.clone(),
@@ -126,7 +174,13 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("listening on {listen}"))?;
     let front = tokio::spawn(front::serve(listener, env.clone()));
 
-    ensure_pool(&env.engine).await;
+    // The runtime below stops on SIGTERM by itself. Until it runs nothing
+    // does, and a process that is first in its container is not stopped by
+    // a signal it has no handler for.
+    tokio::select! {
+        _ = ensure_pool(&env.engine) => {}
+        _ = stop_signal() => return Ok(()),
+    }
     env.ready.store(true, Ordering::SeqCst);
 
     let mut registry = Registry::new();

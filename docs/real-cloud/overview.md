@@ -13,21 +13,19 @@ Everything else in these docs runs against the simulated cloud. Its replacement 
 | [`ludy_core::sealed_drive`](../../crates/ludy-core/src/sealed_drive.rs) | The engine for it, beside the old one ([`drive`](../../crates/ludy-core/src/drive.rs)) and with the same methods the NFS adapter calls. The tree comes from the feed, each key unwrapped from the root key down; a read goes through the file's sealed manifest and fetches only the frames it needs; an upload cuts and seals what changed, sends the sealed shards the cloud lacks and commits a sealed manifest; creates, moves and deletes are queued ops sent in commits that are safe to send twice. [`sealed_client`](../../crates/ludy-core/src/sealed_client.rs) is its HTTP side |
 | [`ludy-server`](../../crates/ludy-server) | The cloud's logic with no platform in it: a drive's tables (the tree, 25 versions per file, which blobs are in use), the rules of a commit, the feed, and a collector that deletes from storage what no version has used for a day. A provider supplies SQLite, a blob store and a timer through its ports. Its own tests run it on SQLite in memory and can make storage fail |
 | [`providers/rivet`](../../providers/rivet) | The self-hosted provider, and what `docker compose up` starts: a Rivet actor per drive, an HTTP front that hashes every upload, blobs in a folder, Cloudflare R2 or any S3 |
-| [`worker`](../../worker) | The Cloudflare provider: a Worker, one Durable Object per drive with SQLite storage, sealed shards and manifests in R2, checked by R2 against their names |
+| [`providers/cloudflare`](../../providers/cloudflare) | The Cloudflare provider: a Worker, one Durable Object per drive with SQLite storage, sealed shards and manifests in R2, checked by R2 against their names |
 
 How the three fit together, and why Rivet could not be the Cloudflare option as well, is in [architecture.md](architecture.md).
 
 ## Running it self-hosted
 
 ```bash
-docker compose up -d
+docker compose up -d --wait
 ```
 
 That starts the Rivet engine and the server, on port 8080 of this machine only, with blobs in a Docker volume. The settings, and the files that move the blobs to R2 or MinIO, are in [`providers/rivet/README.md`](../../providers/rivet/README.md).
 
-## Setting up the Worker
-
-`worker` is outside the cargo workspace, since it only builds for WebAssembly. It needs the `wasm32-unknown-unknown` target, `cargo install worker-build`, and `npm install` in `worker` (Wrangler 4). `npm run dev` there starts it under workerd with local R2 and Durable Object storage.
+The Cloudflare Worker is set up as [`providers/cloudflare/README.md`](../../providers/cloudflare/README.md) says.
 
 ## How it was checked
 
@@ -48,7 +46,7 @@ That starts the Rivet engine and the server, on port 8080 of this machine only, 
 
 - **The drive by itself.** [`ludy-server/tests/drive.rs`](../../crates/ludy-server/tests/drive.rs) runs the drive on SQLite in memory, with no server: the rules of a commit, the feed, the collector, a panic inside a transaction. It can make storage fail, which no real provider can be asked to do: the database fails at every statement of a commit in turn, and all of the commit or none of it remains.
 - **Both providers under the same suites.** The two suites above were written against the Worker. `LUDY_PROVIDER=rivet` runs them against the self-hosted server: `ludy-rivet` beside a Rivet engine in a container, both killed at each `kill -9`. All 13 and 14 tests pass on each provider (2026-11-22, after the server's logic moved into `ludy-server`). One extra engine soak on Rivet failed its check of the server's log while every file was right; what that was is in [known problems](known-issues.md#the-rivet-provider). The tables are in [`bench/2026-11-22-providers-chaos.md`](../../bench/2026-11-22-providers-chaos.md).
-- **The Compose files, by hand.** `docker compose up` was built and started, a drive was created, written and read, both containers were killed with SIGKILL and started again, and the drive was as it had been. The same with MinIO as the blob store, plus a run of the collector, to try the S3 path. The R2 file was not started: that needs an account.
+- **The Compose files, by hand.** `docker compose up` was built and started, a drive was created, written and read, both containers were killed with SIGKILL and started again, and the drive was as it had been. The same with MinIO as the blob store, plus a run of the collector, to try the S3 path. The R2 file was not started: that needs an account. Later the stack was timed through a restart, a `down` and `up`, `kill -9` of one and of both containers, and a paused server; the numbers are in the same bench file and what they mean for running it is in [the Rivet provider's README](../../providers/rivet/README.md#stopping-and-starting).
 
 On Cloudflare (the default):
 

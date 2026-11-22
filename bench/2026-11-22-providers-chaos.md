@@ -96,3 +96,22 @@ The tables below are from the first complete run on each provider. Three small c
 | Proxy: connections / replies lost / requests lost | 833 / 34 / 29 |
 | Reads checked against what was written / reads that failed while the cloud was away | 15 / 2 |
 | Read back from the cloud by this Mac: bytes / range requests | 1854047 / 45 |
+
+## Compose: stopping and starting
+
+Later on 2026-11-22, on this Mac, each step once. The stack from `docker-compose.yml` with the image already built, one drive created, and "answers" meaning `GET` of that drive's head returns 200. The first column of numbers is with the engine's own wait for a silent server; the second is with 2,000 ms, which the Compose file now sets. Both were run with a health check asked every second while starting (`start_interval`, which needs Docker Engine 25). The third is the files as committed: 2,000 ms, and a check every three seconds that keeps asking for four.
+
+| Step | Engine default | 2,000 ms | As committed |
+|---|---|---|---|
+| `up -d --wait` from nothing (no volumes) | not timed | 7.3 s | 12.0 s, 11.5 s |
+| `restart ludy`: the command, then until the drive answers | 0.3 s, 0.1 s | 0.4 s, 0.1 s | 0.4 s, 0.1 s |
+| `down`, then `up -d --wait`, then until the drive answers | 1.6 s, 6.4 s, 0.1 s | 1.6 s, 9.8 s, 0.1 s | 1.6 s, 12.4 s, 0.1 s |
+| `kill -s KILL ludy`, `start ludy`, until the drive answers | 45.0 s | 6.7 s | 6.7 s |
+| `kill -s KILL` of both, `up -d --wait`, then until the drive answers | 51.9 s, 2.1 s | 19.3 s, 1.9 s | 20.9 s, 1.9 s |
+| `pause ludy` for 4 s, until the drive answers after `unpause` | not run | 5.4 s | not run |
+| `pause ludy` for 10 s | 0.0 s | 1.6 s | not run |
+| `pause ludy` for 30 s | not run | 2.1 s | not run |
+
+No `fault`, `upstream` or `error` line was in the server's log after any column. Nothing was being written during a pause.
+
+With `docker-compose.minio.yml` on top, `up -d --wait` from nothing took 16.6 s (with a check every three seconds that did not keep asking), and a shard was stored, read whole and by range, and a body that did not match its name was refused with 400.

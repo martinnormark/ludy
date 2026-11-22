@@ -6,15 +6,31 @@ Where this fits, and what a provider has to promise: [docs/real-cloud/architectu
 
 ## Run it
 
+From the top of the repository, with Docker running and nothing to set:
+
 ```bash
-docker compose up -d
+docker compose up -d --wait
+```
+
+Two services start: the Rivet engine and this server. `--wait` returns when both are healthy, which for the server means a drive answers. It was run with Docker Engine 29.6 and Compose 5.3 and no older Docker was tried. The image is built with BuildKit. Shards and manifests go to a Docker volume. The first `up` builds the server's image, four and a half minutes here; after that a start from nothing took 12 seconds.
+
+Create a drive and read its head back. A real client sends a sealed name and wrapped keys; these are placeholder bytes:
+
+```bash
+curl -X PUT -H 'content-type: application/json' -d '{"root":"0f0e0d0c0b0a09080706050403020100","name":"00","key":"00","dedup":"00"}' http://127.0.0.1:8080/drives/000102030405060708090a0b0c0d0e0f
 ```
 
 ```bash
-curl http://127.0.0.1:8080/
+curl http://127.0.0.1:8080/drives/000102030405060708090a0b0c0d0e0f
 ```
 
-That answers `ludy-rivet` once the engine is up. Two services start: the Rivet engine and this server. Shards and manifests go to a Docker volume.
+Both answer the drive's head, with `"seq":1`. If port 8080 is taken, set `LUDY_PORT` in `.env` ([`.env.example`](../../.env.example) lists every setting).
+
+Stop it, keeping the drives:
+
+```bash
+docker compose down
+```
 
 To keep the blobs in Cloudflare R2, fill in the four `R2_` settings from [`.env.example`](../../.env.example) and add the R2 file:
 
@@ -28,16 +44,25 @@ To keep them in MinIO on the same machine, which is how the S3 path was tried:
 docker compose -f docker-compose.yml -f docker-compose.minio.yml up -d
 ```
 
-There is no sign-in yet, so the port is published on the machine itself only.
+There is no sign-in yet, so the port is published on the machine itself only. The R2 file has not been started against an R2 account.
 
-The first `up` builds the server's image: four and a half minutes here. After `kill -9` of both containers a drive answered again after about 48 seconds, with what it held; that wait is the engine's default before it gives up on a dead node (see [Check it](#check-it)). The R2 file has not been started against an R2 account.
+### Stopping and starting
+
+| What happens | How long a drive answers nothing |
+|---|---|
+| `docker compose restart ludy` | Under a second |
+| `docker compose down`, then `up -d --wait` | `up` took 12 seconds; the drive answered at once after it |
+| `kill -9` of the server, then started again | 6.7 seconds |
+| `kill -9` of both containers, then `up -d --wait` | `up` took 21 seconds, the drive 2 more |
+
+Each was done once or twice on this Mac, and each time the drive held what it had. The last two depend on how long the engine waits for a server that went silent: `RIVET_NODE_LOST_MS`, two seconds in the Compose file. With the engine's own default they took 45 and 52 seconds. What the shorter wait costs is in [known problems](../../docs/real-cloud/known-issues.md#the-rivet-provider).
 
 ## Without Docker for the server
 
 The engine still runs in a container; the server runs from the checkout.
 
 ```bash
-docker run -d --name rivet -p 127.0.0.1:6420:6420 -e RIVET__AUTH__ADMIN_TOKEN=dev -e RIVET__STORAGE__LOG_DIRECTORY=/var/lib/rivet/log -e RIVET__STORAGE__AUTO_PROVISION_PARTITIONS=1 -e RIVET__STORAGE__BALANCING__ENABLED=false -e RIVET__OBJECT_STORAGE__PRIMARY__FILE_SYSTEM__PATH=/var/lib/rivet/objects -v /var/lib/rivet/log -v /var/lib/rivet/objects rivetdev/engine:3.1.1
+docker run -d --name rivet -p 127.0.0.1:6420:6420 -e RIVET__AUTH__ADMIN_TOKEN=dev -e RIVET__STORAGE__LOG_DIRECTORY=/var/lib/rivet/log -e RIVET__STORAGE__AUTO_PROVISION_PARTITIONS=1 -e RIVET__STORAGE__BALANCING__ENABLED=false -e RIVET__OBJECT_STORAGE__PRIMARY__FILE_SYSTEM__PATH=/var/lib/rivet/objects -e RIVET__PEGBOARD__NODE_LOST_THRESHOLD=2000 -e RIVET__PEGBOARD__NODE_PING_TIMEOUT=2000 -v /var/lib/rivet/log -v /var/lib/rivet/objects rivetdev/engine:3.1.1
 ```
 
 ```bash
@@ -56,6 +81,10 @@ The package is left out of a plain `cargo build` and `cargo test` because it is 
 | `AWS_ENDPOINT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` | | For `s3://`. With an endpoint the bucket goes in the path, which R2 and MinIO want. Region defaults to `auto` |
 | `GC_GRACE_MS` | a day | How long a shard no version uses is kept |
 | `LUDY_DEV` | off | `1` turns on the `_dev` routes. Only the chaos suites set it |
+
+`ludy-rivet health` asks the server on the same machine for a drive that does not exist (`ffff…`, 32 of them) and exits 0 if an actor answered. It is the image's health check, run every three seconds, so the engine holds one actor for that id. Its usual answer is left out of the server's log.
+
+The Compose file reads four more from `.env`: `LUDY_PORT` (8080), `RIVET_TOKEN`, `RIVET_NODE_LOST_MS` (2000) and, with the R2 or MinIO file, that store's settings.
 
 ## How it is put together
 
@@ -89,4 +118,4 @@ LUDY_PROVIDER=rivet cargo test -p ludy-core --test sealed_engine -- --ignored --
 
 `LUDY_RIVET_KILL=server` or `engine` makes a `kill -9` take only that one; by default it takes both.
 
-In them the rig sets the engine's `pegboard.node_lost_threshold` to two seconds. That is how long the engine waits before it gives a dead node's actors to another node; the default left a drive unanswered for 46 seconds after `kill -9` of the server, and two seconds brought it to under nine. `docker-compose.yml` leaves the default alone.
+The rig gives its engine the same two-second wait for a silent server as `docker-compose.yml` does, so the suites test what Compose runs.

@@ -2,8 +2,8 @@
 target
 **/target
 **/node_modules
-worker/build
-worker/.wrangler
+providers/cloudflare/build
+providers/cloudflare/.wrangler
 .git
 bench
 docs

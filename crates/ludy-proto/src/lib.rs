@@ -7,7 +7,7 @@
 //! * [`synth`]: the bytes of a synthetic object
 //! * [`tree`]: the node-tree protocol of an encrypted drive: commits of ops
 //!   on nodes, and the feed of what changed. Spoken by the Worker in
-//!   `app/worker`; the engine and `ludy-cloud` still use [`wire`]
+//!   `app/providers/cloudflare`; the engine and `ludy-cloud` still use [`wire`]
 //! * [`crypt`]: end-to-end encryption: sealed shards, keyed cut points, node
 //!   keys, sealed names and manifests. Not used by the engine or the cloud yet
 //!

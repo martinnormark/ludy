@@ -1,4 +1,4 @@
-//! Chaos tests for the Worker (`app/worker`): the node-tree protocol under
+//! Chaos tests for the Worker (`app/providers/cloudflare`): the node-tree protocol under
 //! `wrangler dev`, with the process killed with `kill -9`, frozen, and
 //! restarted, and with requests and replies lost on the way.
 //!
@@ -11,7 +11,7 @@
 //! is byte for byte what was written, and storage holds exactly the blobs it
 //! should.
 //!
-//! These need Node and `app/worker/node_modules`, so they are ignored by
+//! These need Node and `app/providers/cloudflare/node_modules`, so they are ignored by
 //! default:
 //!
 //! ```text
@@ -492,7 +492,7 @@ fn assert_quiet_log(worker: &Worker, allowed: &[&str]) {
 /// The reply to a commit is lost three times. The client keeps sending the
 /// same commit; it must be applied once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn a_lost_reply_does_not_apply_a_commit_twice() {
     let Some(rig) = rig(NEVER, 1).await else { return };
     let mut m = Model::new(&rig.client, 1).await;
@@ -526,7 +526,7 @@ async fn a_lost_reply_does_not_apply_a_commit_twice() {
 
 /// A commit whose last op is refused must leave nothing of its first ops.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn a_refused_commit_leaves_nothing_behind() {
     let Some(rig) = rig(NEVER, 2).await else { return };
     let mut m = Model::new(&rig.client, 2).await;
@@ -588,7 +588,7 @@ async fn a_refused_commit_leaves_nothing_behind() {
 /// `kill -9` while a burst of commits is in flight. Every one of them is
 /// retried until answered, and every one must be there exactly once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn kill_nine_in_a_burst_of_commits() {
     let Some(mut rig) = rig(NEVER, 3).await else { return };
     let mut m = Model::new(&rig.client, 3).await;
@@ -715,7 +715,7 @@ async fn burst_and_kill(rig: &mut Rig, m: &mut Model, creates: usize, tag: u64) 
 /// Two writers put a new version on the same base at the same moment.
 /// Exactly one wins, and the other is told which version it lost to.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn of_two_writers_on_one_base_exactly_one_wins() {
     let Some(rig) = rig(NEVER, 4).await else { return };
     let mut m = Model::new(&rig.client, 4).await;
@@ -752,7 +752,7 @@ async fn of_two_writers_on_one_base_exactly_one_wins() {
 /// A shard that vanishes from storage between upload and commit is named in
 /// the refusal; uploading it again makes the same commit go through.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn a_shard_lost_before_the_commit_is_asked_for_again() {
     let Some(rig) = rig(NEVER, 5).await else { return };
     let mut m = Model::new(&rig.client, 5).await;
@@ -790,7 +790,7 @@ async fn a_shard_lost_before_the_commit_is_asked_for_again() {
 /// writers keep bringing back content whose shards were just let go. No
 /// version may ever come to depend on a shard the collector removed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn the_collector_never_takes_what_a_commit_names() {
     let Some(rig) = rig(0, 6).await else { return };
     let mut m = Model::new(&rig.client, 6).await;
@@ -883,7 +883,7 @@ async fn prepare_racing(client: &Client, m: &mut Model, node: &Id, key: &NodeKey
 /// A panic in the middle of a commit's transaction, after it has written,
 /// must leave nothing of it; and the drive must keep working.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn a_panic_inside_a_commit_leaves_no_half_commit() {
     let Some(rig) = rig(NEVER, 7).await else { return };
     let mut m = Model::new(&rig.client, 7).await;
@@ -921,7 +921,7 @@ async fn a_panic_inside_a_commit_leaves_no_half_commit() {
 /// The fault switches and the consistency check must not exist unless the
 /// harness asked for them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn the_dev_routes_are_off_unless_switched_on() {
     if !available() {
         return;
@@ -961,7 +961,7 @@ async fn the_dev_routes_are_off_unless_switched_on() {
 /// once the collector has finished, the same commit goes through after a
 /// fresh upload.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn a_collector_cut_short_never_hands_out_what_it_marked() {
     let Some(mut rig) = rig(NEVER, 9).await else { return };
     let mut m = Model::new(&rig.client, 9).await;
@@ -1043,7 +1043,7 @@ async fn a_collector_cut_short_never_hands_out_what_it_marked() {
 
 /// A folder of three thousand files made in three commits and deleted in one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn a_wide_tree_in_few_commits() {
     let Some(rig) = rig(NEVER, 10).await else { return };
     let mut m = Model::new(&rig.client, 10).await;
@@ -1093,7 +1093,7 @@ async fn a_wide_tree_in_few_commits() {
 /// Forty versions of one file: twenty-five are kept, and what the dropped
 /// ones used is let go.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn history_is_capped_and_the_dropped_versions_let_go() {
     let Some(rig) = rig(NEVER, 11).await else { return };
     let mut m = Model::new(&rig.client, 11).await;
@@ -1133,7 +1133,7 @@ async fn history_is_capped_and_the_dropped_versions_let_go() {
 
 /// What does not fit or does not parse is refused with an answer, never an error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn oversized_and_malformed_requests_are_refused() {
     let Some(rig) = rig(NEVER, 12).await else { return };
     let mut m = Model::new(&rig.client, 12).await;
@@ -1203,7 +1203,7 @@ async fn oversized_and_malformed_requests_are_refused() {
 /// Random operations on a drive while the Worker is killed, frozen and
 /// restarted and the proxy loses requests and replies. The seed is printed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "minutes long; needs Node and app/worker/node_modules"]
+#[ignore = "minutes long; needs Node and app/providers/cloudflare/node_modules"]
 async fn soak() {
     let seed: u64 = std::env::var("WORKER_CHAOS_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or_else(|| ludy_proto::now_ms() % 100_000);
     let steps: u64 = std::env::var("WORKER_CHAOS_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);

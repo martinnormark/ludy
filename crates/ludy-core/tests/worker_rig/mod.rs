@@ -78,7 +78,7 @@ const RIVET_TOKEN: &str = "rig";
 const PROBE_DRIVE: &str = "ffffffffffffffffffffffffffffffff";
 
 pub fn worker_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../worker")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../providers/cloudflare")
 }
 
 fn rivet_binary() -> PathBuf {
@@ -99,7 +99,7 @@ pub fn available() -> bool {
         Provider::Cloudflare => {
             let there = worker_dir().join("node_modules/.bin/wrangler").exists();
             if !there {
-                eprintln!("skipped: app/worker/node_modules is not installed (run `npm install` in app/worker)");
+                eprintln!("skipped: app/providers/cloudflare/node_modules is not installed (run `npm install` in app/providers/cloudflare)");
             }
             there
         }
@@ -210,7 +210,8 @@ impl Worker {
         let run = [
             "run", "-d", "--name", &engine.name, "--label", "ludy-rig=1", "-p", &publish,
             "-e", &token,
-            // One instance, everything on its own disk: what docker-compose.yml runs.
+            // One instance, everything on its own disk, and the same wait for
+            // a silent node: what docker-compose.yml runs.
             "-e", "RIVET__STORAGE__LOG_DIRECTORY=/var/lib/rivet/log",
             "-e", "RIVET__STORAGE__AUTO_PROVISION_PARTITIONS=1",
             "-e", "RIVET__STORAGE__BALANCING__ENABLED=false",

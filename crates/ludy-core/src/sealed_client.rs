@@ -1,4 +1,4 @@
-//! HTTP client for the Worker (`app/worker`): the node-tree protocol of an
+//! HTTP client for the Worker (`app/providers/cloudflare`): the node-tree protocol of an
 //! end-to-end encrypted drive. It moves sealed bytes and JSON; nothing here
 //! holds a key. [`crate::sealed_drive`] does the sealing and opening.
 

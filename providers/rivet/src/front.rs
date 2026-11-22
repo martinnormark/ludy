@@ -78,8 +78,13 @@ async fn handle(State(env): State<Arc<Env>>, method: Method, uri: Uri, headers: 
         Route::Drive { drive } => to_drive(&env, &method, &path, uri.query().unwrap_or_default(), body, &drive, started).await,
         Route::Refused(r) => refuse(&r),
     };
-    // One line per request, the way `wrangler dev` writes them.
-    log(&format!("{method} {path} {} ({}ms)", response.status().as_u16(), started.elapsed().as_millis()));
+    // One line per request, the way `wrangler dev` writes them. Not for the
+    // health check's question when it got its usual answer: that is asked
+    // every few seconds for as long as the server runs.
+    let status = response.status().as_u16();
+    if !(status == 404 && path.strip_prefix("/drives/") == Some(crate::PROBE_DRIVE)) {
+        log(&format!("{method} {path} {status} ({}ms)", started.elapsed().as_millis()));
+    }
     response
 }
 

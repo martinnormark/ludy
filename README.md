@@ -67,6 +67,8 @@ The full map is [docs/README.md](docs/README.md).
 | [`crates/ludy-cloud`](crates/ludy-cloud) | The simulated cloud |
 | [`crates/ludy-app`](crates/ludy-app) | The gpui app |
 | [`crates/ludy-cli`](crates/ludy-cli) | `ludy`, the engine without a window |
-| [`worker`](worker) | The real cloud's server, a Cloudflare Worker |
+| [`crates/ludy-server`](crates/ludy-server) | The real cloud's server logic, with no platform in it |
+| [`providers/rivet`](providers/rivet) | The provider `docker compose up` starts: Rivet actors |
+| [`providers/cloudflare`](providers/cloudflare) | The Cloudflare provider: a Worker |
 | [`bench`](bench) | Raw benchmark tables |
 | [`docs`](docs) | Everything else |

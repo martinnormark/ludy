@@ -7,7 +7,7 @@
 //! engine's code: the cloud has to hold what the application wrote, sealed
 //! the way the format says.
 //!
-//! These need Node and `app/worker/node_modules`, so they are ignored by default:
+//! These need Node and `app/providers/cloudflare/node_modules`, so they are ignored by default:
 //!
 //! ```text
 //! cargo test -p ludy-core --test sealed_engine -- --ignored --test-threads=1
@@ -177,7 +177,7 @@ fn sizes(cloud: &BTreeMap<String, Entry>) -> BTreeMap<String, Option<u64>> {
 const SEALED_BLOCK: u64 = BLOCK_SIZE + (BLOCK_SIZE / FRAME as u64) * TAG as u64;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn what_is_written_is_in_the_cloud_sealed_and_another_mac_reads_it() {
     let Some(b) = bench().await else { return };
     let a = b.mac("a").await;
@@ -222,7 +222,7 @@ async fn what_is_written_is_in_the_cloud_sealed_and_another_mac_reads_it() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn a_read_in_the_middle_fetches_only_the_frames_around_it() {
     let Some(b) = bench().await else { return };
     let a = b.mac("a").await;
@@ -257,7 +257,7 @@ async fn a_read_in_the_middle_fetches_only_the_frames_around_it() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn sequential_and_concurrent_reads_share_requests() {
     let Some(b) = bench().await else { return };
     let a = b.mac("a").await;
@@ -299,7 +299,7 @@ async fn sequential_and_concurrent_reads_share_requests() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn a_small_change_in_a_large_file_sends_only_the_shards_it_touches() {
     let Some(b) = bench().await else { return };
     let a = b.mac("a").await;
@@ -360,7 +360,7 @@ async fn a_small_change_in_a_large_file_sends_only_the_shards_it_touches() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn folders_renames_and_deletes_reach_the_cloud_in_order() {
     let Some(b) = bench().await else { return };
     let a = b.mac("a").await;
@@ -414,7 +414,7 @@ async fn folders_renames_and_deletes_reach_the_cloud_in_order() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn finder_droppings_stay_here_and_names_compare_normalised() {
     let Some(b) = bench().await else { return };
     let a = b.mac("a").await;
@@ -452,7 +452,7 @@ async fn finder_droppings_stay_here_and_names_compare_normalised() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn unsent_writes_survive_the_app_being_killed() {
     let Some(b) = bench().await else { return };
     let a = b.mac("a").await;
@@ -497,7 +497,7 @@ async fn unsent_writes_survive_the_app_being_killed() {
 // --------------------------------------------------- two Macs, one drive
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn two_macs_that_create_the_same_name_both_keep_their_file() {
     let Some(b) = bench().await else { return };
     let (a, c) = (b.mac("a").await, b.mac("c").await);
@@ -532,7 +532,7 @@ async fn two_macs_that_create_the_same_name_both_keep_their_file() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn the_last_writer_wins_and_the_other_version_stays_in_history() {
     let Some(b) = bench().await else { return };
     let a = b.mac("a").await;
@@ -559,7 +559,7 @@ async fn the_last_writer_wins_and_the_other_version_stays_in_history() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn changes_to_what_the_cloud_deleted_are_kept_when_they_can_be() {
     let Some(b) = bench().await else { return };
     let a = b.mac("a").await;
@@ -613,7 +613,7 @@ async fn changes_to_what_the_cloud_deleted_are_kept_when_they_can_be() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn a_rename_that_lost_to_another_mac_gives_way() {
     let Some(b) = bench().await else { return };
     let a = b.mac("a").await;
@@ -653,7 +653,7 @@ async fn a_rename_that_lost_to_another_mac_gives_way() {
 /// dies. On the next start the same commit goes out again and is recognised:
 /// one file, under its own name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn a_lost_reply_and_then_a_crash_do_not_duplicate_a_file() {
     let Some(b) = bench().await else { return };
     for (round, forget) in [(0, false), (1, true)] {
@@ -690,7 +690,7 @@ async fn a_lost_reply_and_then_a_crash_do_not_duplicate_a_file() {
 /// A flood of small files and a large copy, with the Worker killed while
 /// they upload, more written while it is away, and the app killed too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn the_worker_and_the_app_die_in_the_middle_of_a_flood() {
     let Some(mut b) = bench().await else { return };
     b.proxy.rates(40, 30);
@@ -842,7 +842,7 @@ fn join(dir: &str, name: &str) -> String {
 ///
 /// `SEALED_SEED=7 SEALED_STEPS=400 cargo test -p ludy-core --test sealed_engine soak -- --ignored --nocapture`
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "minutes long; needs Node and app/worker/node_modules"]
+#[ignore = "minutes long; needs Node and app/providers/cloudflare/node_modules"]
 async fn soak() {
     let seed: u64 = std::env::var("SEALED_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or_else(|| ludy_proto::now_ms() % 100_000);
     let steps: u64 = std::env::var("SEALED_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);

@@ -30,7 +30,7 @@ flowchart TB
     ractor -- "is it there? delete" --> rblob
   end
 
-  subgraph cf["worker: Cloudflare"]
+  subgraph cf["providers/cloudflare"]
     w["Worker<br/>routes; blobs straight to R2"]
     d["Durable Object per drive<br/>SQLite, alarm"]
     r2[("R2")]
@@ -55,7 +55,7 @@ Three facts everything leans on:
 
 ### Which one to run
 
-| | Rivet (`docker compose up`) | Cloudflare (`wrangler deploy`) |
+| | [Rivet](../../providers/rivet) (`docker compose up`) | [Cloudflare](../../providers/cloudflare) (`wrangler deploy`) |
 |---|---|---|
 | Runs on | Any machine with Docker, or the binary beside an engine | Cloudflare's network |
 | A drive is | A Rivet actor, placed by the engine | A Durable Object |
@@ -146,10 +146,10 @@ app/
     ludy-cloud/              the simulated cloud; retire once the app mounts sealed drives
   providers/
     rivet/                   ludy-rivet: front, actors, Dockerfile
-  worker/                    the Cloudflare provider; a workspace of its own, WebAssembly only
+    cloudflare/              the Worker; a workspace of its own, WebAssembly only
 ```
 
-`providers/rivet` is in the workspace and left out of its default members: it is a three-and-a-half-minute build that most work on the client does not need. `worker` only builds for WebAssembly, so it stays a workspace of its own.
+`providers/rivet` is in the workspace and left out of its default members: it is a three-and-a-half-minute build that most work on the client does not need. `providers/cloudflare` only builds for WebAssembly, so it stays a workspace of its own.
 
 ## Conformance
 
@@ -169,6 +169,5 @@ Both go through [`worker_rig`](../../crates/ludy-core/tests/worker_rig/mod.rs), 
 
 ## Open questions
 
-- Should `worker/` move to `providers/cloudflare/`, beside the other provider?
 - Is the plain binary worth having, for someone who wants no Rivet engine?
 - Which S3 besides R2 and MinIO should be tried before saying "any S3"?

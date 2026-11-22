@@ -12,7 +12,7 @@ Five crates. The engine does not depend on the server, so another client could l
 | [`ludy-app`](../../crates/ludy-app) | The gpui app |
 | [`ludy-cli`](../../crates/ludy-cli) | `ludy`, the engine without a window |
 
-These five are the system the app mounts today. The encrypted cloud being built beside it adds a sixth crate, [`ludy-server`](../../crates/ludy-server), and two packages that run it, [`providers/rivet`](../../providers/rivet) and [`worker`](../../worker); see [its architecture](../real-cloud/architecture.md#packages).
+These five are the system the app mounts today. The encrypted cloud being built beside it adds a sixth crate, [`ludy-server`](../../crates/ludy-server), and two packages that run it, [`providers/rivet`](../../providers/rivet) and [`providers/cloudflare`](../../providers/cloudflare); see [its architecture](../real-cloud/architecture.md#packages).
 
 ## Other clients
 

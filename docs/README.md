@@ -43,6 +43,7 @@ The end-to-end encrypted cloud being built beside the simulated one, self-hosted
 | [Known problems](real-cloud/known-issues.md) | What is expected to break, what is fragile, what nobody has checked, what is not built |
 | [Architecture](real-cloud/architecture.md) | How one crate of server logic runs on Rivet actors under Docker Compose and on Cloudflare, what a provider must promise, and why Rivet is not the Cloudflare option too |
 | [The Rivet provider](../providers/rivet/README.md) | How do I self-host it? The Compose files, the settings, R2 or MinIO for the blobs |
+| [The Cloudflare provider](../providers/cloudflare/README.md) | How do I run the Worker? What it needs installed, its bindings and settings |
 
 ## Where things go
 
