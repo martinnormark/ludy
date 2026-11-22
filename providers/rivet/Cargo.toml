@@ -13,9 +13,11 @@ path = "src/main.rs"
 ludy-proto = { path = "../../crates/ludy-proto" }
 ludy-server = { path = "../../crates/ludy-server" }
 # Pinned to the release of the engine image in docker-compose.yml: the two
-# speak a versioned protocol. `sqlite-local` runs each actor's SQLite inside
-# this process (about 60,000 statements a second in a transaction, against
-# 2,300 over the wire) and needs LIBSQLITE3_FLAGS, set in .cargo/config.toml.
+# speak a versioned protocol. The server's own image is tagged with this
+# version too (`rivet-3.1.1`), so change both tags there with it.
+# `sqlite-local` runs each actor's SQLite inside this process (about 60,000
+# statements a second in a transaction, against 2,300 over the wire) and
+# needs LIBSQLITE3_FLAGS, set in .cargo/config.toml.
 rivetkit = { version = "=3.1.1", features = ["sqlite-local"] }
 anyhow = "1"
 async-trait = "0.1"

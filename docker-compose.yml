@@ -2,7 +2,8 @@
 #
 #   docker compose up -d --wait
 #
-# returns once a drive can answer on http://127.0.0.1:8080.
+# returns once a drive can answer on http://127.0.0.1:8080. It pulls the
+# server's image; to run the source in this checkout instead, add `--build`.
 #
 #   rivet   the Rivet engine. It places a drive's actor, and keeps each
 #           drive's SQLite database and its timer. One instance, on its own
@@ -24,7 +25,8 @@ name: ludy
 
 services:
   rivet:
-    # The same release as the `rivetkit` crate in providers/rivet/Cargo.toml.
+    # The same release as the `rivetkit` crate in providers/rivet/Cargo.toml
+    # and as the tag of the `ludy` image below.
     image: rivetdev/engine:3.1.1
     restart: unless-stopped
     environment:
@@ -60,6 +62,12 @@ services:
 
   # Healthy when a drive answers (`ludy-rivet health`, set in the image).
   ludy:
+    # Built from this repository by .github/workflows/server-image.yml, for
+    # amd64 and arm64, and pulled if it is not here yet. Its tag is the Rivet
+    # release it is built against: the engine's tag above, the `rivetkit`
+    # crate and this move together. Where it cannot be pulled, Compose
+    # builds it from the checkout, which takes some minutes.
+    image: ghcr.io/martinnormark/ludy-rivet:rivet-3.1.1
     build:
       context: .
       dockerfile: providers/rivet/Dockerfile
