@@ -5,12 +5,19 @@
 //! * [`shard`]: how file content is cut into shards, and the manifest that
 //!   lists them. Two clients share shards only if they cut the same way.
 //! * [`synth`]: the bytes of a synthetic object
+//! * [`tree`]: the node-tree protocol of an encrypted drive: commits of ops
+//!   on nodes, and the feed of what changed. Spoken by the Worker in
+//!   `app/worker`; the engine and `ludy-cloud` still use [`wire`]
+//! * [`crypt`]: end-to-end encryption: sealed shards, keyed cut points, node
+//!   keys, sealed names and manifests. Not used by the engine or the cloud yet
 //!
 //! Nothing here does I/O beyond reading a byte stream to cut it, so every
 //! client (the desktop engine, a phone, a tool) and the server can use it.
 
+pub mod crypt;
 pub mod shard;
 pub mod synth;
+pub mod tree;
 pub mod wire;
 
 pub use wire::{Changes, Content, DriveInfo, Listing, LogEntry, ObjectInfo, Share, Version};
