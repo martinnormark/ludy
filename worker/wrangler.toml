@@ -1,0 +1,24 @@
+name = "ludy-worker"
+main = "build/index.js"
+compatibility_date = "2026-11-01"
+send_metrics = false
+
+[build]
+command = "worker-build --release"
+
+[dev]
+port = 8787
+
+# Shards, named by their SHA-256.
+[[r2_buckets]]
+binding = "SHARDS"
+bucket_name = "ludy-shards"
+
+# One Durable Object per drive, with SQLite storage.
+[[durable_objects.bindings]]
+name = "DRIVE"
+class_name = "Drive"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Drive"]
