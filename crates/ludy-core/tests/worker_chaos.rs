@@ -464,7 +464,6 @@ struct Rig {
 
 async fn rig(gc_grace_ms: i64, seed: u64) -> Option<Rig> {
     if !available() {
-        eprintln!("skipped: app/worker/node_modules is not installed (run `npm install` in app/worker)");
         return None;
     }
     let worker = Worker::start(gc_grace_ms).await;
@@ -916,7 +915,7 @@ async fn a_panic_inside_a_commit_leaves_no_half_commit() {
     let log = rig.worker.log();
     assert!(log.contains("panic inside a transaction"), "the panic should be in the log");
     // The panic itself is in the log, and nothing else is.
-    assert_quiet_log(&rig.worker, &["panicked at src/drive.rs", "panic inside a transaction", "RuntimeError: unreachable", "/_dev/panic"]);
+    assert_quiet_log(&rig.worker, &["ludy-server/src/drive.rs", "panic inside a transaction", "RuntimeError: unreachable", "/_dev/panic"]);
 }
 
 /// The fault switches and the consistency check must not exist unless the

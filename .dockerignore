@@ -1,0 +1,15 @@
+# The image is built from the manifests and sources only.
+target
+**/target
+**/node_modules
+worker/build
+worker/.wrangler
+.git
+bench
+docs
+data
+scripts
+*.md
+.env
+.env.*
+!.env.example

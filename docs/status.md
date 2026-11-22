@@ -9,8 +9,7 @@ Where each part of Ludy stands, and where its lists of limits are kept. Each lis
 | Simulated cloud, engine, mount | Built, covered by automated tests, and checked against real mounts | [What works](evidence/verification.md) |
 | The app | Built. Some controls were clicked and checked in screenshots; the rest were not | [Not verified](evidence/verification.md#not-verified) |
 | The engine under faults | A chaos suite and a randomized soak pass; seven problems are known and not fixed | [Chaos testing](evidence/chaos-testing.md#known-and-not-fixed) |
-| The encrypted cloud | Built beside the simulated one and passing its chaos suites on the local emulator. The app does not use it, and nothing has run on Cloudflare | [The real cloud](real-cloud/overview.md), [known problems](real-cloud/known-issues.md) |
-| Self-hosting the cloud | A plan only | [Architecture](real-cloud/architecture.md) |
+| The encrypted cloud | Built beside the simulated one. Its server runs self-hosted on Rivet actors (`docker compose up`) and as a Cloudflare Worker, and both pass the chaos suites locally. The app does not use it, and nothing has been deployed | [The real cloud](real-cloud/overview.md), [known problems](real-cloud/known-issues.md), [architecture](real-cloud/architecture.md) |
 
 ## Simulated cloud, engine and app (2026-11-19)
 
@@ -18,7 +17,7 @@ The server, the engine and the app are built, covered by automated tests, and ch
 
 ## The encrypted cloud (2026-11-22)
 
-The format, the protocol, the Worker and a second engine exist and are tested against each other under `wrangler dev`. Nothing mounts a sealed drive yet, there is no sign-in, and nothing has been deployed. What was built and how it was checked is in [the real cloud](real-cloud/overview.md); what is expected to break, what is fragile and what nobody has checked is in [known problems](real-cloud/known-issues.md).
+The format, the protocol, the server and a second engine exist and are tested against each other. The server's logic is one crate, `ludy-server`, with two providers: Rivet actors under Docker Compose, and a Cloudflare Worker under `wrangler dev`. Nothing mounts a sealed drive yet, there is no sign-in, and nothing has been deployed. What was built and how it was checked is in [the real cloud](real-cloud/overview.md); what is expected to break, what is fragile and what nobody has checked is in [known problems](real-cloud/known-issues.md).
 
 ## Where the limits are listed
 

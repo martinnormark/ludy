@@ -1,0 +1,20 @@
+# Keep sealed shards and manifests in Cloudflare R2. Use it on top of
+# docker-compose.yml:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.r2.yml up -d
+#
+# Create a bucket and an R2 API token with "Object Read & Write" on it, and
+# put these in .env (see .env.example):
+#
+#   R2_ACCOUNT_ID  R2_BUCKET  R2_ACCESS_KEY_ID  R2_SECRET_ACCESS_KEY
+#
+# The drives' databases stay with the Rivet engine on this machine; only the
+# blobs move. Any other S3 works the same way: set AWS_ENDPOINT to it.
+services:
+  ludy:
+    environment:
+      LUDY_BLOBS: s3://${R2_BUCKET:?set R2_BUCKET in .env}
+      AWS_ENDPOINT: https://${R2_ACCOUNT_ID:?set R2_ACCOUNT_ID in .env}.r2.cloudflarestorage.com
+      AWS_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:?set R2_ACCESS_KEY_ID in .env}
+      AWS_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:?set R2_SECRET_ACCESS_KEY in .env}
+      AWS_REGION: auto

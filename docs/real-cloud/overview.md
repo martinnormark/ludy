@@ -1,8 +1,8 @@
 # The real cloud, in progress
 
-An end-to-end encrypted cloud is being built beside the simulated one: an encryption format, a protocol for a drive the server cannot read, an engine for it, and a server as a Cloudflare Worker. It passes its chaos suites on the local emulator. The app does not use it yet, and nothing has been deployed.
+An end-to-end encrypted cloud is being built beside the simulated one: an encryption format, a protocol for a drive the server cannot read, an engine for it, and a server whose logic is one crate that runs in two places: self-hosted on Rivet actors (`docker compose up`) and as a Cloudflare Worker. Both pass the same chaos suites locally. The app does not use it yet, and nothing has been deployed.
 
-Everything else in these docs runs against the simulated cloud. Its replacement is being built beside it, and the app, the CLI and the mount do not use it yet. The decisions behind it: end-to-end encryption, file and folder names included; Cloudflare R2 for storage; the server as a Cloudflare Worker written in Rust.
+Everything else in these docs runs against the simulated cloud. Its replacement is being built beside it, and the app, the CLI and the mount do not use it yet. The decisions behind it: end-to-end encryption, file and folder names included; a server that can be self-hosted or run on Cloudflare; Cloudflare R2 or any S3 for the blobs; all of it in Rust.
 
 ## The pieces
 
@@ -11,7 +11,19 @@ Everything else in these docs runs against the simulated cloud. Its replacement 
 | [`ludy_proto::crypt`](../../crates/ludy-proto/src/crypt.rs) | The encryption format: shards sealed in 64 KiB frames so a range read fetches only its frames, shard keys and cut points derived from content and a per-drive secret, a key per file and folder wrapped by its parent's, sealed names and manifests. The description is at the top of the file |
 | [`ludy_proto::tree`](../../crates/ludy-proto/src/tree.rs) | The protocol for a drive the server cannot read: a tree of nodes with ids, commits of ops applied together or not at all, and a feed of what changed since a sequence number |
 | [`ludy_core::sealed_drive`](../../crates/ludy-core/src/sealed_drive.rs) | The engine for it, beside the old one ([`drive`](../../crates/ludy-core/src/drive.rs)) and with the same methods the NFS adapter calls. The tree comes from the feed, each key unwrapped from the root key down; a read goes through the file's sealed manifest and fetches only the frames it needs; an upload cuts and seals what changed, sends the sealed shards the cloud lacks and commits a sealed manifest; creates, moves and deletes are queued ops sent in commits that are safe to send twice. [`sealed_client`](../../crates/ludy-core/src/sealed_client.rs) is its HTTP side |
-| [`worker`](../../worker) | The Worker. Sealed shards and manifests in R2, checked by R2 against their names. One Durable Object per drive with SQLite storage: the tree, 25 versions per file, which blobs are in use, and a collector that deletes from R2 what no version has used for a day |
+| [`ludy-server`](../../crates/ludy-server) | The cloud's logic with no platform in it: a drive's tables (the tree, 25 versions per file, which blobs are in use), the rules of a commit, the feed, and a collector that deletes from storage what no version has used for a day. A provider supplies SQLite, a blob store and a timer through its ports. Its own tests run it on SQLite in memory and can make storage fail |
+| [`providers/rivet`](../../providers/rivet) | The self-hosted provider, and what `docker compose up` starts: a Rivet actor per drive, an HTTP front that hashes every upload, blobs in a folder, Cloudflare R2 or any S3 |
+| [`worker`](../../worker) | The Cloudflare provider: a Worker, one Durable Object per drive with SQLite storage, sealed shards and manifests in R2, checked by R2 against their names |
+
+How the three fit together, and why Rivet could not be the Cloudflare option as well, is in [architecture.md](architecture.md).
+
+## Running it self-hosted
+
+```bash
+docker compose up -d
+```
+
+That starts the Rivet engine and the server, on port 8080 of this machine only, with blobs in a Docker volume. The settings, and the files that move the blobs to R2 or MinIO, are in [`providers/rivet/README.md`](../../providers/rivet/README.md).
 
 ## Setting up the Worker
 
@@ -34,12 +46,32 @@ Everything else in these docs runs against the simulated cloud. Its replacement 
   - The last four ran on the final code, where a `kill -9` lands on a burst of creates, new versions and deletes of files and whole folders (2,000 steps, 2,208 commits, 57 kills, 918 lost messages); the numbers are in [`bench/2026-11-22-worker-chaos.md`](../../bench/2026-11-22-worker-chaos.md).
   - Four bugs put into the drive object on purpose, one at a time, were each caught.
 
+- **The drive by itself.** [`ludy-server/tests/drive.rs`](../../crates/ludy-server/tests/drive.rs) runs the drive on SQLite in memory, with no server: the rules of a commit, the feed, the collector, a panic inside a transaction. It can make storage fail, which no real provider can be asked to do: the database fails at every statement of a commit in turn, and all of the commit or none of it remains.
+- **Both providers under the same suites.** The two suites above were written against the Worker. `LUDY_PROVIDER=rivet` runs them against the self-hosted server: `ludy-rivet` beside a Rivet engine in a container, both killed at each `kill -9`. All 13 and 14 tests pass on each provider (2026-11-22, after the server's logic moved into `ludy-server`). One extra engine soak on Rivet failed its check of the server's log while every file was right; what that was is in [known problems](known-issues.md#the-rivet-provider). The tables are in [`bench/2026-11-22-providers-chaos.md`](../../bench/2026-11-22-providers-chaos.md).
+- **The Compose files, by hand.** `docker compose up` was built and started, a drive was created, written and read, both containers were killed with SIGKILL and started again, and the drive was as it had been. The same with MinIO as the blob store, plus a run of the collector, to try the S3 path. The R2 file was not started: that needs an account.
+
+On Cloudflare (the default):
+
 ```bash
 cargo test -p ludy-core --test worker_chaos -- --ignored --test-threads=1
 ```
 
 ```bash
 cargo test -p ludy-core --test sealed_engine -- --ignored --test-threads=1
+```
+
+On Rivet, with Docker running:
+
+```bash
+cargo build --release -p ludy-rivet
+```
+
+```bash
+LUDY_PROVIDER=rivet cargo test -p ludy-core --test worker_chaos -- --ignored --test-threads=1
+```
+
+```bash
+LUDY_PROVIDER=rivet cargo test -p ludy-core --test sealed_engine -- --ignored --test-threads=1
 ```
 
 ## What this found, all fixed
@@ -51,9 +83,10 @@ cargo test -p ludy-core --test sealed_engine -- --ignored --test-threads=1
 | The engine's message that a change could not be saved was erased by the next successful upload, so nobody would have seen it | Such notices are kept apart from transient errors until they are read |
 | Six readers of one place in a file counted as one reader moving forward and set off read-ahead | Only a read that gets further extends the streak |
 | A collector cut short (through a fault switch, then `kill -9`) leaves its shards marked, and a commit wanting one back is refused until the collector finishes. Each refusal set the collector's alarm 50 ms ahead again, so a client retrying faster than that postponed it for ever | The alarm is never moved later than it is already set |
+| On Rivet, a panic inside a commit left the drive answering nothing for 36 seconds: the transaction stayed open, and the actor that was restarted after the panic waited for it. Found by the panic scenario the first time the suite ran against Rivet | The adapter rolls the transaction back before it lets the panic go on. The request that panicked gets a 502 at once, and the others were answered within 41 ms |
 
 ## Read next
 
 - [Known problems and what is not verified](known-issues.md): what is expected to break, what is fragile, what nobody has checked, what is not built, and the decisions still open.
-- [Architecture](architecture.md): diagrams of what exists, and a plan for running the same cloud self-hosted, as one Rust binary or on Rivet actors.
+- [Architecture](architecture.md): what runs where, what a provider must promise, and how each of the two keeps it.
 - [Worker chaos numbers](../../bench/2026-11-22-worker-chaos.md): the raw tables.

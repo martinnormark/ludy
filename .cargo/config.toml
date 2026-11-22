@@ -1,0 +1,5 @@
+# Rivet's embedded SQLite (providers/rivet) refuses to start unless the
+# bundled SQLite was compiled with these. They change nothing for the other
+# crates that bundle SQLite.
+[env]
+LIBSQLITE3_FLAGS = "SQLITE_ENABLE_BATCH_ATOMIC_WRITE SQLITE_DIRECT_OVERFLOW_READ=0"

@@ -51,7 +51,6 @@ struct Mac {
 
 async fn bench() -> Option<Bench> {
     if !available() {
-        eprintln!("skipped: app/worker/node_modules is not installed (run `npm install` in app/worker)");
         return None;
     }
     let worker = Worker::start(NEVER).await;

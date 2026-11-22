@@ -430,11 +430,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ludy-server"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "ludy-proto",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ludy-worker"
 version = "0.1.0"
 dependencies = [
  "futures-util",
  "ludy-proto",
+ "ludy-server",
  "serde",
  "serde_json",
  "worker",

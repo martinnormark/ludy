@@ -35,13 +35,14 @@ The raw benchmark tables are in [`bench/`](../bench).
 
 ## The real cloud
 
-The end-to-end encrypted cloud being built beside the simulated one. The app does not use it yet.
+The end-to-end encrypted cloud being built beside the simulated one, self-hosted or on Cloudflare. The app does not use it yet.
 
 | Page | What it answers |
 |---|---|
 | [Overview](real-cloud/overview.md) | What has been built, how it was checked, what the checks found |
 | [Known problems](real-cloud/known-issues.md) | What is expected to break, what is fragile, what nobody has checked, what is not built |
-| [Architecture](real-cloud/architecture.md) | Diagrams of what exists, and a plan for running the same cloud on Cloudflare, as one Rust binary, or on Rivet actors |
+| [Architecture](real-cloud/architecture.md) | How one crate of server logic runs on Rivet actors under Docker Compose and on Cloudflare, what a provider must promise, and why Rivet is not the Cloudflare option too |
+| [The Rivet provider](../providers/rivet/README.md) | How do I self-host it? The Compose files, the settings, R2 or MinIO for the blobs |
 
 ## Where things go
 

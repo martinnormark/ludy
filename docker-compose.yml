@@ -1,0 +1,59 @@
+# Ludy's cloud, self-hosted: `docker compose up` and it is on port 8080.
+#
+#   rivet   the Rivet engine. It places a drive's actor, and keeps each
+#           drive's SQLite database and its timer. One instance, on its own
+#           disk: fine for one machine, and the engine's own documentation
+#           asks for three instances and a bucket in production.
+#   ludy    this repository's server (providers/rivet): the HTTP front every
+#           client talks to, and the actors, one per drive.
+#
+# Sealed shards and manifests go to a volume. To keep them in Cloudflare R2
+# or any S3 instead, add docker-compose.r2.yml or docker-compose.minio.yml:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.r2.yml up -d
+#
+# There is no sign-in yet: whoever can reach port 8080 can read and change
+# every drive (what they read is sealed; they hold no key). So the port is
+# published on this machine only. Put it behind something that authenticates
+# before changing that.
+name: ludy
+
+services:
+  rivet:
+    # The same release as the `rivetkit` crate in providers/rivet/Cargo.toml.
+    image: rivetdev/engine:3.1.1
+    restart: unless-stopped
+    environment:
+      # Only `ludy` can reach the engine (its port is not published), so a
+      # fixed token does for one machine. Set RIVET_TOKEN in .env otherwise.
+      RIVET__AUTH__ADMIN_TOKEN: ${RIVET_TOKEN:-ludy-on-one-machine}
+      RIVET__STORAGE__LOG_DIRECTORY: /var/lib/rivet/log
+      RIVET__STORAGE__AUTO_PROVISION_PARTITIONS: "1"
+      RIVET__STORAGE__BALANCING__ENABLED: "false"
+      RIVET__OBJECT_STORAGE__PRIMARY__FILE_SYSTEM__PATH: /var/lib/rivet/objects
+    volumes:
+      - rivet-log:/var/lib/rivet/log
+      - rivet-objects:/var/lib/rivet/objects
+
+  ludy:
+    build:
+      context: .
+      dockerfile: providers/rivet/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - rivet
+    ports:
+      - "127.0.0.1:${LUDY_PORT:-8080}:8080"
+    environment:
+      RIVET_ENDPOINT: http://default:${RIVET_TOKEN:-ludy-on-one-machine}@rivet:6420
+      # A folder, in the volume below. The R2 and MinIO files replace this.
+      LUDY_BLOBS: /var/lib/ludy/blobs
+      # How long a shard no version uses is kept, in milliseconds. A day.
+      GC_GRACE_MS: ${GC_GRACE_MS:-86400000}
+    volumes:
+      - ludy-blobs:/var/lib/ludy/blobs
+
+volumes:
+  rivet-log:
+  rivet-objects:
+  ludy-blobs:

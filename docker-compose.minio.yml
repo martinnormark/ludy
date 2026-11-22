@@ -1,0 +1,42 @@
+# Keep sealed shards and manifests in MinIO, an S3 that runs here too. Use
+# it on top of docker-compose.yml:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.minio.yml up -d
+#
+# This is also how the S3 path of the server is tried without an account
+# anywhere. MinIO no longer publishes images of its own on Docker Hub; this
+# is Chainguard's build, which only offers the `latest` tag for free.
+services:
+  # A folder at the top of MinIO's data directory is a bucket. The image has
+  # no shell to make one with, so this does, and hands it to MinIO's user.
+  minio-bucket:
+    image: busybox:1.36
+    command: ["sh", "-c", "mkdir -p /data/ludy && chown -R 65532:65532 /data"]
+    volumes:
+      - minio-data:/data
+
+  minio:
+    image: cgr.dev/chainguard/minio:latest
+    restart: unless-stopped
+    depends_on:
+      minio-bucket:
+        condition: service_completed_successfully
+    command: ["server", "/data"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER:-ludy}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:-ludy-on-one-machine}
+    volumes:
+      - minio-data:/data
+
+  ludy:
+    depends_on:
+      - minio
+    environment:
+      LUDY_BLOBS: s3://ludy
+      AWS_ENDPOINT: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_USER:-ludy}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_PASSWORD:-ludy-on-one-machine}
+      AWS_REGION: us-east-1
+
+volumes:
+  minio-data:

@@ -41,6 +41,16 @@ Click **Mount** on a drive. It mounts at `~/Ludy/<drive>` and appears under Loca
 | `scripts/chaos-mount.sh <work-dir>` | Flood, copy and `kill -9` the cloud and then the mounting process, on a hidden mount (needs the release builds) |
 | `curl -X PUT 'http://127.0.0.1:9000/_config?mbps=50&latency_ms=120'` | Slow the link down while running |
 
+## The encrypted cloud, self-hosted
+
+The app does not use this cloud yet; this starts its server. From the repository root, with Docker running:
+
+```bash
+docker compose up -d
+```
+
+It listens on `http://127.0.0.1:8080`. The first start builds the server's image, which takes several minutes. The settings, and how to keep the blobs in Cloudflare R2 or MinIO, are in [the Rivet provider's README](../providers/rivet/README.md); the Cloudflare Worker is set up as [the overview](real-cloud/overview.md#setting-up-the-worker) says.
+
 ## Environment variables
 
 Environment variables: `LUDY_SERVER` (default `http://127.0.0.1:9000`), `LUDY_CACHE_MB` (default 2000), `LUDY_CACHE_DIR` (default `~/Library/Caches/Ludy/blocks`), `LUDY_MOUNT_ROOT` (default `~/Ludy`), `LUDY_READ_ONLY`, `LUDY_NOBROWSE`.

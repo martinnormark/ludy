@@ -1,11 +1,23 @@
-//! What the Worker chaos tests stand on: the Worker under `wrangler dev` as
-//! a process that can be killed, frozen and restarted; a proxy in front of
-//! it that loses requests and replies; and a client that keeps trying until
-//! it has an answer, counting what it saw on the way.
+//! What the chaos tests of the real cloud stand on: the server as a
+//! process that can be killed, frozen and restarted; a proxy in front of it
+//! that loses requests and replies; and a client that keeps trying until it
+//! has an answer, counting what it saw on the way.
+//!
+//! The server is whichever provider `LUDY_PROVIDER` names:
+//!
+//! * `cloudflare` (the default): the Worker under `wrangler dev`.
+//! * `rivet`: `target/release/ludy-rivet` with a Rivet engine in a Docker
+//!   container of its own and a folder for the blobs. Build the binary first
+//!   (`cargo build --release -p ludy-rivet`).
+//!
+//! The type is still called [`Worker`]: the suites were written against the
+//! Cloudflare Worker, and they are the conformance test for every provider.
 //!
 //! Everything the rig starts is in a process group of its own, on ports of
 //! its own, with its state in a temporary folder, and it signals nothing
-//! else.
+//! else. A Rivet engine container is named `ludy-rig-<port>` and removed
+//! when the rig is dropped; if a test run is itself killed, remove what it
+//! left with `docker rm -fv $(docker ps -aq --filter label=ludy-rig)`.
 
 #![allow(dead_code)]
 
@@ -23,13 +35,86 @@ use serde::de::DeserializeOwned;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 
+/// Which server the suites run against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Provider {
+    Cloudflare,
+    Rivet,
+}
+
+pub fn provider() -> Provider {
+    match std::env::var("LUDY_PROVIDER").unwrap_or_default().as_str() {
+        "" | "cloudflare" => Provider::Cloudflare,
+        "rivet" => Provider::Rivet,
+        other => panic!("LUDY_PROVIDER={other}: the providers are cloudflare and rivet"),
+    }
+}
+
+/// What `kill -9` takes on Rivet: `LUDY_RIVET_KILL` is `both` (the default:
+/// the server and the engine's container, as when their machine loses
+/// power), `server` or `engine`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kill {
+    Both,
+    Server,
+    Engine,
+}
+
+fn kill_mode() -> Kill {
+    match std::env::var("LUDY_RIVET_KILL").unwrap_or_default().as_str() {
+        "" | "both" => Kill::Both,
+        "server" => Kill::Server,
+        "engine" => Kill::Engine,
+        other => panic!("LUDY_RIVET_KILL={other}: both, server or engine"),
+    }
+}
+
+/// The Rivet engine image. The same release as the `rivetkit` crate in
+/// `providers/rivet/Cargo.toml` and the image in its `docker-compose.yml`.
+const RIVET_ENGINE_IMAGE: &str = "rivetdev/engine:3.1.1";
+/// The engine's admin token inside the rig. Nothing outside the rig can reach that engine.
+const RIVET_TOKEN: &str = "rig";
+/// A drive nobody creates, asked for to see whether drives answer yet.
+const PROBE_DRIVE: &str = "ffffffffffffffffffffffffffffffff";
+
 pub fn worker_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../worker")
 }
 
-/// The Worker can only run where Node and its packages are installed.
+fn rivet_binary() -> PathBuf {
+    match std::env::var("LUDY_RIVET_BIN") {
+        Ok(path) => PathBuf::from(path),
+        Err(_) => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/release/ludy-rivet"),
+    }
+}
+
+fn docker(args: &[&str]) -> bool {
+    Command::new("docker").args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
+}
+
+/// Whether the chosen provider can be started here. A suite that finds it
+/// cannot skips itself and says what is missing.
 pub fn available() -> bool {
-    worker_dir().join("node_modules/.bin/wrangler").exists()
+    match provider() {
+        Provider::Cloudflare => {
+            let there = worker_dir().join("node_modules/.bin/wrangler").exists();
+            if !there {
+                eprintln!("skipped: app/worker/node_modules is not installed (run `npm install` in app/worker)");
+            }
+            there
+        }
+        Provider::Rivet => {
+            if !rivet_binary().exists() {
+                eprintln!("skipped: {} is not built (run `cargo build --release -p ludy-rivet`)", rivet_binary().display());
+                return false;
+            }
+            if !docker(&["version"]) {
+                eprintln!("skipped: Docker is not running, and the Rivet engine runs in a container");
+                return false;
+            }
+            true
+        }
+    }
 }
 
 fn free_port() -> u16 {
@@ -38,26 +123,37 @@ fn free_port() -> u16 {
 
 // ------------------------------------------------------------ the process
 
+/// The Rivet engine's container, beside the server's own process.
+struct Engine {
+    name: String,
+    port: u16,
+    created: bool,
+}
+
 pub struct Worker {
     pub dir: tempfile::TempDir,
     pub port: u16,
     inspector: u16,
     vars: Vec<(String, String)>,
     child: Option<Child>,
+    /// Only with the Rivet provider.
+    engine: Option<Engine>,
     /// How long each start took, in milliseconds.
     pub starts: Vec<u64>,
     pub kills: u32,
 }
 
 impl Worker {
-    /// Start the Worker with the `_dev` routes on and the collector's grace
+    /// Start the server with the `_dev` routes on and the collector's grace
     /// period as given (use a huge one to keep the collector from running by itself).
     pub async fn start(gc_grace_ms: i64) -> Worker {
         Worker::start_with(vec![("LUDY_DEV".into(), "1".into()), ("GC_GRACE_MS".into(), gc_grace_ms.to_string())]).await
     }
 
     pub async fn start_with(vars: Vec<(String, String)>) -> Worker {
-        let mut w = Worker { dir: tempfile::tempdir().unwrap(), port: free_port(), inspector: free_port(), vars, child: None, starts: vec![], kills: 0 };
+        let port = free_port();
+        let engine = (provider() == Provider::Rivet).then(|| Engine { name: format!("ludy-rig-{port}"), port: free_port(), created: false });
+        let mut w = Worker { dir: tempfile::tempdir().unwrap(), port, inspector: free_port(), vars, child: None, engine, starts: vec![], kills: 0 };
         w.boot().await;
         w
     }
@@ -74,35 +170,95 @@ impl Worker {
         format!("http://127.0.0.1:{}", self.port)
     }
 
+    /// The server's own process, not started yet.
+    fn command(&self) -> Command {
+        let Some(engine) = &self.engine else {
+            let mut cmd = Command::new(worker_dir().join("node_modules/.bin/wrangler"));
+            cmd.current_dir(worker_dir())
+                .args(["dev", "--port", &self.port.to_string(), "--inspector-port", &self.inspector.to_string()])
+                .args(["--persist-to", self.dir.path().join("state").to_str().unwrap(), "--show-interactive-dev-session=false"])
+                .env("WRANGLER_SEND_METRICS", "false");
+            for (k, v) in &self.vars {
+                cmd.args(["--var", &format!("{k}:{v}")]);
+            }
+            return cmd;
+        };
+        let mut cmd = Command::new(rivet_binary());
+        cmd.env("RIVET_ENDPOINT", format!("http://default:{RIVET_TOKEN}@127.0.0.1:{}", engine.port))
+            .env("LUDY_LISTEN", format!("127.0.0.1:{}", self.port))
+            .env("LUDY_BLOBS", self.dir.path().join("blobs"))
+            // Without the two the harness sets, the server must behave as it does for anyone.
+            .env_remove("LUDY_DEV")
+            .env_remove("GC_GRACE_MS");
+        for (k, v) in &self.vars {
+            cmd.env(k, v);
+        }
+        cmd
+    }
+
+    /// Start the Rivet engine's container, or start it again after a kill.
+    /// Its state is in the container, so it is what the engine had on disk.
+    fn boot_engine(&mut self) {
+        let Some(engine) = &mut self.engine else { return };
+        if engine.created {
+            assert!(docker(&["start", &engine.name]), "docker start {}", engine.name);
+            return;
+        }
+        let publish = format!("127.0.0.1:{}:6420", engine.port);
+        let token = format!("RIVET__AUTH__ADMIN_TOKEN={RIVET_TOKEN}");
+        #[rustfmt::skip]
+        let run = [
+            "run", "-d", "--name", &engine.name, "--label", "ludy-rig=1", "-p", &publish,
+            "-e", &token,
+            // One instance, everything on its own disk: what docker-compose.yml runs.
+            "-e", "RIVET__STORAGE__LOG_DIRECTORY=/var/lib/rivet/log",
+            "-e", "RIVET__STORAGE__AUTO_PROVISION_PARTITIONS=1",
+            "-e", "RIVET__STORAGE__BALANCING__ENABLED=false",
+            "-e", "RIVET__OBJECT_STORAGE__PRIMARY__FILE_SYSTEM__PATH=/var/lib/rivet/objects",
+            // How long the engine waits before it gives a dead node's actors
+            // to another. The default is about 45 s, which a suite that
+            // kills the node dozens of times cannot afford.
+            "-e", "RIVET__PEGBOARD__NODE_LOST_THRESHOLD=2000",
+            "-e", "RIVET__PEGBOARD__NODE_PING_TIMEOUT=2000",
+            "-v", "/var/lib/rivet/log", "-v", "/var/lib/rivet/objects",
+            RIVET_ENGINE_IMAGE,
+        ];
+        assert!(docker(&run), "docker run {RIVET_ENGINE_IMAGE} as {}", engine.name);
+        engine.created = true;
+    }
+
     async fn boot(&mut self) {
         let started = Instant::now();
-        let log = std::fs::OpenOptions::new().create(true).append(true).open(self.log_path()).unwrap();
-        let mut cmd = Command::new(worker_dir().join("node_modules/.bin/wrangler"));
-        cmd.current_dir(worker_dir())
-            .args(["dev", "--port", &self.port.to_string(), "--inspector-port", &self.inspector.to_string()])
-            .args(["--persist-to", self.dir.path().join("state").to_str().unwrap(), "--show-interactive-dev-session=false"])
-            .env("WRANGLER_SEND_METRICS", "false")
-            .stdin(Stdio::null())
-            .stdout(log.try_clone().unwrap())
-            .stderr(log)
-            // A group of its own, so that killing it takes workerd along and nothing else.
-            .process_group(0);
-        for (k, v) in &self.vars {
-            cmd.args(["--var", &format!("{k}:{v}")]);
+        self.boot_engine();
+        // After a kill of the engine alone the server is still running.
+        if self.child.is_none() {
+            let log = std::fs::OpenOptions::new().create(true).append(true).open(self.log_path()).unwrap();
+            let mut cmd = self.command();
+            cmd.stdin(Stdio::null())
+                .stdout(log.try_clone().unwrap())
+                .stderr(log)
+                // A group of its own, so that killing it takes its children along and nothing else.
+                .process_group(0);
+            self.child = Some(cmd.spawn().expect("start the server"));
         }
-        self.child = Some(cmd.spawn().expect("start wrangler dev"));
         let http = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().unwrap();
         let deadline = Instant::now() + Duration::from_secs(180);
+        // Up means a drive answers. On Rivet the front is up before the
+        // engine has given the node its actors back.
+        let probe = match self.engine {
+            Some(_) => format!("{}/drives/{PROBE_DRIVE}", self.url()),
+            None => self.url(),
+        };
         loop {
-            if let Ok(r) = http.get(self.url()).send().await {
-                if r.status().is_success() {
+            if let Ok(r) = http.get(&probe).send().await {
+                if r.status().is_success() || r.status().as_u16() == 404 {
                     break;
                 }
             }
             if let Some(status) = self.child.as_mut().unwrap().try_wait().unwrap() {
-                panic!("wrangler dev exited with {status}:\n{}", tail(&self.log(), 40));
+                panic!("the server exited with {status}:\n{}", tail(&self.log(), 40));
             }
-            assert!(Instant::now() < deadline, "wrangler dev did not come up:\n{}", tail(&self.log(), 40));
+            assert!(Instant::now() < deadline, "the server did not come up:\n{}", tail(&self.log(), 40));
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         self.starts.push(started.elapsed().as_millis() as u64);
@@ -116,7 +272,9 @@ impl Worker {
         signal_group(self.pid(), signal);
     }
 
-    /// Stop every process of the Worker where it stands; requests hang.
+    /// Stop every process of the server where it stands; requests hang.
+    /// On Rivet that is the node, front and actors together; the engine
+    /// keeps running and sees a node that has stopped answering.
     pub fn freeze(&self) {
         self.signal(libc::SIGSTOP);
     }
@@ -126,13 +284,28 @@ impl Worker {
     }
 
     /// `kill -9` the whole group: nothing gets to flush or say goodbye.
+    /// On Rivet the engine's container is killed the same way right after,
+    /// as when the machine both run on loses power.
     pub fn kill9(&mut self) {
+        if let (Some(engine), Kill::Engine) = (&self.engine, kill_mode()) {
+            if self.child.is_some() && docker(&["kill", "-s", "KILL", &engine.name]) {
+                self.kills += 1;
+            }
+            return;
+        }
+        self.kill_server(kill_mode() == Kill::Both);
+    }
+
+    fn kill_server(&mut self, engine_too: bool) {
         if let Some(mut child) = self.child.take() {
             let pid = child.id() as i32;
             // A stopped process does not die until it is continued on some systems; be sure.
             signal_group(pid, libc::SIGCONT);
             signal_group(pid, libc::SIGKILL);
             let _ = child.wait();
+            if let (Some(engine), true) = (&self.engine, engine_too) {
+                docker(&["kill", "-s", "KILL", &engine.name]);
+            }
             self.kills += 1;
             // The port must really be free before anything is started on it again.
             let deadline = Instant::now() + Duration::from_secs(20);
@@ -155,9 +328,12 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        self.kill9();
+        self.kill_server(true);
+        if let Some(engine) = &self.engine {
+            docker(&["rm", "-f", "-v", &engine.name]);
+        }
         if std::thread::panicking() {
-            eprintln!("--- the end of the Worker's log ---\n{}", tail(&self.log(), 60));
+            eprintln!("--- the end of the server's log ---\n{}", tail(&self.log(), 60));
         }
     }
 }

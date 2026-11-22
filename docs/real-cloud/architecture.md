@@ -1,46 +1,76 @@
-# Architecture: one cloud, several places to run it
+# Architecture: one cloud, two places to run it
 
-Written 2026-11-22. The first half describes what exists. The second half is a plan: how to arrange the code so the same cloud can run on Cloudflare (as now), as one self-hosted Rust binary, or self-hosted on Rivet actors under Docker Compose. Nothing in the second half is built.
+The cloud's logic is one crate with no platform in it, [`ludy-server`](../../crates/ludy-server). A provider is a thin package that supplies storage, a timer and an HTTP front to it. Two exist: Rivet actors under Docker Compose, which is what `docker compose up` starts, and a Cloudflare Worker. Both pass the same chaos suites.
 
-What is not verified, including about today's code, is in [known-issues.md](known-issues.md).
+Written 2026-11-22. What is not verified is in [known-issues.md](known-issues.md).
 
-## Today
+## What runs where
 
 ```mermaid
 flowchart TB
-  subgraph mac["The Mac"]
-    apps["Finder and applications"]
-    nfs["NFS adapter, loopback NFSv3<br/>ludy-core: nfs.rs"]
-    old["Old engine<br/>DriveFs"]
-    new["New engine<br/>SealedDrive: holds the keys,<br/>seals and opens"]
-    disk[("Journal and block cache")]
-    apps --> nfs --> old
-    nfs -. "not wired yet" .-> new
-    old --> disk
-    new --> disk
+  clients["Clients<br/>ludy-core on the Mac; later iOS, web"]
+  proto{{"The protocol: ludy-proto<br/>same HTTP on every provider"}}
+  clients --> proto
+
+  subgraph server["crates/ludy-server: the cloud's logic, no platform in it"]
+    front["front: which request goes where,<br/>checks on a blob's path and size"]
+    logic["drive: tables, commit, feed,<br/>collector, recount"]
+    ports["ports: SQL with a transaction, blob store,<br/>timer, clock, two settings, log"]
+    front --> logic --> ports
+  end
+  proto --> front
+
+  subgraph rivet["providers/rivet: self-hosted, the default"]
+    rfront["HTTP front (axum)<br/>hashes every upload"]
+    ractor["A Rivet actor per drive<br/>its own SQLite, a schedule"]
+    rengine["Rivet engine<br/>(rivetdev/engine container)"]
+    rblob[("A folder, Cloudflare R2,<br/>MinIO or any S3")]
+    rfront -- "blobs" --> rblob
+    rfront -- "the rest, through the gateway" --> rengine --> ractor
+    ractor -- "is it there? delete" --> rblob
   end
 
-  sim["ludy-cloud<br/>simulated cloud, to be retired"]
-  old -- "old HTTP API" --> sim
-
-  subgraph cf["Cloudflare (so far only wrangler dev)"]
+  subgraph cf["worker: Cloudflare"]
     w["Worker<br/>routes; blobs straight to R2"]
-    d["Durable Object per drive<br/>SQLite: tree, versions, blob counts<br/>alarm: collector"]
-    r2[("R2<br/>sealed shards and manifests")]
+    d["Durable Object per drive<br/>SQLite, alarm"]
+    r2[("R2")]
     w --> d
     w --> r2
     d -- "is it there? delete" --> r2
   end
-  new -- "HTTP: ludy_proto::tree and blobs" --> w
+
+  ports -- "implemented by" --> ractor
+  ports -- "implemented by" --> d
+
+  conf["Conformance: both chaos suites,<br/>LUDY_PROVIDER picks the launcher"]
+  conf -. "must pass" .-> rivet
+  conf -. "must pass" .-> cf
 ```
 
-Three facts the rest of this document leans on:
+Three facts everything leans on:
 
 1. **The server never holds a key.** It stores sealed bytes under the SHA-256 of those bytes, and a tree of nodes whose names and keys are sealed. Everything that needs a key happens in the client.
 2. **The client only knows a base URL.** [`SealedClient`](../../crates/ludy-core/src/sealed_client.rs) takes one and speaks the protocol below. It has no idea what answers.
 3. **A drive is one small database with one writer.** All of a drive's bookkeeping is a SQLite database of five tables, and every commit is one transaction on it. Bytes do not pass through it.
 
-### The protocol is the boundary
+### Which one to run
+
+| | Rivet (`docker compose up`) | Cloudflare (`wrangler deploy`) |
+|---|---|---|
+| Runs on | Any machine with Docker, or the binary beside an engine | Cloudflare's network |
+| A drive is | A Rivet actor, placed by the engine | A Durable Object |
+| The drive's database | The actor's SQLite, kept by the engine | The object's SQLite |
+| Blobs | A folder by default; Cloudflare R2, MinIO or any S3 by setting | R2, through the binding |
+| Uploads checked against their name | The front hashes the body | R2 does |
+| More than one machine | The engine's documentation asks for three or more engine instances and a bucket; not tried here | Yes, it is Cloudflare's |
+| TLS, sign-in | Neither. Put a proxy in front | TLS is Cloudflare's. No sign-in |
+| State | Passes both chaos suites, engine and server both killed | Passes both chaos suites under `wrangler dev`; never deployed |
+
+**Rivet cannot be the Cloudflare option too.** That was the hope: one Rivet codebase, hosted on Compose or on Workers. Rivet 3 (3.0.0 shipped 2026-11-01; this uses 3.1.1) has no Workers target. Its actors run in long-lived processes that dial out to an engine, and the engine refuses serverless pools (`pool.serverless_unsupported`). The older `@rivetkit/cloudflare-workers` package, on the 2.x line that Rivet's migration guide retires, only made a Worker a runner for an engine hosted somewhere else; the state never lived on Cloudflare. So Cloudflare stays its own provider, and what the two share is everything that matters: the drive logic, the protocol, and the test of both.
+
+What does carry over is storage: R2 speaks S3, so the Rivet provider can keep its blobs in R2 ([`docker-compose.r2.yml`](../../docker-compose.r2.yml)).
+
+## The protocol is the boundary
 
 | Request | What it does |
 |---|---|
@@ -55,144 +85,90 @@ Three facts the rest of this document leans on:
 | `GET /drives/:drive/stats` | Counts and telemetry |
 | `/_dev/...` | Fault switches and the drive's recount of itself, for the tests only |
 
-The types are in [`ludy_proto::tree`](../../crates/ludy-proto/src/tree.rs). A provider is anything that answers these requests the same way. That makes the provider boundary an HTTP one: clients do not change, and nothing about a provider leaks into `ludy-core`.
+The types are in [`ludy_proto::tree`](../../crates/ludy-proto/src/tree.rs). A provider is anything that answers these requests the same way. Clients do not change, and nothing about a provider leaks into `ludy-core`.
 
-## Target
+## The shared crate
 
-```mermaid
-flowchart TB
-  clients["Clients<br/>ludy-core on the Mac; later iOS, web"]
-  proto{{"The protocol: ludy-proto<br/>same HTTP on every provider"}}
-  clients --> proto
+[`ludy-server`](../../crates/ludy-server) has three modules:
 
-  subgraph server["crates/ludy-server: the cloud's logic, no platform in it"]
-    routes["Routes and checks"]
-    logic["Drive logic<br/>tables, commit, feed, collector, recount"]
-    ports["Ports<br/>Sql, Blobs, Timer, Clock, Config, Log"]
-    routes --> logic --> ports
-  end
-  proto --> routes
+- [`drive`](../../crates/ludy-server/src/drive.rs): one drive. The tables, the rules of a commit, the feed, the collector, the recount the tests ask for. Generic over a `Platform`.
+- [`front`](../../crates/ludy-server/src/front.rs): what the HTTP side shares. Which request goes to the blob store, which to a drive, which does not exist; a blob's key and size limit; byte ranges.
+- [`ports`](../../crates/ludy-server/src/ports.rs): the `Platform` and `Sql` traits a provider implements.
 
-  subgraph providers["providers/: one package each"]
-    cf["cloudflare<br/>Worker, Durable Object, R2"]
-    native["native<br/>one Rust binary:<br/>axum, SQLite, files or S3"]
-    rivet["rivet<br/>Docker Compose:<br/>Rivet engine, actors, S3"]
-  end
-  ports -- "implemented by" --> cf
-  ports -- "implemented by" --> native
-  ports -- "implemented by" --> rivet
+It builds for `wasm32-unknown-unknown` and natively, so it has no `tokio`, no threads, no clock and no file access of its own.
 
-  conf["Conformance<br/>both chaos suites,<br/>one launcher per provider"]
-  conf -. "must pass" .-> cf
-  conf -. "must pass" .-> native
-  conf -. "must pass" .-> rivet
-```
+**The ports are asynchronous and ask for no `Send`.** Rivet's SQLite is awaited; a Durable Object's is not. The Worker's types cannot move between threads; Rivet's runtime requires that a request can. Generic code is as movable as what it is given, so the drive holds nothing unmovable of its own across a wait, and [a test](../../crates/ludy-server/tests/drive.rs) proves a request is `Send` when the platform is. On Cloudflare a transaction's body is polled once inside the runtime's synchronous transaction, and fails loudly if it ever waited.
 
-The drive logic is written once. A provider is a thin package that supplies storage, a timer and an HTTP front, and promises a short list of things about them.
+**The drive has tests of its own now.** [`tests/drive.rs`](../../crates/ludy-server/tests/drive.rs) runs it on SQLite in memory with a blob store, a timer and a clock that are plain values: ten tests in 50 ms, no server. They can make the ports fail, which no real provider can be asked to do: one fails the database at every statement of a commit in turn and checks that all of the commit or none of it remains.
 
 ### What a provider must promise
 
-This list is read off what [`drive.rs`](../../worker/src/drive.rs) and [`lib.rs`](../../worker/src/lib.rs) rely on today. Each line is something the chaos suites would catch if it were false.
+Each line is something the chaos suites would catch if it were false.
 
 1. **One live instance per drive.** Every request for a drive reaches the same instance, and there is never a second.
 2. **SQLite per drive, with a transaction that is all or nothing.** What a commit wrote is kept if it finishes and gone if it is refused, fails or panics.
-3. **Nothing else for that drive runs in the middle** of a transaction, or between the collector choosing blobs and marking them. Today this holds because the code between those points never waits.
-4. **Acknowledged means durable.** A write that was answered survives `kill -9`. The collector can also ask for its marks to be on disk before it deletes anything.
+3. **No other statement of the drive runs in the middle of a transaction.** The collector chooses and marks blobs inside one, so a commit cannot land between the two.
+4. **Acknowledged means durable.** A write that was answered survives `kill -9`.
 5. **One timer per drive that survives a restart,** to run the collector.
 6. **A blob store** with: put, get with a byte range, "is it there", delete, and list by prefix (tests only).
-7. **Uploads checked against their name.** A body that does not hash to the SHA-256 in its path is refused and nothing is stored. R2 does this itself; elsewhere the provider must.
-8. **Blob bytes do not pass through the drive's instance.** The HTTP front moves them to and from the blob store directly.
+7. **Uploads checked against their name.** A body that does not hash to the SHA-256 in its path is refused and nothing is stored.
+8. **Blob bytes do not pass through the drive's instance.**
 9. **A clock, two settings** (`GC_GRACE_MS`, `LUDY_DEV`) **and a place to write a line of JSON.**
 
-### How each provider would keep them
+### How each provider keeps them
 
-| | Cloudflare (exists) | Native Rust | Rivet |
-|---|---|---|---|
-| One instance per drive | Durable Object, by name | One process; a lock per drive. One machine only | An actor per drive, placed by the Rivet engine |
-| SQLite | The object's SQLite, synchronous calls | A file per drive, `rusqlite` | The actor's SQLite, asynchronous calls |
-| Transaction | `transactionSync` | A `rusqlite` transaction | Documented for TypeScript actors; not found for Rust actors |
-| Nothing in the middle | The code does not wait | The lock | Rivet runs actions concurrently and they interleave at every `await`, so the adapter needs its own lock per drive |
-| Durable before answering | The platform | SQLite in WAL mode with `synchronous=FULL` | The docs say a committed write is replicated before it is acknowledged |
-| Timer | Alarm | A row in the drive's database and a task, armed again at start | `schedule.at`, documented for TypeScript; not found for Rust |
-| Blob store | R2 binding | A folder, or any S3 | Any S3 (MinIO in the Compose file) |
-| Upload check | R2 | The server hashes the body | The server hashes the body |
-| HTTP front | The Worker | `axum` | `axum` in the same binary as the actors |
-| TLS | Cloudflare | A reverse proxy, or `rustls` | A reverse proxy |
-| Scales past one machine | Yes | No | Yes, with three or more engine instances |
-| State | Passes both chaos suites locally | Not started | Not started; see below |
+| | Cloudflare | Rivet |
+|---|---|---|
+| One instance per drive | Durable Object, by name | An actor keyed by the drive's id, placed by the engine |
+| SQLite | The object's, synchronous calls | The actor's, inside the server's process, pages kept by the engine |
+| Transaction | `transactionSync` | `begin`, then commit or roll back |
+| A panic in a commit | An exception through the transaction undoes it | The adapter rolls the transaction back, then lets the panic restart the actor |
+| Nothing in the middle | The code inside does not wait | The runtime hands an actor its HTTP requests one at a time (seen: a request waited for a slow one before it). The collector comes in beside them as a scheduled action; a transaction takes the actor's SQL exclusively and a plain statement waits for it, which is read from Rivet's source and not from a test that produced the overlap |
+| Durable before answering | The platform | The engine has it on disk before a statement is answered. Seen: 80 writes answered before four `kill -9` of the engine were all there afterwards, and every commit of the soaks |
+| Timer | Alarm | `schedule.at`, one event named `collect`; set again when an actor starts, and five seconds after a run that failed, because Rivet does not retry a failed schedule |
+| Blob store | R2 binding | A folder or any S3, through the `object_store` crate |
+| Upload check | R2, given the SHA-256 | The front hashes the body |
+| HTTP front | The Worker | `axum`, in the same process as the actors |
 
-Why three: Cloudflare is the hosted one. Native is the simplest thing someone can run on a single box, and it is the only one where tests can make storage fail. Rivet is for self-hosting on more than one machine without writing placement and replication ourselves.
-
-### Packages
+## Packages
 
 ```text
 app/
-  Cargo.toml                 workspace: crates/*, providers/native, providers/rivet
+  docker-compose.yml         the Rivet provider, ready to run
+  docker-compose.r2.yml      ... with blobs in Cloudflare R2
+  docker-compose.minio.yml   ... with blobs in MinIO
+  Cargo.toml                 workspace: crates/*, providers/rivet
   crates/
-    ludy-proto/              the protocol and the encryption format           exists
-    ludy-core/               the client engine                                exists
-    ludy-server/             the cloud's logic behind ports                   new
-    ludy-conformance/        the chaos rig and both suites, as a library      new, from ludy-core/tests
-    ludy-app/  ludy-cli/     the Mac app and the command line                 exist
-    ludy-cloud/              the simulated cloud                              retire once the app mounts sealed drives
+    ludy-proto/              the protocol and the encryption format
+    ludy-server/             the cloud's logic behind ports
+    ludy-core/               the client engine; its tests hold the chaos suites
+    ludy-app/  ludy-cli/     the Mac app and the command line
+    ludy-cloud/              the simulated cloud; retire once the app mounts sealed drives
   providers/
-    cloudflare/              today's worker/, reduced to an adapter           move
-      wrangler.toml  package.json  src/
-    native/                  ludy-server-native: one binary                   new
-      Dockerfile
-    rivet/                   ludy-server-rivet: actors and gateway            new
-      docker-compose.yml     engine, this binary, MinIO
-  docs/
+    rivet/                   ludy-rivet: front, actors, Dockerfile
+  worker/                    the Cloudflare provider; a workspace of its own, WebAssembly only
 ```
 
-Constraints on `ludy-server` that follow from this:
+`providers/rivet` is in the workspace and left out of its default members: it is a three-and-a-half-minute build that most work on the client does not need. `worker` only builds for WebAssembly, so it stays a workspace of its own.
 
-- **It builds for `wasm32-unknown-unknown` and for native.** So no `tokio`, no threads, no `std::time`, no file access in it. `ludy-proto` already lives under the same rule.
-- **Generic over the ports, not `dyn`.** `axum` needs handlers whose futures can move between threads, and the Worker's types cannot. Generic code is as movable as what it is given; the shared code itself must hold nothing unmovable across a wait. Today's drive object keeps its pins in an `Rc<RefCell<..>>`, which has to change.
-- **`providers/cloudflare` stays out of the cargo workspace,** as `worker/` is now, because it only builds for WebAssembly.
-- **SQL is the shared language.** All three have SQLite, so the tables and statements move as they are. The port is "run this statement with these values and give me rows", plus "run this closure as a transaction".
+## Conformance
 
-### Conformance
-
-The two suites that exist are the definition of a correct provider:
+The two suites are the definition of a correct provider:
 
 - [`worker_chaos.rs`](../../crates/ludy-core/tests/worker_chaos.rs): a model predicts every commit while the server is killed, frozen and restarted and a proxy loses messages.
 - [`sealed_engine.rs`](../../crates/ludy-core/tests/sealed_engine.rs): the real engine against the server under the same faults.
 
-Both go through [`worker_rig`](../../crates/ludy-core/tests/worker_rig/mod.rs), whose `Worker` type starts `wrangler dev`, signals its process group and restarts it on the same state folder. That type becomes a launcher with one implementation per provider (start, freeze, thaw, `kill -9`, restart, read the log), chosen by an environment variable. The proxy, the client, the model and the reader stay as they are. The `_dev` routes are part of what a provider must serve when `LUDY_DEV=1`.
+Both go through [`worker_rig`](../../crates/ludy-core/tests/worker_rig/mod.rs), whose `Worker` type is the launcher: start, freeze, thaw, `kill -9`, restart, read the log. `LUDY_PROVIDER` chooses what it launches. For `cloudflare` (the default) that is `wrangler dev`. For `rivet` it is `target/release/ludy-rivet` and an engine container of the rig's own; `kill -9` takes both, as a machine losing power would, and a freeze stops the server while the engine runs on. The proxy, the client, the model and the reader are the same for both.
 
-## The Rivet provider: from the docs, not tried
+## Not built
 
-Read on 2026-11-22 at rivet.dev; nothing was run.
-
-- **Self-hosting is small.** The documented Compose file is one service, `rivetdev/engine`, on port 6420 with file-system storage. No Postgres, no message bus. Production is three or more engine instances and a bucket. Our binary runs beside it and connects out to it.
-- **Each actor has its own SQLite, and schedules that survive restarts.** That is the same shape as a Durable Object.
-- **Actors can be written in Rust** with the `rivetkit` crate on `tokio`. The Rust quickstart shows `ctx.sql().exec(..).await` and `ctx.sql().execute(..).await`. It does not show a transaction, a schedule or a raw HTTP handler for Rust. All three are documented for TypeScript actors. No stability label was found for the Rust SDK.
-- **Actions interleave.** "Actions run concurrently and interleave at every `await`." SQL calls are awaits, so promise 3 does not come free as it does on Cloudflare.
-- **Messages to an actor are capped at 16 MiB**, 64 KiB unless raised. A sealed shard can be 16 MiB plus 4 KiB, which is one more reason shards go from the gateway to S3 and never to the actor. A commit of 100,000 shard names is about 6.7 MB and a feed page can be about 3 MB, so both soft limits must be raised.
-
-What a spike has to answer before this provider is designed in detail:
-
-1. Is there a transaction for a Rust actor's SQLite, and does it roll back when the body fails or panics?
-2. Can a Rust actor schedule itself?
-3. Our drive logic calls SQL synchronously inside a transaction. On Rivet's asynchronous SQL, do we block on each call from a `tokio` blocking section, or make the shared logic asynchronous and have Cloudflare and native run it without ever waiting? The second touches every provider.
-4. If the Rust SDK cannot do 1 or 2: a TypeScript actor that only holds storage and the timer, with the logic in a Rust process beside it? That is a different design and may not be worth it.
-5. Does a write survive `kill -9` of the engine container? The conformance suite answers this once a launcher exists.
-
-## Order of work
-
-1. **Extract `ludy-server`** from `worker/src/drive.rs` and the neutral half of `lib.rs`, behind the ports. Give it tests on in-memory SQLite, so the commit rules run in milliseconds without `wrangler`.
-2. **Move `worker/` to `providers/cloudflare/`** as an adapter. Both chaos suites must pass unchanged; they are the test of the move.
-3. **Turn the rig's `Worker` into a launcher** per provider.
-4. **`providers/native`.** Run both suites against it. Add what only this provider allows: a blob store and a database that fail on request, which closes "storage failing" in [known-issues.md](known-issues.md).
-5. **Rivet spike**, then `providers/rivet` and its Compose file.
-
-Sign-in and sharing add at least one more port, because accounts, devices and grants do not belong to one drive: a directory that is not a per-drive object. Pushing changes to clients adds another. Neither is designed. Doing step 1 before sign-in means sign-in is written once, in `ludy-server`, and not ported afterwards.
+- **One plain binary, with no engine.** The plan had a third provider: `axum`, a SQLite file per drive, nothing else to run. The ports make it small, and the tests already hold a `rusqlite` platform. It was left out because the Rivet provider with a folder for blobs covers one machine, at the price of a second container.
+- **Rivet on more than one machine.** Three engine instances and a bucket is the engine's documented production shape. Nothing here has run it.
+- **Sign-in and sharing.** Accounts, devices and grants do not belong to one drive, so they need one more port: a directory that is not a per-drive object. Written once in `ludy-server`, it serves both providers.
+- **Pushing changes to clients.** They poll the feed.
 
 ## Open questions
 
-- Is `ludy-server` the right name, given `ludy-cloud` is the simulated one being retired?
-- Native: one machine only, or should it be able to run several behind a lease? This document assumes one.
-- Self-hosted blob store: a folder, S3, or both?
-- Rivet: Rust actors as documented so far, or wait until the Rust SDK documents transactions and schedules?
-- Before or after sign-in?
+- Should `worker/` move to `providers/cloudflare/`, beside the other provider?
+- Is the plain binary worth having, for someone who wants no Rivet engine?
+- Which S3 besides R2 and MinIO should be tried before saying "any S3"?

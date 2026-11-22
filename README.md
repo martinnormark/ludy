@@ -7,7 +7,7 @@ The "cloud" here is simulated: a local S3-like server with configurable latency 
 ## Status
 
 - **The simulated cloud, the engine and the app** are built, covered by automated tests, and checked against real mounts (2026-11-19).
-- **A real, end-to-end encrypted cloud** is being built beside the simulated one. It passes its tests on a local emulator; the app does not use it yet and nothing has been deployed (2026-11-22).
+- **A real, end-to-end encrypted cloud** is being built beside the simulated one. Its server can be self-hosted (`docker compose up`, on Rivet actors, with blobs in a folder, Cloudflare R2 or any S3) or run as a Cloudflare Worker; both pass the same chaos tests locally. The app does not use it yet and nothing has been deployed (2026-11-22).
 - **Not checked:** many of the app's controls, and the Quick Look panel itself.
 
 More in [docs/status.md](docs/status.md).
