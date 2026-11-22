@@ -12,7 +12,9 @@ From the top of the repository, with Docker running and nothing to set:
 docker compose up -d --wait
 ```
 
-Two services start: the Rivet engine and this server. `--wait` returns when both are healthy, which for the server means a drive answers. It was run with Docker Engine 29.6 and Compose 5.3 and no older Docker was tried. The image is built with BuildKit. Shards and manifests go to a Docker volume. The first `up` builds the server's image, four and a half minutes here; after that a start from nothing took 12 seconds.
+Two services start: the Rivet engine and this server. `--wait` returns when both are healthy, which for the server means a drive answers. It was run with Docker Engine 29.6 and Compose 5.3 and no older Docker was tried. Shards and manifests go to a Docker volume.
+
+The first `up` pulls the server's image, `ghcr.io/martinnormark/ludy-rivet` (140 MB, for amd64 and arm64): with the engine's image already there, a start from nothing took 14 seconds. Where the image cannot be pulled, Compose builds it from the checkout, which took four and a half minutes here and needs BuildKit.
 
 Create a drive and read its head back. A real client sends a sealed name and wrapped keys; these are placeholder bytes:
 
@@ -31,6 +33,24 @@ Stop it, keeping the drives:
 ```bash
 docker compose down
 ```
+
+### The server's image
+
+[A workflow](../../.github/workflows/server-image.yml) builds the image from this repository and publishes it when the server's source changes on `main` (and, until it is merged, on the branch the server lives on). Its tag is the Rivet release it is built against, `rivet-3.1.1`, the same as the engine's.
+
+To run the source in the checkout instead of the published image:
+
+```bash
+docker compose up -d --wait --build
+```
+
+That build takes the published image's name on this machine, and Compose keeps using it. To go back to the published one, or to get a newer one:
+
+```bash
+docker compose pull ludy
+```
+
+If Compose builds when you expected it to pull, look for `denied` in its output. A saved login for `ghcr.io` that the registry no longer accepts does that, even though the image is public; `docker logout ghcr.io` clears it.
 
 To keep the blobs in Cloudflare R2, fill in the four `R2_` settings from [`.env.example`](../../.env.example) and add the R2 file:
 

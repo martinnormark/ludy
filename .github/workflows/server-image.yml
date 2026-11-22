@@ -28,6 +28,8 @@ on:
       - crates/**
       - providers/rivet/**
       - .github/workflows/server-image.yml
+      # .dockerignore keeps these out of the build.
+      - '!**/*.md'
 
 permissions:
   contents: read

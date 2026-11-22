@@ -147,6 +147,8 @@ app/
   providers/
     rivet/                   ludy-rivet: front, actors, Dockerfile
     cloudflare/              the Worker; a workspace of its own, WebAssembly only
+  .github/workflows/
+    server-image.yml         builds ludy-rivet's image and publishes it to ghcr.io
 ```
 
 `providers/rivet` is in the workspace and left out of its default members: it is a three-and-a-half-minute build that most work on the client does not need. `providers/cloudflare` only builds for WebAssembly, so it stays a workspace of its own.

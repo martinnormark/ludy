@@ -49,7 +49,7 @@ The app does not use this cloud yet; this starts its server. From the repository
 docker compose up -d --wait
 ```
 
-When that returns it answers on `http://127.0.0.1:8080`. The first start builds the server's image, which takes several minutes. The settings, and how to keep the blobs in Cloudflare R2 or MinIO, are in [the Rivet provider's README](../providers/rivet/README.md); the Cloudflare Worker is set up as [its README](../providers/cloudflare/README.md) says.
+When that returns it answers on `http://127.0.0.1:8080`. The first start pulls the server's image, and builds it instead, over several minutes, if it cannot. The settings, and how to keep the blobs in Cloudflare R2 or MinIO, are in [the Rivet provider's README](../providers/rivet/README.md); the Cloudflare Worker is set up as [its README](../providers/cloudflare/README.md) says.
 
 ## Environment variables
 
