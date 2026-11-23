@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use std::time::Instant;
 
-use gpui::{point, px, ClipboardItem, Context, FocusHandle, KeyDownEvent, PathPromptOptions, Pixels, Point, ScrollStrategy, UniformListScrollHandle, Window};
+use gpui::{point, px, ClickEvent, ClipboardItem, Context, FocusHandle, KeyDownEvent, PathPromptOptions, Pixels, Point, ScrollStrategy, UniformListScrollHandle, Window};
 use ludy_core::engine::{DriveView, Engine, View};
 use ludy_core::fs::ROOT_ID;
 use ludy_core::sealed_drive::{FileVersion, SealedDrive};
@@ -20,7 +20,7 @@ use ludy_core::transfer;
 pub struct UiOptions {
     pub open: Option<String>,
     pub list: bool,
-    /// "menu", "entry-menu", "key" or "new-drive".
+    /// "menu", "entry-menu", "key", "new-drive" or "info".
     pub demo: Option<String>,
     /// Scroll the open folder by itself for a few seconds, print frame times, quit.
     pub perf: bool,
@@ -102,6 +102,14 @@ pub struct LudyApp {
     /// Drive sequence number the browser listing was loaded at.
     loaded_seq: u64,
     grid: bool,
+    /// The key of the file the details pane shows. The entry itself is
+    /// looked up in `entries`, so the pane follows the file as it changes.
+    selected: Option<String>,
+    selected_at: Instant,
+    navigated_at: Instant,
+    /// A file to keep in view at the next draw: the details pane opening
+    /// or closing changes how many tiles fit in a row.
+    reveal: Option<String>,
     menu: Option<Menu>,
     modal: Option<Modal>,
     focus: FocusHandle,
@@ -114,6 +122,9 @@ pub struct LudyApp {
 fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
+
+/// Two clicks this close together are one double-click.
+const DOUBLE_CLICK: Duration = Duration::from_millis(600);
 
 /// The folder a browser prefix (`""`, `raw/`, `raw/day 1/`) names.
 fn folder_id(fs: &SealedDrive, prefix: &str) -> anyhow::Result<u64> {
@@ -180,6 +191,10 @@ impl LudyApp {
             loading: false,
             loaded_seq: 0,
             grid: !opts.list,
+            selected: None,
+            selected_at: Instant::now(),
+            navigated_at: Instant::now(),
+            reveal: None,
             menu: None,
             modal: None,
             focus,
@@ -225,6 +240,13 @@ impl LudyApp {
                 Some(e) => self.menu = Some(Menu { at, target: Target::Entry(e.clone()) }),
                 None => return,
             },
+            Some("info") => match self.entries.iter().find(|e| !e.is_dir) {
+                Some(e) => {
+                    self.reveal = Some(e.key.clone());
+                    self.selected = Some(e.key.clone());
+                }
+                None => return,
+            },
             _ => return,
         }
         self.demo = None;
@@ -241,7 +263,72 @@ impl LudyApp {
         Some(if key.is_empty() { mount.mountpoint.clone() } else { mount.mountpoint.join(key.trim_end_matches('/')) })
     }
 
+    /// The file the details pane shows, as the current listing has it.
+    fn selected_entry(&self) -> Option<&Entry> {
+        let key = self.selected.as_ref()?;
+        self.entries.iter().find(|e| &e.key == key)
+    }
+
+    /// Leave the folder on screen: nothing in it stays selected.
+    fn leave_folder(&mut self) {
+        self.selected = None;
+        self.navigated_at = Instant::now();
+    }
+
+    fn show_drives(&mut self) {
+        self.leave_folder();
+        self.screen = Screen::Drives;
+    }
+
+    /// A click on a row or a tile: a folder opens, a file is selected and
+    /// shown in the details pane, and a second click opens the file.
+    fn click_entry(&mut self, e: &Entry, ev: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if ev.click_count() >= 2 {
+            self.second_click(Some(e), window, cx);
+        } else if e.is_dir {
+            self.menu_action("Open", Target::Entry(e.clone()), window, cx);
+        } else {
+            if self.selected.is_none() {
+                self.reveal = Some(e.key.clone());
+            }
+            self.selected = Some(e.key.clone());
+            self.selected_at = Instant::now();
+            cx.notify();
+        }
+    }
+
+    /// Close the details pane. Says whether it was open.
+    fn close_details(&mut self) -> bool {
+        self.reveal = self.selected.take();
+        self.reveal.is_some()
+    }
+
+    /// Whether a click is the second of the double-click that selected a
+    /// file. The pane may have opened under the pointer by then, and
+    /// whatever the click lands on, it means "open that file".
+    fn is_second_click(&self, ev: &ClickEvent) -> bool {
+        ev.click_count() >= 2 && self.selected.is_some() && self.selected_at.elapsed() < DOUBLE_CLICK
+    }
+
+    /// The second click of a double-click, on `under` or on nothing. The
+    /// first click may have moved everything: selecting a file opens the
+    /// details pane, which narrows the grid, and opening a folder replaces
+    /// what is listed. So this opens what the first click chose, and after
+    /// a folder was opened it opens nothing.
+    fn second_click(&mut self, under: Option<&Entry>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.navigated_at.elapsed() < DOUBLE_CLICK {
+            return;
+        }
+        let chosen = self.selected_entry().filter(|_| self.selected_at.elapsed() < DOUBLE_CLICK).or(under).cloned();
+        if let Some(e) = chosen {
+            // Once: a click can reach more than one handler.
+            self.selected_at = Instant::now() - DOUBLE_CLICK;
+            self.menu_action("Open", Target::Entry(e), window, cx);
+        }
+    }
+
     fn open_drive(&mut self, drive: &str, cx: &mut Context<Self>) {
+        self.leave_folder();
         self.screen = Screen::Browser { drive: drive.to_string(), prefix: String::new() };
         self.entries.clear();
         self.scroll.scroll_to_item(0, ScrollStrategy::Top);
@@ -249,6 +336,7 @@ impl LudyApp {
     }
 
     fn navigate(&mut self, prefix: String, cx: &mut Context<Self>) {
+        self.leave_folder();
         if let Screen::Browser { prefix: p, .. } = &mut self.screen {
             // The old rows stay until the new listing lands, so a folder
             // change does not flash an empty pane.
@@ -268,7 +356,7 @@ impl LudyApp {
         let (d, p) = (drive.clone(), prefix.clone());
         let task = self.engine.spawn(async move {
             let fs = engine.open(&d).await?;
-            let rows = fs.readdir(folder_id(&fs, &p)?).map_err(fs_error)?;
+            let rows = fs.contents(folder_id(&fs, &p)?).map_err(fs_error)?;
             anyhow::Ok((rows, fs.seq().wrapping_add(fs.sync_token())))
         });
         cx.spawn(async move |this, cx| {
@@ -293,6 +381,10 @@ impl LudyApp {
                         entries.extend(rows.iter().filter(|r| !r.1.is_dir).map(entry));
                         this.entries = entries;
                         this.loaded_seq = seq;
+                        // Renamed, deleted or in another folder: nothing to show.
+                        if this.selected_entry().is_none() {
+                            this.selected = None;
+                        }
                     }
                     Ok(Err(e)) => {
                         this.entries.clear();
@@ -485,7 +577,7 @@ impl LudyApp {
                     self.engine.set_notice(format!("Eject {drive} before renaming it."));
                 } else {
                     if showing(&drive) {
-                        self.screen = Screen::Drives;
+                        self.show_drives();
                     }
                     let name = name.trim().to_string();
                     self.run("Rename drive", cx, async move { engine.rename_drive(&drive, &name).await });
@@ -496,7 +588,7 @@ impl LudyApp {
                     self.engine.set_notice(format!("Eject {drive} before removing it."));
                 } else {
                     if showing(&drive) {
-                        self.screen = Screen::Drives;
+                        self.show_drives();
                     }
                     self.run("Remove drive", cx, async move { engine.forget_drive(&drive).await });
                 }
@@ -547,7 +639,7 @@ impl LudyApp {
     fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         if ks.key == "escape" {
-            if self.menu.take().is_some() || self.modal.take().is_some() {
+            if self.menu.take().is_some() || self.modal.take().is_some() || self.close_details() {
                 cx.notify();
             }
             return;

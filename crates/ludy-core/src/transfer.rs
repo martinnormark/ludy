@@ -118,7 +118,7 @@ pub async fn copy_tree_out(fs: &Arc<SealedDrive>, id: u64, dest: &Path) -> Resul
             continue;
         }
         std::fs::create_dir_all(&dest).with_context(|| format!("cannot make {}", dest.display()))?;
-        for (name, attr) in fs.readdir(id).map_err(|e| fs_err("list", e))? {
+        for (name, attr) in fs.contents(id).map_err(|e| fs_err("list", e))? {
             todo.push((attr.id, dest.join(name)));
         }
     }

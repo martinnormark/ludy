@@ -1066,9 +1066,23 @@ impl SealedDrive {
     }
 
     pub fn readdir(&self, dir: u64) -> FsResult<Vec<(String, Attr)>> {
+        self.list(dir, true)
+    }
+
+    /// What the drive holds in a folder: `readdir` without what never
+    /// leaves this Mac (`.DS_Store`, `._*` and the like). The mount shows
+    /// those to the Finder, which made them; nothing else should.
+    pub fn contents(&self, dir: u64) -> FsResult<Vec<(String, Attr)>> {
+        self.list(dir, false)
+    }
+
+    fn list(&self, dir: u64, local_only_too: bool) -> FsResult<Vec<(String, Attr)>> {
         let t = self.tree.lock().unwrap();
         let mut out = Vec::new();
         for (name, id) in t.dir(dir)? {
+            if !local_only_too && t.cloud(*id).is_none() {
+                continue;
+            }
             if let Ok(attr) = self.attr_of(&t, *id) {
                 out.push((name.clone(), attr));
             }
@@ -1111,8 +1125,8 @@ impl SealedDrive {
     pub fn totals(&self) -> (u64, u64) {
         let t = self.tree.lock().unwrap();
         t.nodes.values().fold((0, 0), |(files, bytes), n| match &n.kind {
-            Kind::File(f) => (files + 1, bytes + f.size),
-            Kind::Dir(_) => (files, bytes),
+            Kind::File(f) if n.cloud.is_some() => (files + 1, bytes + f.size),
+            _ => (files, bytes),
         })
     }
 

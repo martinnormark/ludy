@@ -445,6 +445,13 @@ async fn finder_droppings_stay_here_and_names_compare_normalised() {
     // They are still here, on this Mac.
     assert_eq!(a.read_all(a.id(".DS_Store")).await, b"finder's");
     assert_eq!(a.read_all(a.id(".Trashes/thrown away")).await, b"x");
+    // The mount lists them, for the Finder; what the app and `ludy ls` list
+    // is the drive, and the drive's totals count the drive.
+    let names = |rows: Vec<(String, ludy_core::fs::Attr)>| rows.into_iter().map(|r| r.0).collect::<Vec<_>>();
+    assert_eq!(names(a.fs.readdir(ROOT_ID).unwrap()), vec![".DS_Store", ".Trashes", "._clip.mov", nfc, "real.txt"]);
+    assert_eq!(names(a.fs.contents(ROOT_ID).unwrap()), vec![nfc, "real.txt"]);
+    assert_eq!(names(a.fs.contents(a.id(".Trashes")).unwrap()), Vec::<String>::new());
+    assert_eq!(a.fs.totals(), (2, 4 + 12));
     // And a real file renamed to such a name leaves the cloud.
     a.fs.rename(ROOT_ID, "real.txt", ROOT_ID, "._real.txt").unwrap();
     a.flush().await;

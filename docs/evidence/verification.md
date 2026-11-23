@@ -4,7 +4,7 @@ Four kinds of check, in four sections: automated tests, real mounts on macOS, th
 
 ## By automated tests
 
-`cargo test`, which needs no server: 80 tests pass, in the protocol, the engine, the server's logic and the app.
+`cargo test`, which needs no server: 83 tests pass, in the protocol, the engine, the server's logic and the app.
 
 - **The format.** The Rust code reproduces test vectors written by a second implementation in JavaScript ([`crypt-v1.mjs`](../../crates/ludy-proto/tests/vectors/crypt-v1.mjs)). Unit tests cover damage: a flipped byte, swapped frames, a missing tail, a frame of another shard, a key, name or manifest moved to another node.
 - **The server's logic**, on SQLite in memory: the rules of a commit, the feed, the collector, and a commit that fails at every statement in turn leaving all of it or none.
@@ -50,10 +50,16 @@ Taken of the app's own window against the Compose server with the demo drives:
 - A drive's folder as a grid and as a list, opened without mounting: names, sizes and dates read from the encrypted tree.
 - The drive menu (Open, Show in Finder, Open in Terminal, Copy path, Rename, Copy drive key, Mount, Remove drive) and the file menu (Open, Show in Finder, Open in Terminal, Copy path, Rename, Versions, Delete), opened with `--demo`.
 - The drive-key dialog.
+- Names in a folder of long and awkward ones (no spaces, many dots, accents, a run of forty W's) and in a folder of 1,500 names of 30 to 70 characters: two lines in the grid and one in the list, the middle left out and the extension readable, at the default window size and at 820 by 560.
+- The details pane, opened by a click posted with `--click` on a tile and on a list row: the name in full, kind, size, date, place, and the tile or row shown as selected.
+- A double-click posted with `--dclick` on a file in the last column of the grid, at a point where the pane is blank once open and at a point where its Show in Finder button is: the pane opened, the tiles moved, and both times the file the first click selected was the one opened (the drive was not mounted, so what showed was the notice asking to mount it to open files, not the one about the Finder).
+- That opening the pane moves nothing beside it: screenshots of a folder before and after a file was selected, at window widths of 820, 908, 1000, 1180 and 1400 points, compared pixel by pixel over the header and the first row left of the pane. No pixel differed at 1000, 1180 and 1400 with a file of the second row selected. With a file of the first row selected and the selection's background colour ignored, none differed at those three, and at 820 and 908 the only ones were where the uncovered shot shows the start of the next tile's name and the other shows the margin before the pane.
+- The list with the pane open in a window 908 points wide: two columns left, Name and Size, and names still readable.
+- A file selected in the second row of a window 480 points high: after the grid went from six tiles in a row to four, the selected tile was on screen.
 
 Scrolling a folder of 5,000 files was measured with `--perf`; the numbers are in [the app](../how-it-works/app.md#scrolling-a-large-folder).
 
-No control was clicked in the window. What each does goes through engine calls that the tests cover, and the list of what was not exercised is in [known problems](../known-issues.md#the-app).
+Apart from those posted clicks, no control was clicked in the window. What each does goes through engine calls that the tests cover, and the list of what was not exercised is in [known problems](../known-issues.md#the-app).
 
 ## The ways of hosting
 
@@ -66,4 +72,3 @@ These were seen on the engine Ludy started on, against the simulated server, and
 - A Finder-visible mount: the sidebar entry, the eject button, a Finder window open during an eject.
 - Video playback from a mount (first frame after 0.30 s with AVPlayer) and a Quick Look thumbnail.
 - That an untouched mount causes no reads.
-- Clicks in the app's window posted with `--click`.

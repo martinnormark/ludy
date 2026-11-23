@@ -127,7 +127,7 @@ fn run() -> Result<()> {
             let fs = engine.block_on(engine.open(drive))?;
             let folder = folder.first().copied().unwrap_or("");
             let dir = if folder.trim_matches('/').is_empty() { ROOT_ID } else { fs.find_path(folder.trim_matches('/')).ok_or_else(|| anyhow!("no folder {folder}"))? };
-            for (name, a) in fs.readdir(dir).map_err(|e| anyhow!("list: {e:?}"))? {
+            for (name, a) in fs.contents(dir).map_err(|e| anyhow!("list: {e:?}"))? {
                 println!("{:>12}  {name}{}", if a.is_dir { "-".to_string() } else { human(a.size) }, if a.is_dir { "/" } else { "" });
             }
         }

@@ -64,7 +64,7 @@ A drive can be open in one process at a time on a Mac. While the app has a drive
 | `cargo run -p ludy-app -- --mount Footage` | Mount a drive at launch |
 | `cargo run -p ludy-app -- --open Footage/raw` | Start in the file browser (`--list` for the list view) |
 | `scripts/seed-stress.sh` then `cargo run -p ludy-app -- --open Stress/clips --perf` | Make a drive with a folder of 5,000 small files, scroll it by itself for a few seconds, print frame times, quit |
-| `cargo run -p ludy-app -- --click 327,345` | Post a click to the app's own window at that point (also `--rclick`, `--dclick`, repeatable; `--demo menu\|entry-menu\|key\|new-drive` opens that surface; `--size 820x560` sets the window size) |
+| `cargo run -p ludy-app -- --click 327,345` | Post a click to the app's own window at that point (also `--rclick`, `--dclick`, repeatable; `--demo menu\|entry-menu\|key\|new-drive\|info` opens that surface; `--size 820x560` sets the window size) |
 | `cargo run --release -p ludy-cli -- bench` | Time fixed engine scenarios against the server and print a table (`--quick` for small sizes) |
 | `cargo test` | The tests that need no server |
 | `cargo test -p ludy-core --test sealed_engine -- --ignored --test-threads=1` | The engine against a server the test starts; see [chaos testing](evidence/chaos-testing.md#running-them) for what it needs |

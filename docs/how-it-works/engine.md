@@ -64,7 +64,7 @@ A write goes to a sparse journal file and returns. An existing file is not downl
 
 Eight files upload at a time. Creating, renaming, moving and deleting are ops on nodes; they are queued and sent in order, up to 200 to a commit. Every commit carries an id, so sending it again after a lost reply changes nothing.
 
-What has not been sent survives a quit, a crash or a power cut: next to each journal file the engine saves which byte ranges it holds and which version they were written over, and it saves the queue of ops, so the next open picks everything up and sends it. `.DS_Store` and `._*` files stay on the Mac.
+What has not been sent survives a quit, a crash or a power cut: next to each journal file the engine saves which byte ranges it holds and which version they were written over, and it saves the queue of ops, so the next open picks everything up and sends it. `.DS_Store` and `._*` files stay on the Mac: the mount lists them, because the Finder made them and expects them back, but they are never sent, and the app's browser, `ludy ls`, `ludy get` and a drive's file count leave them out.
 
 ## Changes made elsewhere
 

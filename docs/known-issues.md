@@ -6,7 +6,7 @@ State of the tests on 2026-11-23, one run of each with the blobs in a folder, af
 
 | Suite | Cloudflare | Rivet |
 |---|---|---|
-| `cargo test` (no server): 80 tests | pass | |
+| `cargo test` (no server): 83 tests | pass | |
 | The server under chaos: 12 scenarios and a soak | 13 pass, 168 s; soak seed 19199, 9 kills | 13 pass, 259 s; soak seed 97809, 9 kills |
 | The engine under chaos: 17 scenarios and a soak | 18 pass, 222 s; soak seed 50895, 11 kills of the server, 7 of the app | 18 pass, 258 s; soak seed 76092, 6 kills of the server, 7 of the app |
 | Chaos on a real mount (`scripts/chaos-mount.sh`) | not run | pass, once, under Compose |
@@ -126,7 +126,7 @@ A fix is small: cap `/missing` at the commit's limit, and make that limit a sett
 
 ### The app
 
-- **Most of its controls.** Seen in screenshots on 2026-11-23: the drives screen with a drive mounted and not, a folder as grid and as list, the drive menu, the file menu, the drive-key dialog. `--mount` at launch mounted a drive and quitting ejected it. Not exercised in the window: creating, adding, renaming and removing a drive, New folder, Import, Rename, Delete, Versions and Restore, Copy drive key, Show in Finder, Open in Terminal, Clear. The engine calls behind them are covered by tests; the clicks are not.
+- **Most of its controls.** Seen in screenshots on 2026-11-23: the drives screen with a drive mounted and not, a folder as grid and as list, the drive menu, the file menu, the drive-key dialog, names cut in the grid and the list, and the details pane opened by a posted click and by a posted double-click. `--mount` at launch mounted a drive and quitting ejected it. Not exercised in the window: creating, adding, renaming and removing a drive, New folder, Import, Rename, Delete, Versions and Restore, Copy drive key, Show in Finder, Open in Terminal, Clear. The engine calls behind them are covered by tests; the clicks are not.
 
 ### The encryption format
 
@@ -143,7 +143,7 @@ A fix is small: cap `/missing` at the commit's limit, and make that limit a sett
 - **Push.** Clients poll the feed; a WebSocket that wakes them is not built.
 - **Pruning.** Abandoned uploads and tombstones are never removed; see [above](#wrong-on-every-provider).
 - **A server with no engine to run beside it, and Rivet on more than one machine.** See [the server](how-it-works/server.md#not-built).
-- **In the app:** thumbnails, drag and drop, search, a menu-bar launcher, a dark theme, showing more than the latest notice.
+- **In the app:** a details pane for a folder, selecting more than one file, moving the selection with the keyboard, thumbnails, drag and drop, search, a menu-bar launcher, a dark theme, showing more than the latest notice.
 - **An app bundle.** The app runs from `cargo run` and is unsigned.
 - **Other clients.** Only the Mac engine exists.
 
