@@ -79,9 +79,10 @@ impl LudyApp {
             }
             drives.push(row.on_click(cx.listener(move |this, _, _, cx| this.open_drive(&name, cx))));
         }
-        let link = self.view.server.as_ref().map(|s| {
-            let bw = if s.mbps == 0 { "unlimited".to_string() } else { format!("{} Mbit/s", s.mbps) };
-            format!("{bw} \u{b7} {} ms (simulated)", s.latency_ms)
+        let address = self.view.server_url.trim_start_matches("https://").trim_start_matches("http://").to_string();
+        let link = Some(match &self.view.server_name {
+            Some(name) => format!("{name} \u{b7} {address}"),
+            None => address,
         });
         div()
             .w(px(SIDEBAR_W))
@@ -120,10 +121,19 @@ impl LudyApp {
                     .items_center()
                     .justify_between()
                     .child(div().text_size(px(11.)).font_weight(FontWeight::MEDIUM).text_color(rgb(T.faint)).child("Drives"))
-                    .child(icon_button("new-drive", "plus").size(px(24.)).on_click(cx.listener(|this, _, _, cx| {
-                        this.modal = Some(Modal::NewDrive { name: String::new() });
-                        cx.notify();
-                    }))),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .child(icon_button("add-drive", "down").size(px(24.)).on_click(cx.listener(|this, _, _, cx| {
+                                this.modal = Some(Modal::AddDrive { key: String::new() });
+                                cx.notify();
+                            })))
+                            .child(icon_button("new-drive", "plus").size(px(24.)).on_click(cx.listener(|this, _, _, cx| {
+                                this.modal = Some(Modal::NewDrive { name: String::new() });
+                                cx.notify();
+                            }))),
+                    ),
             )
             .child(div().id("nav-list").flex_1().min_h(px(0.)).overflow_y_scroll().flex().flex_col().gap(px(1.)).children(drives))
             .child(
@@ -141,7 +151,7 @@ impl LudyApp {
                             .gap(px(7.))
                             .text_color(rgb(T.muted))
                             .child(div().size(px(7.)).rounded_full().bg(rgb(if self.view.online { T.good } else { T.bad })))
-                            .child(if self.view.online { "Cloud connected" } else { "Cloud unreachable" }),
+                            .child(if self.view.online { "Server connected" } else { "Server unreachable" }),
                     )
                     .when_some(link, |d, link| d.child(div().truncate().text_color(rgb(T.faint)).child(link))),
             )
@@ -229,7 +239,7 @@ impl LudyApp {
         let drive_name = drive.clone();
         let share_name = drive.clone();
         let share = cx.listener(move |this: &mut Self, _: &ClickEvent, _, cx| {
-            this.modal = Some(Modal::Share { drive: share_name.clone(), email: String::new(), edit: false });
+            this.modal = Some(Modal::DriveKey { drive: share_name.clone() });
             cx.notify();
         });
         bar.child(div().flex().items_center().gap(px(6.)).min_w(px(0.)).child(icon_button("back", "chevron-left").on_click(go(parent, cx))).child(trail)).child(
@@ -268,7 +278,7 @@ impl LudyApp {
                 } else {
                     button("browser-mount", "Mount").on_click(cx.listener(move |this, _, _, _| this.engine.mount(&drive_name))).into_any_element()
                 })
-                .child(div().ml(px(4.)).child(primary_button("browser-share", "Share").on_click(share))),
+                .child(div().ml(px(4.)).child(primary_button("browser-share", "Drive key").on_click(share))),
         )
     }
 
@@ -277,8 +287,8 @@ impl LudyApp {
     /// The live numbers, always on screen: streamed, uploads, cache.
     fn status_bar(&self, left: String, cx: &mut Context<Self>) -> impl IntoElement {
         let v = &self.view;
-        let pending: usize = v.drives.iter().filter_map(|d| d.mount.as_ref()).map(|m| m.pending.files + m.pending.ops).sum();
-        let uploading = v.drives.iter().filter_map(|d| d.mount.as_ref()).find_map(|m| m.pending.uploading.clone());
+        let pending: usize = v.drives.iter().filter_map(|d| d.pending.as_ref()).map(|p| p.files + p.ops).sum();
+        let uploading = v.drives.iter().filter_map(|d| d.pending.as_ref()).find_map(|p| p.uploading.clone());
         let down = match (v.stats.down_rate >= 1.0, v.stats.range_requests) {
             (true, n) => format!("{} \u{b7} {} in {}", fmt_rate(v.stats.down_rate), fmt_bytes(v.stats.bytes_down), plural(n as usize, "range")),
             (false, 0) => "Nothing streamed yet".into(),
@@ -362,16 +372,12 @@ impl LudyApp {
             (None, Some(m)) => home_relative(&m.mountpoint),
             (None, None) => "Not mounted".into(),
         };
-        let detail = format!(
-            "{} \u{b7} {}{}",
-            fmt_bytes(d.info.bytes),
-            plural(d.info.objects as usize, "item"),
-            match (&d.info.forked_from, d.info.shares.len()) {
-                (Some(f), _) => format!(" \u{b7} fork of {f}"),
-                (None, 0) => String::new(),
-                (None, n) => format!(" \u{b7} shared with {n}"),
-            }
-        );
+        // A drive's size is in its tree, which only this Mac can read, and
+        // only once the drive has been opened.
+        let detail = match d.info.totals {
+            Some((files, bytes)) => format!("{} \u{b7} {}", fmt_bytes(bytes), plural(files as usize, "file")),
+            None => "End-to-end encrypted".to_string(),
+        };
         let act = Self::drive_action;
         let (menu_name, more_name) = (name.clone(), name.clone());
         div()
@@ -471,13 +477,12 @@ impl LudyApp {
 
     fn drives_screen(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let v = &self.view;
-        let total: u64 = v.drives.iter().map(|d| d.info.bytes).sum();
-        let subtitle = format!("{} in the cloud across {}. {} of it is on this Mac.", fmt_bytes(total), plural(v.drives.len(), "drive"), fmt_bytes(v.cache.bytes));
+        let subtitle = format!("{} on {}. {} cached on this Mac.", plural(v.drives.len(), "drive"), v.server_url, fmt_bytes(v.cache.bytes));
         div().size_full().flex().flex_col().child(Self::page_header("Drives".into(), subtitle)).child(if v.drives.is_empty() {
             Self::empty_state(
                 drive_glyph(false, 1.0),
-                if v.online { "No drives yet" } else { "Waiting for the cloud" },
-                if v.online { "Create one with New drive." } else { "Start the server with: cargo run -p ludy-cloud" },
+                if v.online { "No drives yet" } else { "Waiting for the server" },
+                if v.online { "Create one with +, or add one from its key." } else { "Start it with: docker compose up -d --wait" },
             )
             .into_any_element()
         } else {
@@ -500,11 +505,8 @@ impl LudyApp {
         if e.is_dir {
             return (None, String::new());
         }
-        let cache = self.engine.cache();
-        let local = cache.version_bytes(&e.version);
-        if cache.is_pinned(&e.version) {
-            (Some(T.accent), "Kept offline".into())
-        } else if e.size > 0 && local >= e.size {
+        let local = e.local_bytes;
+        if e.size > 0 && local >= e.size {
             (Some(T.good), "All of it".into())
         } else if local > 0 {
             (Some(T.blue), fmt_bytes(local))
@@ -693,15 +695,14 @@ impl LudyApp {
         match target {
             Target::Drive(name) => {
                 let mounted = self.drive(name).is_some_and(|d| d.mount.is_some());
-                let mut v = vec![("Open", false), ("Show in Finder", false), ("Open in Terminal", false), ("Copy path", false), ("Rename", false), ("Share drive", false), ("Fork drive", false)];
+                let mut v = vec![("Open", false), ("Show in Finder", false), ("Open in Terminal", false), ("Copy path", false), ("Rename", false), ("Copy drive key", false)];
                 v.push((if mounted { "Eject" } else { "Mount" }, false));
-                v.push(("Delete drive", true));
+                v.push(("Remove drive", true));
                 v
             }
             Target::Entry(e) => {
                 let mut v = vec![("Open", false), ("Show in Finder", false), ("Open in Terminal", false), ("Copy path", false), ("Rename", false)];
                 if !e.is_dir {
-                    v.push((if self.engine.cache().is_pinned(&e.version) { "Remove offline copy" } else { "Keep offline" }, false));
                     v.push(("Versions", false));
                 }
                 v.push(("Delete", true));
@@ -782,89 +783,29 @@ impl LudyApp {
         let (title, body, confirm, danger): (String, Div, Option<&'static str>, bool) = match modal {
             Modal::NewDrive { name } => ("New drive".into(), div().child(Self::text_field(name, "Drive name")), Some("Create"), false),
             Modal::RenameDrive { drive, name } => (format!("Rename {drive}"), div().child(Self::text_field(name, "New name")), Some("Rename"), false),
-            Modal::ForkDrive { drive, name } => (
-                format!("Fork {drive}"),
+            Modal::AddDrive { key } => (
+                "Add a drive from its key".into(),
                 div()
                     .flex()
                     .flex_col()
                     .gap(px(12.))
-                    .child(Self::note("A fork is a new drive that starts with the same files. No data is copied; the two drives diverge as they change."))
-                    .child(Self::text_field(name, "Name of the fork")),
-                Some("Fork"),
+                    .child(Self::note("Paste the key of a drive that lives on this server. The key is what opens the drive: copy it on the Mac that has the drive, from the drive's menu or with ludy key."))
+                    .child(Self::text_field(if key.is_empty() { "" } else { "Key pasted" }, "Paste the key (\u{2318}V)")),
+                Some("Add drive"),
                 false,
             ),
-            Modal::DeleteDrive { drive } => (
-                format!("Delete {drive}?"),
-                Self::note("The drive and every version of every file in it are removed from the cloud. This cannot be undone."),
-                Some("Delete drive"),
+            Modal::RemoveDrive { drive } => (
+                format!("Remove {drive} from this Mac?"),
+                Self::note("This Mac forgets the drive's key. The drive's sealed content stays on the server, and without the key nobody can read it, this Mac included. Copy the key first if the drive should ever be opened again."),
+                Some("Remove drive"),
                 true,
             ),
-            Modal::Share { drive, email, edit } => {
-                let shares = self.drive(drive).map(|d| d.info.shares.clone()).unwrap_or_default();
-                let role = |id: &'static str, label: &'static str, on: bool, value: bool, cx: &mut Context<Self>| {
-                    div()
-                        .id(id)
-                        .px(px(11.))
-                        .h(px(26.))
-                        .flex()
-                        .items_center()
-                        .rounded(px(6.))
-                        .cursor_pointer()
-                        .when(on, |d| d.bg(rgb(T.surface)).shadow_sm())
-                        .when(!on, |d| d.text_color(rgb(T.muted)))
-                        .child(label)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(Modal::Share { edit, .. }) = &mut this.modal {
-                                *edit = value;
-                            }
-                            cx.notify();
-                        }))
-                };
-                let drive_for_remove = drive.clone();
-                (
-                    format!("Share {drive}"),
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(12.))
-                        .child(Self::note("Invite someone by email. They get the whole drive without downloading it. (Simulated: the cloud records the share; no mail is sent.)"))
-                        .child(Self::text_field(email, "name@example.com"))
-                        .child(div().flex().child(
-                            div().p(px(2.)).flex().gap(px(2.)).rounded(px(8.)).bg(rgb(T.hover)).child(role("role-view", "Can view", !*edit, false, cx)).child(role("role-edit", "Can edit", *edit, true, cx)),
-                        ))
-                        .when(!shares.is_empty(), |d| {
-                            d.child(div().pt(px(4.)).text_size(px(12.)).text_color(rgb(T.faint)).child("People with access")).children(shares.into_iter().map(|s| {
-                                let (drive, email) = (drive_for_remove.clone(), s.email.clone());
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .child(div().child(s.email.clone()))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(12.))
-                                            .text_size(px(12.))
-                                            .child(div().text_color(rgb(T.muted)).child(if s.role == "edit" { "Can edit" } else { "Can view" }))
-                                            .child(
-                                                div()
-                                                    .id(SharedString::from(format!("unshare-{}", s.email)))
-                                                    .text_color(rgb(T.bad))
-                                                    .cursor_pointer()
-                                                    .child("Remove")
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        let (client, drive, email) = (this.client(), drive.clone(), email.clone());
-                                                        this.run("Remove share", cx, async move { client.unshare_drive(&drive, &email).await });
-                                                    })),
-                                            ),
-                                    )
-                            }))
-                        }),
-                    Some("Send invite"),
-                    false,
-                )
-            }
+            Modal::DriveKey { drive } => (
+                format!("The key of {drive}"),
+                Self::note("A drive is opened by its key. Whoever has the key and can reach the server can read and change everything in the drive. There are no accounts and no read-only access yet. To open the drive on another Mac, copy the key and add it there."),
+                Some("Copy key"),
+                false,
+            ),
             Modal::NewFolder { name } => ("New folder".into(), div().child(Self::text_field(name, "Folder name")), Some("Create"), false),
             Modal::RenameEntry { entry, name } => (format!("Rename {}", entry.name), div().child(Self::text_field(name, "New name")), Some("Rename"), false),
             Modal::DeleteEntry { entry } => (
@@ -877,13 +818,13 @@ impl LudyApp {
                 format!("Versions of {}", entry.name),
                 div().flex().flex_col().children(match versions {
                     None => vec![div().text_color(rgb(T.muted)).child("Loading\u{2026}").into_any_element()],
+                    // Newest first; the first one is what the file holds now.
                     Some(list) => {
-                        let current = list.last().map(|v| v.id.clone());
+                        let current = list.first().map(|v| v.id);
                         list.iter()
-                            .rev()
                             .map(|v| {
-                                let is_current = Some(&v.id) == current.as_ref();
-                                let (entry, id) = (entry.clone(), v.id.clone());
+                                let is_current = Some(v.id) == current;
+                                let (entry, id) = (entry.clone(), v.id);
                                 div()
                                     .h(px(34.))
                                     .flex()
@@ -904,7 +845,7 @@ impl LudyApp {
                                             .text_color(rgb(T.blue))
                                             .cursor_pointer()
                                             .child("Restore")
-                                            .on_click(cx.listener(move |this, _, _, cx| this.restore(&entry, id.clone(), cx)))
+                                            .on_click(cx.listener(move |this, _, _, cx| this.restore(&entry, id, cx)))
                                             .into_any_element()
                                     })
                                     .into_any_element()

@@ -1,13 +1,14 @@
-//! The sealed drive (`ludy_core::sealed_drive`) against the Worker under
-//! `wrangler dev`: what the engine's tests check on the old cloud, for the
-//! engine that speaks the node-tree protocol and encrypts everything.
+//! The engine (`ludy_core::sealed_drive`) against a real server, started
+//! by `worker_rig` as the provider `LUDY_PROVIDER` names: the Worker under
+//! `wrangler dev` (the default) or `ludy-rivet` beside a Rivet engine.
 //!
 //! Every test that writes ends by reading the drive back with
 //! `worker_rig::read_drive`, which holds the root key and none of the
 //! engine's code: the cloud has to hold what the application wrote, sealed
 //! the way the format says.
 //!
-//! These need Node and `app/providers/cloudflare/node_modules`, so they are ignored by default:
+//! These need a provider's tools (Node and `providers/cloudflare/node_modules`,
+//! or Docker and `target/release/ludy-rivet`), so they are ignored by default:
 //!
 //! ```text
 //! cargo test -p ludy-core --test sealed_engine -- --ignored --test-threads=1
@@ -21,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ludy_core::cache::{BlockCache, BLOCK_SIZE};
-use ludy_core::drive::{FsError, ROOT_ID};
+use ludy_core::fs::{FsError, ROOT_ID};
 use ludy_core::sealed_client::SealedClient;
 use ludy_core::sealed_drive::{create_drive, DriveKeys, SealedDrive};
 use ludy_core::stats::Stats;
@@ -555,6 +556,157 @@ async fn the_last_writer_wins_and_the_other_version_stays_in_history() {
     assert_eq!(b.reader.versions(&b.keys.drive, &node.id).await.unwrap().len(), 3, "the first version, A's and C's");
     assert!(a.fs.refresh().await.unwrap());
     assert!(a.read_all(file).await == want, "A sees C's save after looking again");
+    b.settled().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
+async fn an_earlier_version_is_restored_without_sending_content() {
+    let Some(b) = bench().await else { return };
+    let a = b.mac("a").await;
+    let first = synth::bytes(30, 0, 3 * MIB);
+    let second = synth::bytes(31, 0, 2 * MIB + 17);
+    let file = a.put(ROOT_ID, "cut.mov", &first);
+    a.flush().await;
+    a.put(ROOT_ID, "cut.mov", &second);
+    a.flush().await;
+    assert!(a.fs.refresh().await.unwrap());
+
+    let versions = a.fs.versions(file).await.unwrap();
+    assert_eq!(versions.iter().map(|v| v.size).collect::<Vec<_>>(), [second.len() as u64, first.len() as u64], "newest first");
+    assert!(versions[0].id > versions[1].id);
+    let sent = a.up();
+    a.fs.restore(file, versions[1].id).await.unwrap();
+    assert_eq!(a.up(), sent, "restoring names the old manifest and shards; no blob is sent");
+    assert!(a.read_all(file).await == first, "the Mac that restored reads the old content");
+    assert_eq!(a.fs.versions(file).await.unwrap().len(), 3, "the restore is a third version");
+    assert!(b.cloud().await["cut.mov"].content.as_deref() == Some(&first[..]));
+    let c = b.mac("c").await;
+    assert!(c.read_all(c.id("cut.mov")).await == first, "and so does another Mac");
+
+    // A file with writes that have not been sent is not restored under them.
+    a.fs.write(file, 0, b"unsent").unwrap();
+    assert!(a.fs.restore(file, versions[0].id).await.is_err());
+    assert!(a.fs.restore(file, 1).await.is_err(), "a version the cloud does not keep");
+    a.flush().await;
+    b.settled().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
+async fn a_synthetic_file_reads_like_any_other_and_stores_no_shard() {
+    let Some(b) = bench().await else { return };
+    let a = b.mac("a").await;
+    let raw = a.fs.mkdir(ROOT_ID, "raw").unwrap();
+    assert!(a.fs.add_synthetic(raw, "early.braw", 10, 1).await.is_err(), "the folder has not reached the cloud yet");
+    a.flush().await;
+    let size = 5 * MIB as u64 + 123;
+    let sent = a.up();
+    a.fs.add_synthetic(raw, "take 01.braw", size, 7).await.unwrap();
+    assert!(a.up() - sent < 1024, "only a sealed manifest goes up: {} bytes", a.up() - sent);
+    assert!(a.fs.add_synthetic(raw, "take 01.braw", size, 8).await.is_err(), "the name is taken");
+
+    let file = a.id("raw/take 01.braw");
+    assert_eq!(a.fs.getattr(file).unwrap().size, size);
+    let (requests, down) = (a.requests(), a.down());
+    let (middle, _) = a.fs.read(file, 3 * MIB as u64 + 5, 70_000).await.unwrap();
+    assert!(middle == synth::bytes(7, 3 * MIB as u64 + 5, 70_000));
+    assert_eq!(a.requests(), requests, "generated here, not fetched");
+    assert!(a.down() - down < 1024, "nothing but the manifest came down");
+    let cloud = b.cloud().await;
+    assert!(cloud["raw/take 01.braw"].content.as_deref() == Some(&synth::bytes(7, 0, size as usize)[..]));
+
+    // Writing into it makes real shards around the write and keeps the rest generated.
+    a.fs.write(file, MIB as u64, b"a real edit").unwrap();
+    a.flush().await;
+    let mut want = synth::bytes(7, 0, size as usize);
+    want[MIB..MIB + 11].copy_from_slice(b"a real edit");
+    assert!(b.cloud().await["raw/take 01.braw"].content.as_deref() == Some(&want[..]));
+    b.settled().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
+async fn folders_copy_in_and_out_and_are_removed_with_what_is_in_them() {
+    use ludy_core::transfer;
+    let Some(b) = bench().await else { return };
+    let a = b.mac("a").await;
+    let src = b.dir.path().join("src/shoot");
+    std::fs::create_dir_all(src.join("day 1/cam a")).unwrap();
+    let files: Vec<(&str, Vec<u8>)> = vec![
+        ("notes.txt", b"call sheet".to_vec()),
+        ("day 1/slate.jpg", synth::bytes(40, 0, 70_000)),
+        ("day 1/cam a/clip.mov", synth::bytes(41, 0, 3 * MIB + 5)),
+        ("day 1/cam a/empty.txt", Vec::new()),
+    ];
+    for (path, data) in &files {
+        std::fs::write(src.join(path), data).unwrap();
+    }
+    std::fs::write(src.join(".DS_Store"), b"finder").unwrap();
+
+    let dailies = transfer::ensure_folder(&a.fs, "in/dailies").unwrap();
+    assert_eq!(transfer::ensure_folder(&a.fs, "/in/dailies/").unwrap(), dailies, "made once");
+    let total: u64 = files.iter().map(|f| f.1.len() as u64).sum();
+    assert_eq!(transfer::copy_tree_in(&a.fs, dailies, "shoot", &src).unwrap(), (4, total));
+    a.flush().await;
+    let cloud = b.cloud_files().await;
+    for (path, data) in &files {
+        assert!(cloud[&format!("in/dailies/shoot/{path}")].as_deref() == Some(&data[..]), "{path}");
+    }
+    assert_eq!(cloud.len(), 4 + 5, "four files and five folders; the Finder's file stayed behind: {:?}", cloud.keys());
+
+    // Out again, on a Mac that has none of it.
+    let c = b.mac("c").await;
+    let out = b.dir.path().join("out");
+    assert_eq!(transfer::copy_tree_out(&c.fs, c.id("in/dailies/shoot"), &out).await.unwrap(), (4, total));
+    for (path, data) in &files {
+        assert!(std::fs::read(out.join(path)).unwrap() == *data, "{path}");
+    }
+    // Copying over a file replaces its content.
+    std::fs::write(src.join("notes.txt"), b"new call sheet, shorter day").unwrap();
+    transfer::copy_in(&a.fs, a.id("in/dailies/shoot"), "notes.txt", &src.join("notes.txt")).unwrap();
+    a.flush().await;
+    assert!(b.cloud_files().await["in/dailies/shoot/notes.txt"].as_deref() == Some(&b"new call sheet, shorter day"[..]));
+
+    assert_eq!(a.fs.remove(a.id("in"), "dailies"), Err(FsError::NotEmpty), "rmdir keeps its meaning");
+    a.fs.remove_tree(a.id("in"), "dailies").unwrap();
+    a.flush().await;
+    assert_eq!(b.cloud_files().await.keys().collect::<Vec<_>>(), ["in"]);
+    assert!(c.fs.refresh().await.unwrap());
+    assert_eq!(c.tree().keys().collect::<Vec<_>>(), ["in"], "the other Mac sees them go");
+    b.settled().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
+async fn a_drive_key_opens_the_drive_elsewhere_and_a_wrong_one_does_not() {
+    use ludy_core::keystore::{self, Keystore};
+    let Some(b) = bench().await else { return };
+    let url = b.worker.url();
+    let here = Keystore::open(&b.dir.path().join("here/drives.json"), &url).unwrap();
+    here.add("Footage on this Mac", &b.keys).unwrap();
+    let key = here.export("Footage on this Mac").unwrap();
+
+    let client = SealedClient::new(&url, Arc::new(Stats::default()));
+    let (keys, name) = keystore::import(&client, &key).await.unwrap();
+    assert_eq!(name, "Footage", "the name the drive was created with, opened with the key");
+    assert_eq!((keys.drive.as_str(), keys.root, keys.root_key.expose()), (b.keys.drive.as_str(), b.keys.root, b.keys.root_key.expose()));
+    let there = Keystore::open(&b.dir.path().join("there/drives.json"), &url).unwrap();
+    there.add(&name, &keys).unwrap();
+    assert_eq!(there.get("Footage").unwrap().keys.drive, b.keys.drive);
+
+    // Another drive's key, this drive's id.
+    let other = create_drive(&client, "Other").await.unwrap();
+    here.add("Other", &other).unwrap();
+    let other_key = here.export("Other").unwrap();
+    let forged = format!("ludy1-{}-{}", b.keys.drive, other_key.rsplit('-').next().unwrap());
+    assert!(keystore::import(&client, &forged).await.unwrap_err().to_string().contains("does not open"));
+    // A drive this server does not have.
+    let nowhere = format!("ludy1-{}-{}", "ab".repeat(16), other_key.rsplit('-').next().unwrap());
+    assert!(keystore::import(&client, &nowhere).await.is_err());
+    for junk in ["", "ludy1-xyz", "ludy2-00-00", &key[..key.len() - 2]] {
+        assert!(keystore::import(&client, junk).await.is_err(), "{junk:?}");
+    }
     b.settled().await;
 }
 

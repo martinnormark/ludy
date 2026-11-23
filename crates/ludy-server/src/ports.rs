@@ -1,5 +1,5 @@
 //! What a provider supplies. Every promise here is one the chaos suites
-//! check; `docs/real-cloud/architecture.md` lists them in words.
+//! check; `docs/how-it-works/server.md` lists them in words.
 //!
 //! The methods are asynchronous because some providers wait for their
 //! database (Rivet) and some do not (a Durable Object's SQLite, `rusqlite`).

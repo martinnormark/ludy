@@ -1,4 +1,4 @@
-//! Adapter that serves a [`DriveFs`] over NFSv3 (via `nfsserve`), so macOS
+//! Adapter that serves a [`SealedDrive`] over NFSv3 (via `nfsserve`), so macOS
 //! can mount it from loopback with `mount_nfs`: no driver, no root.
 
 use std::sync::Arc;
@@ -7,10 +7,11 @@ use async_trait::async_trait;
 use nfsserve::nfs::*;
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 
-use crate::drive::{Attr, DriveFs, FsError, ROOT_ID};
+use crate::fs::{Attr, FsError, ROOT_ID};
+use crate::sealed_drive::SealedDrive;
 
 pub struct NfsDrive {
-    fs: Arc<DriveFs>,
+    fs: Arc<SealedDrive>,
     uid: u32,
     gid: u32,
     /// Distinguishes this mount's file handles from any earlier mount's.
@@ -19,7 +20,7 @@ pub struct NfsDrive {
 }
 
 impl NfsDrive {
-    pub fn new(fs: Arc<DriveFs>, read_only: bool) -> NfsDrive {
+    pub fn new(fs: Arc<SealedDrive>, read_only: bool) -> NfsDrive {
         // SAFETY: getuid/getgid cannot fail and take no arguments.
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
         NfsDrive { fs, uid, gid, generation: ludy_proto::now_ms() << 8 | (std::process::id() as u64 & 0xff), read_only }

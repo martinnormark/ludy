@@ -1,16 +1,16 @@
-//! HTTP client for the Worker (`app/providers/cloudflare`): the node-tree protocol of an
-//! end-to-end encrypted drive. It moves sealed bytes and JSON; nothing here
-//! holds a key. [`crate::sealed_drive`] does the sealing and opening.
+//! HTTP client for Ludy's server, whichever provider runs it: the node-tree
+//! protocol of an end-to-end encrypted drive. It moves sealed bytes and JSON;
+//! nothing here holds a key. [`crate::sealed_drive`] does the sealing and opening.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use ludy_proto::tree::{Blobs, Commit, Committed, CreateDrive, DriveHead, Feed, NodeInfo, Refusal};
+use ludy_proto::tree::{Blobs, Commit, Committed, CreateDrive, DriveHead, Feed, NodeInfo, Refusal, VersionEntry};
 use serde::de::DeserializeOwned;
 
-use crate::client::{stalled, transfer_timeout, HttpError, RangeBody, SMALL_REQUEST, STALL};
+use crate::http::{stalled, transfer_timeout, HttpError, RangeBody, SMALL_REQUEST, STALL};
 use crate::stats::Stats;
 
 #[derive(Clone)]
@@ -99,6 +99,30 @@ impl SealedClient {
 
     pub async fn node(&self, drive: &str, id: &str) -> Result<Reply<NodeInfo>> {
         self.json("node", self.http.get(self.url(&format!("/drives/{drive}/nodes/{id}")))).await
+    }
+
+    /// A file's history, newest first.
+    pub async fn versions(&self, drive: &str, id: &str) -> Result<Reply<Vec<VersionEntry>>> {
+        self.json("versions", self.http.get(self.url(&format!("/drives/{drive}/nodes/{id}/versions")))).await
+    }
+
+    /// The name the server gives itself (`ludy-rivet`, `ludy-worker`): a
+    /// cheap way to ask whether anything of ours answers at this address.
+    pub async fn hello(&self) -> Result<String> {
+        let resp = self.http.get(self.url("/")).timeout(Duration::from_secs(5)).send().await.context("hello")?;
+        if !resp.status().is_success() {
+            return Err(HttpError { status: resp.status().as_u16(), what: "hello".into(), body: String::new() }.into());
+        }
+        let name = resp.text().await.context("hello")?;
+        let name = name.trim();
+        if !name.starts_with("ludy-") || name.len() > 40 {
+            anyhow::bail!("something answers at {}, and it is not a Ludy server", self.base);
+        }
+        Ok(name.to_string())
+    }
+
+    pub fn base(&self) -> &str {
+        &self.base
     }
 
     /// Which of these sealed shards and manifests a commit would be refused for.

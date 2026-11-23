@@ -1,10 +1,9 @@
 //! One end-to-end encrypted drive as a filesystem, over the node-tree
-//! protocol (`ludy_proto::tree`) and the Worker.
+//! protocol (`ludy_proto::tree`).
 //!
-//! The same shape as [`crate::drive`], which it is to replace: a tree built
-//! from what the cloud lists, reads that fetch only what an application asks
-//! for, and writes that land in a local journal and upload in the
-//! background. What differs is everything the cloud may no longer see:
+//! A tree built from what the cloud lists, reads that fetch only what an
+//! application asks for, and writes that land in a local journal and upload
+//! in the background. The cloud sees none of it in the clear:
 //!
 //! * The tree comes from the drive's feed of nodes. Each node's key is
 //!   unwrapped with its folder's key, from the root key down, and its name
@@ -36,7 +35,7 @@ use ludy_proto::synth;
 use tokio::sync::Semaphore;
 
 use crate::cache::{BlockCache, BLOCK_SIZE};
-use crate::drive::{is_local_only, Attr, FsError, FsResult, Pending, ROOT_ID};
+use crate::fs::{is_local_only, Attr, FsError, FsResult, Pending, ROOT_ID};
 use crate::patch::{self, Piece as Patch};
 use crate::rangeset::RangeSet;
 use crate::sealed_client::{Reply, SealedClient};
@@ -114,6 +113,18 @@ pub async fn create_drive(client: &SealedClient, name: &str) -> anyhow::Result<D
     let drive = hex(&drive.0);
     client.create_drive(&drive, &body).await?.accepted("create drive")?;
     Ok(DriveKeys { drive, root, root_key })
+}
+
+/// One entry of a file's history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileVersion {
+    /// The drive's sequence number the version was committed at.
+    pub id: u64,
+    pub size: u64,
+    /// When the cloud committed it.
+    pub committed_ms: u64,
+    /// The file's modification time, as its writer sealed it.
+    pub mtime_ms: u64,
 }
 
 /// A node's identity in the cloud. A node without one never leaves this Mac.
@@ -1065,7 +1076,8 @@ impl SealedDrive {
         Ok(out)
     }
 
-    /// One page of a folder; see [`crate::drive::DriveFs::readdir_page`].
+    /// One page of a folder: up to `max` entries after the entry with id
+    /// `after` (0: from the start), and whether that was the last page.
     pub fn readdir_page(&self, dir: u64, after: u64, max: usize) -> FsResult<(Vec<(String, Attr)>, bool)> {
         use std::ops::Bound;
         let t = self.tree.lock().unwrap();
@@ -1092,6 +1104,93 @@ impl SealedDrive {
 
     pub fn find_path(&self, path: &str) -> Option<u64> {
         self.tree.lock().unwrap().find_path(path)
+    }
+
+    /// How many files the drive holds and how many bytes they add up to, as
+    /// the tree here has them.
+    pub fn totals(&self) -> (u64, u64) {
+        let t = self.tree.lock().unwrap();
+        t.nodes.values().fold((0, 0), |(files, bytes), n| match &n.kind {
+            Kind::File(f) => (files + 1, bytes + f.size),
+            Kind::Dir(_) => (files, bytes),
+        })
+    }
+
+    /// A file's history in the cloud, newest first.
+    pub async fn versions(&self, id: u64) -> anyhow::Result<Vec<FileVersion>> {
+        let file = self.committed_file(id)?;
+        let entries = self.client.versions(&self.keys.drive, &hex(&file.id.0)).await?.accepted("versions")?;
+        Ok(entries
+            .into_iter()
+            .map(|e| FileVersion { id: e.id, size: e.size, committed_ms: e.at_ms, mtime_ms: file.key.open_meta(&file.id, &unhex(&e.meta)).map(|m| m.mtime_ms).unwrap_or(e.at_ms) })
+            .collect())
+    }
+
+    /// Make an earlier version of a file its newest one. No content moves:
+    /// the new version names the old one's manifest and shards.
+    pub async fn restore(&self, id: u64, version: u64) -> anyhow::Result<()> {
+        let file = self.committed_file(id)?;
+        let node = hex(&file.id.0);
+        let entries = self.client.versions(&self.keys.drive, &node).await?.accepted("versions")?;
+        let old = entries.into_iter().find(|e| e.id == version).ok_or_else(|| anyhow::anyhow!("the cloud no longer keeps that version"))?;
+        let sealed = self.client.get_manifest(&self.keys.drive, &old.manifest).await?.ok_or_else(|| anyhow::anyhow!("the cloud no longer has that version's manifest"))?;
+        let manifest = file.key.open_manifest(&file.id, &sealed).map_err(|e| anyhow::anyhow!("that version's manifest does not open: {e}"))?;
+        let mut rng = OsRandom;
+        let meta = hex(&file.key.seal_meta(&file.id, &FileMeta { mtime_ms: now_ms() }, &mut rng));
+        let put = Op::Put { node, base: None, size: old.size, manifest: old.manifest, shards: manifest.shard_ids(), meta };
+        self.client.commit(&self.keys.drive, &Commit { id: hex(&NodeId::random(&mut rng).0), ops: vec![put] }).await?.accepted("restore")?;
+        self.sync_gen.fetch_add(1, Ordering::SeqCst);
+        let _ = self.refresh().await;
+        Ok(())
+    }
+
+    /// Add a file whose content is generated, not stored: `size` bytes of
+    /// the synthetic stream for `seed`. It takes no storage and no upload,
+    /// and reads like any other file. For demos and tests of very large files.
+    pub async fn add_synthetic(&self, dir: u64, name: &str, size: u64, seed: u64) -> anyhow::Result<()> {
+        let name = Self::name(name).map_err(|e| anyhow::anyhow!("{name:?} cannot be a file's name ({e:?})"))?;
+        let folder = {
+            let t = self.tree.lock().unwrap();
+            if t.dir(dir).map_err(|e| anyhow::anyhow!("not a folder ({e:?})"))?.contains_key(&name) {
+                anyhow::bail!("{name} is already there");
+            }
+            t.cloud(dir).filter(|c| c.committed).cloned().ok_or_else(|| anyhow::anyhow!("the folder has not reached the cloud yet"))?
+        };
+        let mut rng = OsRandom;
+        let (id, key) = (NodeId::random(&mut rng), NodeKey::random(&mut rng));
+        let manifest = PrivateManifest { size, segments: if size == 0 { Vec::new() } else { vec![PrivateSegment::Synth { seed, off: 0, n: size }] } };
+        manifest.validate().map_err(|e| anyhow::anyhow!("the manifest is wrong: {e}"))?;
+        let sealed = key.seal_manifest(&id, &manifest, &mut rng);
+        let manifest_name = sha256_hex(&sealed);
+        self.client.put_manifest(&self.keys.drive, &manifest_name, Bytes::from(sealed)).await?;
+        let node = hex(&id.0);
+        let ops = vec![
+            Op::Create {
+                id: node.clone(),
+                parent: hex(&folder.id.0),
+                kind: ludy_proto::tree::Kind::File,
+                name_hash: hex(&folder.key.name_hash(&name).map_err(|e| anyhow::anyhow!("name: {e}"))?),
+                name: hex(&key.seal_name(&id, &name, &mut rng).map_err(|e| anyhow::anyhow!("name: {e}"))?),
+                key: hex(&folder.key.wrap_child(&id, &key, &mut rng)),
+            },
+            Op::Put { node, base: Some(0), size, manifest: manifest_name, shards: Vec::new(), meta: hex(&key.seal_meta(&id, &FileMeta { mtime_ms: now_ms() }, &mut rng)) },
+        ];
+        self.client.commit(&self.keys.drive, &Commit { id: hex(&NodeId::random(&mut rng).0), ops }).await?.accepted("add a synthetic file")?;
+        self.sync_gen.fetch_add(1, Ordering::SeqCst);
+        let _ = self.refresh().await;
+        Ok(())
+    }
+
+    /// The cloud's side of a file that has reached it and has nothing
+    /// waiting to be uploaded.
+    fn committed_file(&self, id: u64) -> anyhow::Result<FileRef> {
+        let t = self.tree.lock().unwrap();
+        let f = t.file(id).map_err(|_| anyhow::anyhow!("not a file"))?;
+        if f.local.is_some() || f.uploading {
+            anyhow::bail!("the file is still uploading");
+        }
+        let c = t.cloud(id).filter(|c| c.committed).ok_or_else(|| anyhow::anyhow!("the file has not reached the cloud yet"))?;
+        Ok(FileRef { id: c.id, key: c.key.clone() })
     }
 
     /// The cloud version currently backing a file, if it has one.
@@ -1513,11 +1612,21 @@ impl SealedDrive {
         Ok(id)
     }
 
+    /// Remove a file or an empty folder, as `unlink` and `rmdir` do.
     pub fn remove(&self, dir: u64, name: &str) -> FsResult<()> {
+        self.remove_node(dir, name, false)
+    }
+
+    /// Remove a file, or a folder and everything in it.
+    pub fn remove_tree(&self, dir: u64, name: &str) -> FsResult<()> {
+        self.remove_node(dir, name, true)
+    }
+
+    fn remove_node(&self, dir: u64, name: &str, with_contents: bool) -> FsResult<()> {
         let name = Self::name(name).map_err(|_| FsError::NotFound)?;
         let mut t = self.tree.lock().unwrap();
         let id = *t.dir(dir)?.get(&name).ok_or(FsError::NotFound)?;
-        if matches!(&t.nodes.get(&id).ok_or(FsError::NotFound)?.kind, Kind::Dir(children) if !children.is_empty()) {
+        if !with_contents && matches!(&t.nodes.get(&id).ok_or(FsError::NotFound)?.kind, Kind::Dir(children) if !children.is_empty()) {
             return Err(FsError::NotEmpty);
         }
         if let Some(cloud) = t.cloud(id).cloned() {

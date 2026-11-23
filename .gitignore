@@ -1,5 +1,6 @@
 /target
-/data
 .DS_Store
 # Local settings and secrets for docker compose
 .env
+# Blobs of a server run from the checkout (docs/hosting/binary.md)
+/ludy-blobs

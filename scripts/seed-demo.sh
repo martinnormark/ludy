@@ -1,22 +1,40 @@
 #!/bin/sh
-# Fill a running ludy-cloud with demo drives.
-#   scripts/seed-demo.sh [path-to-a-video] [server-url]
-# The video is uploaded for real; everything else is synthetic and takes no disk.
+# Make three demo drives on a running server and fill them.
+#   scripts/seed-demo.sh [path-to-a-video]
+# The server is the one at $LUDY_SERVER (default http://127.0.0.1:8080, where
+# `docker compose up -d --wait` answers). The drives' keys go into this Mac's
+# keystore, so the app lists them afterwards.
+#
+# The video and the text files are uploaded for real: cut, sealed and stored.
+# The large files (12 to 180 GB) are generated content: each is a sealed
+# manifest that says "this many bytes of the stream for this seed", so they
+# take no storage and no upload, and read like any other file.
+#
+# Set LUDY to a built binary to skip cargo: LUDY=target/release/ludy
 set -eu
 VIDEO="${1:-../e58b62c20765eacd37457c1a53d2e97ace458f85.mp4}"
-B="${2:-${LUDY_SERVER:-http://127.0.0.1:9000}}"
+LUDY="${LUDY:-cargo run -q -p ludy-cli --}"
+TEXT="$(mktemp)"
+trap 'rm -f "$TEXT"' EXIT
 
-drive() { curl -fsS -o /dev/null -X PUT "$B/$1" || true; }
-synth() { curl -fsS -o /dev/null -X PUT -H "x-ludy-synthetic-size: $3" -H "x-ludy-synthetic-seed: $4" "$B/$1/$2"; }
-text()  { printf '%s\n' "$3" | curl -fsS -o /dev/null -T - "$B/$1/$2"; }
+$LUDY server
+have() { $LUDY drives | awk '{print $1}' | grep -qx "$1"; }
+drive() { if have "$1"; then echo "$1 is already here"; else $LUDY mkdrive "$1"; fi; }
+# A file a previous run already made is left as it is; any other failure stops the script.
+synth() {
+  if out=$($LUDY synth "$1" "$2" "$3" "$4" 2>&1); then echo "$out"
+  elif echo "$out" | grep -q "is already there"; then echo "$1/$2 is already there"
+  else echo "$out" >&2; exit 1
+  fi
+}
+text()  { printf '%s\n' "$3" > "$TEXT"; $LUDY put "$1" "$TEXT" "$2"; }
 
 drive Footage
 drive Archive
 drive Projects
 
 if [ -f "$VIDEO" ]; then
-  echo "uploading $VIDEO to Footage/demo.mp4"
-  curl -fsS -o /dev/null -T "$VIDEO" "$B/Footage/demo.mp4"
+  $LUDY put Footage "$VIDEO" demo.mp4
 else
   echo "no video at $VIDEO; skipping the real file"
 fi
@@ -31,6 +49,4 @@ synth Archive "2024/festival-cut.mov" 36GB 5
 text Projects "spring-film/cut-v3.edl" "TITLE: spring film, cut 3"
 text Projects "readme.txt" "Project files live here."
 
-curl -fsS "$B/" | python3 -c 'import json,sys
-for d in json.load(sys.stdin)["drives"]:
-    print("%-10s %8.1f GB  %d objects" % (d["name"], d["bytes"]/1e9, d["objects"]))'
+$LUDY drives

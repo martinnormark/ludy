@@ -1,4 +1,4 @@
-# Ludy's cloud, self-hosted. No settings are needed:
+# Ludy's server, self-hosted. No settings are needed:
 #
 #   docker compose up -d --wait
 #
@@ -20,7 +20,7 @@
 # There is no sign-in yet: whoever can reach port 8080 can read and change
 # every drive (what they read is sealed; they hold no key). So the port is
 # published on this machine only. Put it behind something that authenticates
-# before changing that.
+# before changing that; docs/hosting/README.md says what that takes.
 name: ludy
 
 services:
@@ -42,7 +42,7 @@ services:
       # tell the engine and do not wait for this; `kill -9` and a power cut
       # do. The engine's own default leaves a drive unanswered for most of a
       # minute then, and two seconds for a few seconds; the measurements are
-      # in providers/rivet/README.md. Two is what both chaos suites run with.
+      # in docs/hosting/compose.md. Two is what both chaos suites run with.
       # These two settings were found in the engine, not in its documentation.
       RIVET__PEGBOARD__NODE_LOST_THRESHOLD: ${RIVET_NODE_LOST_MS:-2000}
       RIVET__PEGBOARD__NODE_PING_TIMEOUT: ${RIVET_NODE_LOST_MS:-2000}

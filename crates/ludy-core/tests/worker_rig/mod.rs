@@ -1,4 +1,4 @@
-//! What the chaos tests of the real cloud stand on: the server as a
+//! What the chaos tests of the server and the engine stand on: the server as a
 //! process that can be killed, frozen and restarted; a proxy in front of it
 //! that loses requests and replies; and a client that keeps trying until it
 //! has an answer, counting what it saw on the way.

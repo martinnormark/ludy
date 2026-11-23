@@ -3133,24 +3133,9 @@ name = "ludy-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "ludy-cloud",
  "ludy-core",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "ludy-cloud"
-version = "0.1.0"
-dependencies = [
- "axum 0.8.9",
- "bytes",
- "futures-util",
  "ludy-proto",
- "reqwest 0.12.28",
- "serde",
  "serde_json",
- "tempfile",
  "tokio",
 ]
 
@@ -3164,7 +3149,6 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "libc",
- "ludy-cloud",
  "ludy-proto",
  "nfsserve",
  "reqwest 0.12.28",

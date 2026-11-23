@@ -1,23 +1,27 @@
 #!/bin/sh
-# Make a drive with thousands of synthetic files, for scroll measurements.
-#   scripts/seed-stress.sh [count] [server-url]
-# The files take no disk. Then: cargo run -p ludy-app -- --open Stress --perf
+# Make a drive with thousands of small files, for scroll measurements.
+#   scripts/seed-stress.sh [count]
+# The files are real: each is cut, sealed and uploaded to the server at
+# $LUDY_SERVER (default http://127.0.0.1:8080). 5,000 of them are about
+# 5 MB in all. Then: cargo run -p ludy-app -- --open Stress/clips --perf
+#
+# Set LUDY to a built binary to skip cargo: LUDY=target/release/ludy
 set -eu
 N="${1:-5000}"
-B="${2:-${LUDY_SERVER:-http://127.0.0.1:9000}}"
-curl -fsS -o /dev/null -X PUT "$B/Stress" || true
-# No simulated latency while seeding; put the previous link back afterwards.
-LINK=$(curl -fsS "$B/_stats" | sed -n 's/.*"latency_ms":\([0-9]*\).*/\1/p')
-MBPS=$(curl -fsS "$B/_stats" | sed -n 's/.*"mbps":\([0-9]*\).*/\1/p')
-curl -fsS -o /dev/null -X PUT "$B/_config?latency_ms=0&mbps=0"
-i=1
-while [ "$i" -le "$N" ]; do
-  case $(( i % 6 )) in 0) e=mov;; 1) e=mp4;; 2) e=wav;; 3) e=png;; 4) e=braw;; *) e=txt;; esac
-  curl -fsS -o /dev/null -X PUT -H "x-ludy-synthetic-size: $(( i * 7919 % 900000000 + 1000 ))" -H "x-ludy-synthetic-seed: $i" \
-    "$B/Stress/$(printf 'clip_%05d' "$i").$e" &
-  [ $(( i % 16 )) -eq 0 ] && wait
-  i=$(( i + 1 ))
-done
-wait
-curl -fsS -o /dev/null -X PUT "$B/_config?latency_ms=${LINK:-30}&mbps=${MBPS:-400}"
-echo "Stress: $N synthetic files"
+LUDY="${LUDY:-cargo run -q -p ludy-cli --}"
+CLIPS="$(mktemp -d)"
+trap 'rm -rf "${CLIPS:?}"' EXIT
+
+$LUDY server
+$LUDY drives | awk '{print $1}' | grep -qx Stress || $LUDY mkdrive Stress
+python3 - "$CLIPS" "$N" <<'PY'
+import os, random, sys
+folder, count = sys.argv[1], int(sys.argv[2])
+ext = ["mov", "mp4", "wav", "png", "braw", "txt"]
+for i in range(1, count + 1):
+    r = random.Random(i)
+    with open(os.path.join(folder, "clip_%05d.%s" % (i, ext[i % 6])), "wb") as f:
+        f.write(r.randbytes(200 + r.randrange(1800)))
+PY
+$LUDY put Stress "$CLIPS" clips
+echo "Stress/clips: $N files. Open it with: cargo run -p ludy-app -- --open Stress/clips --perf"

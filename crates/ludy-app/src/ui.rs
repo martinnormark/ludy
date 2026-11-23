@@ -9,8 +9,10 @@ use std::time::Duration;
 use std::time::Instant;
 
 use gpui::{point, px, ClipboardItem, Context, FocusHandle, KeyDownEvent, PathPromptOptions, Pixels, Point, ScrollStrategy, UniformListScrollHandle, Window};
-use ludy_core::client::{CloudClient, Version};
 use ludy_core::engine::{DriveView, Engine, View};
+use ludy_core::fs::ROOT_ID;
+use ludy_core::sealed_drive::{FileVersion, SealedDrive};
+use ludy_core::transfer;
 
 /// How the window starts. `demo` and `perf` exist so that screens which need
 /// a click can be opened, and scrolling measured, without a hand on the mouse.
@@ -18,7 +20,7 @@ use ludy_core::engine::{DriveView, Engine, View};
 pub struct UiOptions {
     pub open: Option<String>,
     pub list: bool,
-    /// "menu", "entry-menu", "share" or "new-drive".
+    /// "menu", "entry-menu", "key" or "new-drive".
     pub demo: Option<String>,
     /// Scroll the open folder by itself for a few seconds, print frame times, quit.
     pub perf: bool,
@@ -44,9 +46,8 @@ struct Entry {
     is_dir: bool,
     size: u64,
     mtime_ms: u64,
-    version: String,
-    versions: usize,
-    synthetic: bool,
+    /// Bytes of the file this Mac holds, in its cache or its journal.
+    local_bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -68,23 +69,26 @@ struct Menu {
 
 enum Modal {
     NewDrive { name: String },
+    /// Add a drive made on another Mac, from its key.
+    AddDrive { key: String },
     RenameDrive { drive: String, name: String },
-    ForkDrive { drive: String, name: String },
-    DeleteDrive { drive: String },
-    Share { drive: String, email: String, edit: bool },
+    /// Forget the drive's key on this Mac.
+    RemoveDrive { drive: String },
+    /// Explain what a drive's key is before copying it.
+    DriveKey { drive: String },
     NewFolder { name: String },
     RenameEntry { entry: Entry, name: String },
     DeleteEntry { entry: Entry },
-    Versions { entry: Entry, versions: Option<Vec<Version>> },
+    Versions { entry: Entry, versions: Option<Vec<FileVersion>> },
 }
 
 impl Modal {
     fn text_mut(&mut self) -> Option<&mut String> {
         match self {
-            Modal::NewDrive { name } | Modal::RenameDrive { name, .. } | Modal::ForkDrive { name, .. } | Modal::NewFolder { name } => Some(name),
+            Modal::NewDrive { name } | Modal::RenameDrive { name, .. } | Modal::NewFolder { name } => Some(name),
             Modal::RenameEntry { name, .. } => Some(name),
-            Modal::Share { email, .. } => Some(email),
-            Modal::DeleteDrive { .. } | Modal::DeleteEntry { .. } | Modal::Versions { .. } => None,
+            Modal::AddDrive { key } => Some(key),
+            Modal::RemoveDrive { .. } | Modal::DriveKey { .. } | Modal::DeleteEntry { .. } | Modal::Versions { .. } => None,
         }
     }
 }
@@ -109,6 +113,26 @@ pub struct LudyApp {
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// The folder a browser prefix (`""`, `raw/`, `raw/day 1/`) names.
+fn folder_id(fs: &SealedDrive, prefix: &str) -> anyhow::Result<u64> {
+    let path = prefix.trim_matches('/');
+    if path.is_empty() {
+        return Ok(ROOT_ID);
+    }
+    fs.find_path(path).filter(|id| fs.getattr(*id).is_ok_and(|a| a.is_dir)).ok_or_else(|| anyhow::anyhow!("the folder {path} is no longer there"))
+}
+
+fn fs_error(e: ludy_core::fs::FsError) -> anyhow::Error {
+    use ludy_core::fs::FsError::*;
+    anyhow::anyhow!(match e {
+        NotFound => "it is no longer there".to_string(),
+        Exists => "that name is taken".to_string(),
+        NameTooLong => "the name is too long".to_string(),
+        Invalid => "that name cannot be used".to_string(),
+        other => format!("{other:?}"),
+    })
 }
 
 fn open_path(args: &[&str], path: &std::path::Path) {
@@ -195,7 +219,7 @@ impl LudyApp {
         let at = point(px(470.), px(250.));
         match self.demo.as_deref() {
             Some("menu") => self.menu = Some(Menu { at, target: Target::Drive(first) }),
-            Some("share") => self.modal = Some(Modal::Share { drive: first, email: String::new(), edit: false }),
+            Some("key") => self.modal = Some(Modal::DriveKey { drive: first }),
             Some("new-drive") => self.modal = Some(Modal::NewDrive { name: String::new() }),
             Some("entry-menu") => match self.entries.iter().find(|e| !e.is_dir) {
                 Some(e) => self.menu = Some(Menu { at, target: Target::Entry(e.clone()) }),
@@ -209,10 +233,6 @@ impl LudyApp {
 
     fn drive(&self, name: &str) -> Option<&DriveView> {
         self.view.drives.iter().find(|d| d.info.name == name)
-    }
-
-    fn client(&self) -> CloudClient {
-        self.engine.client()
     }
 
     /// The path of a drive (or something in it) in the Finder, when mounted.
@@ -238,14 +258,19 @@ impl LudyApp {
         }
     }
 
-    /// Load the current folder from the cloud.
+    /// Load the current folder from the drive's tree. The first time a
+    /// drive is opened that reads its tree from the server; after that the
+    /// tree is in memory and kept current.
     fn reload(&mut self, cx: &mut Context<Self>) {
         let Screen::Browser { drive, prefix } = self.screen.clone() else { return };
         self.loading = true;
-        let seq = self.drive(&drive).map(|d| d.info.seq).unwrap_or(0);
-        let client = self.client();
+        let engine = self.engine.clone();
         let (d, p) = (drive.clone(), prefix.clone());
-        let task = self.engine.spawn(async move { client.list_folder(&d, &p).await });
+        let task = self.engine.spawn(async move {
+            let fs = engine.open(&d).await?;
+            let rows = fs.readdir(folder_id(&fs, &p)?).map_err(fs_error)?;
+            anyhow::Ok((rows, fs.seq().wrapping_add(fs.sync_token())))
+        });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -254,33 +279,20 @@ impl LudyApp {
                 }
                 this.loading = false;
                 match result {
-                    Ok(Ok(listing)) => {
-                        let mut entries: Vec<Entry> = listing
-                            .prefixes
-                            .iter()
-                            .map(|p| Entry {
-                                name: p[prefix.len()..].trim_end_matches('/').to_string(),
-                                key: p.clone(),
-                                is_dir: true,
-                                size: 0,
-                                mtime_ms: 0,
-                                version: String::new(),
-                                versions: 0,
-                                synthetic: false,
-                            })
-                            .collect();
-                        entries.extend(listing.objects.iter().filter(|o| o.key != prefix).map(|o| Entry {
-                            name: o.key[prefix.len()..].to_string(),
-                            key: o.key.clone(),
-                            is_dir: false,
-                            size: o.size,
-                            mtime_ms: o.mtime_ms,
-                            version: o.version.clone(),
-                            versions: o.versions,
-                            synthetic: o.synthetic,
-                        }));
+                    Ok(Ok((rows, seq))) => {
+                        let entry = |(name, a): &(String, ludy_core::fs::Attr)| Entry {
+                            key: format!("{prefix}{name}{}", if a.is_dir { "/" } else { "" }),
+                            name: name.clone(),
+                            is_dir: a.is_dir,
+                            size: a.size,
+                            mtime_ms: a.mtime_ms,
+                            local_bytes: a.local_bytes,
+                        };
+                        // Folders first, each group by name.
+                        let mut entries: Vec<Entry> = rows.iter().filter(|r| r.1.is_dir).map(entry).collect();
+                        entries.extend(rows.iter().filter(|r| !r.1.is_dir).map(entry));
                         this.entries = entries;
-                        this.loaded_seq = listing.seq.max(seq);
+                        this.loaded_seq = seq;
                     }
                     Ok(Err(e)) => {
                         this.entries.clear();
@@ -297,7 +309,20 @@ impl LudyApp {
         .detach();
     }
 
-    /// Run a cloud operation, then refresh whatever is on screen.
+    /// Change the drive's tree in a folder: a new folder, a rename, a
+    /// delete. The change is made here at once and sent in the background.
+    fn in_folder<F>(&mut self, what: &'static str, cx: &mut Context<Self>, drive: String, prefix: String, op: F)
+    where
+        F: FnOnce(&SealedDrive, u64) -> ludy_core::fs::FsResult<()> + Send + 'static,
+    {
+        let engine = self.engine.clone();
+        self.run(what, cx, async move {
+            let fs = engine.open(&drive).await?;
+            op(&fs, folder_id(&fs, &prefix)?).map_err(fs_error)
+        });
+    }
+
+    /// Run an operation on the engine, then refresh whatever is on screen.
     fn run<F>(&mut self, what: &'static str, cx: &mut Context<Self>, op: F)
     where
         F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
@@ -349,9 +374,8 @@ impl LudyApp {
                 cx.write_to_clipboard(ClipboardItem::new_string(path.display().to_string()));
             }
             ("Rename", Target::Drive(d)) => self.modal = Some(Modal::RenameDrive { name: d.clone(), drive: d }),
-            ("Share drive", Target::Drive(d)) => self.modal = Some(Modal::Share { drive: d, email: String::new(), edit: false }),
-            ("Fork drive", Target::Drive(d)) => self.modal = Some(Modal::ForkDrive { name: format!("{d}-fork"), drive: d }),
-            ("Delete drive", Target::Drive(d)) => self.modal = Some(Modal::DeleteDrive { drive: d }),
+            ("Copy drive key", Target::Drive(d)) => self.modal = Some(Modal::DriveKey { drive: d }),
+            ("Remove drive", Target::Drive(d)) => self.modal = Some(Modal::RemoveDrive { drive: d }),
 
             ("Open", Target::Entry(e)) if e.is_dir => self.navigate(e.key, cx),
             ("Open", Target::Entry(e)) => match self.local_path(&current_drive, &e.key) {
@@ -373,70 +397,65 @@ impl LudyApp {
             ("Rename", Target::Entry(e)) => self.modal = Some(Modal::RenameEntry { name: e.name.clone(), entry: e }),
             ("Delete", Target::Entry(e)) => self.modal = Some(Modal::DeleteEntry { entry: e }),
             ("Versions", Target::Entry(e)) => {
-                let (client, drive, key) = (self.client(), current_drive.clone(), e.key.clone());
+                let (engine, drive, key) = (self.engine.clone(), current_drive.clone(), e.key.clone());
                 self.modal = Some(Modal::Versions { entry: e, versions: None });
-                let task = self.engine.spawn(async move { client.versions(&drive, &key).await });
+                let task = self.engine.spawn(async move {
+                    let fs = engine.open(&drive).await?;
+                    let id = fs.find_path(&key).ok_or_else(|| anyhow::anyhow!("the file is no longer there"))?;
+                    fs.versions(id).await
+                });
                 cx.spawn(async move |this, cx| {
                     let result = task.await;
                     let _ = this.update(cx, |this, cx| {
-                        if let (Some(Modal::Versions { versions, .. }), Ok(Ok(list))) = (&mut this.modal, result) {
-                            *versions = Some(list);
+                        match (&mut this.modal, result) {
+                            (Some(Modal::Versions { versions, .. }), Ok(Ok(list))) => *versions = Some(list),
+                            (Some(Modal::Versions { .. }), Ok(Err(e))) => {
+                                this.modal = None;
+                                this.engine.set_notice(format!("Could not list versions: {e:#}"));
+                            }
+                            _ => {}
                         }
                         cx.notify();
                     });
                 })
                 .detach();
             }
-            ("Keep offline", Target::Entry(e)) | ("Remove offline copy", Target::Entry(e)) => self.toggle_pin(&current_drive, &e, cx),
             _ => {}
         }
         window.focus(&self.focus);
         cx.notify();
     }
 
-    /// Pin: download every block of the file and exempt it from eviction.
-    fn toggle_pin(&mut self, drive: &str, e: &Entry, cx: &mut Context<Self>) {
-        let cache = self.engine.cache();
-        let version: Arc<str> = e.version.as_str().into();
-        if cache.is_pinned(&version) {
-            cache.set_pinned(&version, false);
-            return;
-        }
-        cache.set_pinned(&version, true);
-        let (client, drive, key, size) = (self.client(), drive.to_string(), e.key.clone(), e.size);
-        self.run("Keep offline", cx, async move {
-            use ludy_core::cache::BLOCK_SIZE;
-            let mut idx = 0;
-            while idx * BLOCK_SIZE < size {
-                if !cache.contains(&version, idx) {
-                    let start = idx * BLOCK_SIZE;
-                    let data = client.get_range(&drive, &key, &version, start, BLOCK_SIZE.min(size - start)).await?;
-                    cache.put(&version, idx, &data)?;
-                }
-                idx += 1;
-            }
-            Ok(())
-        });
-    }
-
+    /// Copy files and folders from this Mac into the open folder. They go
+    /// into the drive's journal first and upload in the background.
     fn import(&mut self, cx: &mut Context<Self>) {
         let Screen::Browser { drive, prefix } = self.screen.clone() else { return };
-        let picked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: Some("Import".into()) });
-        let client = self.client();
+        let picked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: true, multiple: true, prompt: Some("Import".into()) });
         let engine = self.engine.clone();
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(paths))) = picked.await else { return };
-            let task = engine.spawn(async move {
-                for path in paths {
-                    let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
-                    client.put_file(&drive, &format!("{prefix}{name}"), &path).await?;
+            let task = engine.spawn({
+                let engine = engine.clone();
+                async move {
+                    let fs = engine.open(&drive).await?;
+                    let dir = folder_id(&fs, &prefix)?;
+                    engine
+                        .spawn_blocking(move || {
+                            for path in paths {
+                                let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+                                transfer::copy_tree_in(&fs, dir, name, &path)?;
+                            }
+                            anyhow::Ok(())
+                        })
+                        .await?
                 }
-                anyhow::Ok(())
             });
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
-                if let Ok(Err(e)) = result {
-                    this.engine.set_notice(format!("Import failed: {e:#}"));
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => this.engine.set_notice(format!("Import failed: {e:#}")),
+                    Err(e) => this.engine.set_notice(format!("Import failed: {e}")),
                 }
                 this.engine.refresh_drives();
                 this.reload(cx);
@@ -447,58 +466,66 @@ impl LudyApp {
 
     fn submit_modal(&mut self, cx: &mut Context<Self>) {
         let Some(modal) = self.modal.take() else { return };
-        let client = self.client();
+        let engine = self.engine.clone();
         let current = match &self.screen {
             Screen::Browser { drive, prefix } => Some((drive.clone(), prefix.clone())),
             Screen::Drives => None,
         };
+        let showing = |drive: &str| current.as_ref().is_some_and(|(d, _)| d == drive);
         match modal {
             Modal::NewDrive { name } if !name.trim().is_empty() => {
                 let name = name.trim().to_string();
-                self.run("Create drive", cx, async move { client.create_drive(&name).await });
+                self.run("Create drive", cx, async move { engine.create_drive(&name).await });
+            }
+            Modal::AddDrive { key } if !key.trim().is_empty() => {
+                self.run("Add drive", cx, async move { engine.import_drive(key.trim(), None).await.map(|_| ()) });
             }
             Modal::RenameDrive { drive, name } if !name.trim().is_empty() && name.trim() != drive => {
                 if self.drive(&drive).is_some_and(|d| d.mount.is_some()) {
                     self.engine.set_notice(format!("Eject {drive} before renaming it."));
                 } else {
-                    let name = name.trim().to_string();
-                    self.run("Rename drive", cx, async move { client.rename_drive(&drive, &name).await });
-                }
-            }
-            Modal::ForkDrive { drive, name } if !name.trim().is_empty() => {
-                let name = name.trim().to_string();
-                self.run("Fork drive", cx, async move { client.fork_drive(&drive, &name).await });
-            }
-            Modal::DeleteDrive { drive } => {
-                if self.drive(&drive).is_some_and(|d| d.mount.is_some()) {
-                    self.engine.set_notice(format!("Eject {drive} before deleting it."));
-                } else {
-                    if self.screen == (Screen::Browser { drive: drive.clone(), prefix: String::new() }) || current.as_ref().is_some_and(|(d, _)| *d == drive) {
+                    if showing(&drive) {
                         self.screen = Screen::Drives;
                     }
-                    self.run("Delete drive", cx, async move { client.delete_drive(&drive).await });
+                    let name = name.trim().to_string();
+                    self.run("Rename drive", cx, async move { engine.rename_drive(&drive, &name).await });
                 }
             }
-            Modal::Share { drive, email, edit } if email.contains('@') => {
-                let role = if edit { "edit" } else { "view" };
-                self.run("Share", cx, async move { client.share_drive(&drive, email.trim(), role).await });
+            Modal::RemoveDrive { drive } => {
+                if self.drive(&drive).is_some_and(|d| d.mount.is_some()) {
+                    self.engine.set_notice(format!("Eject {drive} before removing it."));
+                } else {
+                    if showing(&drive) {
+                        self.screen = Screen::Drives;
+                    }
+                    self.run("Remove drive", cx, async move { engine.forget_drive(&drive).await });
+                }
             }
+            Modal::DriveKey { drive } => match self.engine.export_drive(&drive) {
+                Ok(key) => {
+                    cx.write_to_clipboard(ClipboardItem::new_string(key));
+                    self.engine.set_notice(format!("The key of {drive} is on the clipboard. Whoever has it can read and change the whole drive."));
+                }
+                Err(e) => self.engine.set_notice(format!("Could not copy the key: {e:#}")),
+            },
             Modal::NewFolder { name } if !name.trim().is_empty() => {
                 if let Some((drive, prefix)) = current {
-                    let key = format!("{prefix}{}/", name.trim());
-                    self.run("New folder", cx, async move { client.put_bytes(&drive, &key, Vec::new().into()).await.map(|_| ()) });
+                    let name = name.trim().to_string();
+                    self.in_folder("New folder", cx, drive, prefix, move |fs, dir| fs.mkdir(dir, &name).map(|_| ()));
                 }
             }
             Modal::RenameEntry { entry, name } if !name.trim().is_empty() && name.trim() != entry.name => {
                 if let Some((drive, prefix)) = current {
-                    let to = format!("{prefix}{}", name.trim());
-                    let from = entry.key.trim_end_matches('/').to_string();
-                    self.run("Rename", cx, async move { client.rename(&drive, &from, &to).await.map(|_| ()) });
+                    let to = name.trim().to_string();
+                    self.in_folder("Rename", cx, drive, prefix, move |fs, dir| match fs.lookup(dir, &to) {
+                        Ok(_) => Err(ludy_core::fs::FsError::Exists),
+                        Err(_) => fs.rename(dir, &entry.name, dir, &to),
+                    });
                 }
             }
             Modal::DeleteEntry { entry } => {
-                if let Some((drive, _)) = current {
-                    self.run("Delete", cx, async move { client.delete(&drive, &entry.key).await });
+                if let Some((drive, prefix)) = current {
+                    self.in_folder("Delete", cx, drive, prefix, move |fs, dir| fs.remove_tree(dir, &entry.name));
                 }
             }
             _ => {}
@@ -506,11 +533,15 @@ impl LudyApp {
         cx.notify();
     }
 
-    fn restore(&mut self, entry: &Entry, version: String, cx: &mut Context<Self>) {
+    fn restore(&mut self, entry: &Entry, version: u64, cx: &mut Context<Self>) {
         let Screen::Browser { drive, .. } = self.screen.clone() else { return };
-        let (client, key) = (self.client(), entry.key.clone());
+        let (engine, key) = (self.engine.clone(), entry.key.clone());
         self.modal = None;
-        self.run("Restore", cx, async move { client.restore(&drive, &key, &version).await.map(|_| ()) });
+        self.run("Restore", cx, async move {
+            let fs = engine.open(&drive).await?;
+            let id = fs.find_path(&key).ok_or_else(|| anyhow::anyhow!("the file is no longer there"))?;
+            fs.restore(id, version).await
+        });
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {

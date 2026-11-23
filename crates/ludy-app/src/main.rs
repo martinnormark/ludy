@@ -4,14 +4,15 @@
 //!
 //! `--mount` mounts a drive at launch; `--open` starts in the file browser,
 //! `--list` in its list view. For checking the app without a hand on the
-//! mouse: `--demo menu|entry-menu|share|new-drive` opens that surface, and
+//! mouse: `--demo menu|entry-menu|key|new-drive` opens that surface, and
 //! `--perf` scrolls the open folder by itself and prints frame times.
 //! `--click X,Y` (also `--rclick`, `--dclick`; repeatable, window points)
 //! posts mouse events to the app's own window, and `--size WxH` sets the
 //! window size.
 //!
 //! Configuration comes from the environment (see `EngineConfig::from_env`):
-//! `LUDY_SERVER` (default http://127.0.0.1:9000), `LUDY_CACHE_MB`,
+//! `LUDY_SERVER` (default http://127.0.0.1:8080, where `docker compose up`
+//! answers), `LUDY_HOME`, `LUDY_CACHE_MB`, `LUDY_CACHE_DIR`,
 //! `LUDY_MOUNT_ROOT` (default ~/Ludy), `LUDY_READ_ONLY`, `LUDY_NOBROWSE`.
 
 mod assets;
@@ -58,7 +59,7 @@ fn main() {
                 window_size = s.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))).unwrap_or(window_size);
             }
             "-h" | "--help" => {
-                println!("usage: ludy-app [--mount DRIVE]... [--open DRIVE[/FOLDER]] [--list]\n\nStart the simulated cloud first: cargo run -p ludy-cloud");
+                println!("usage: ludy-app [--mount DRIVE]... [--open DRIVE[/FOLDER]] [--list]\n\nStart the server first: docker compose up -d --wait\nIt is looked for at $LUDY_SERVER (default http://127.0.0.1:8080).");
                 return;
             }
             other => {

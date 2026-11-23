@@ -1,6 +1,6 @@
 [package]
 name = "ludy-core"
-description = "Ludy's engine: cloud client, block cache, drive filesystem; with the `mount` feature, the loopback NFS mount"
+description = "Ludy's engine: server client, block cache, end-to-end encrypted drive filesystem, keystore; with the `mount` feature, the loopback NFS mount"
 version.workspace = true
 edition.workspace = true
 
@@ -8,7 +8,7 @@ edition.workspace = true
 default = ["mount"]
 # The macOS side: the loopback NFS server, mounting it, and the desktop
 # `Engine` that owns the mounts. Without it the crate is the portable part
-# (client, cache, drive filesystem, patch planner) and builds no NFS code.
+# (client, cache, drive filesystem, keystore, patch planner) and builds no NFS code.
 mount = ["dep:nfsserve", "dep:async-trait", "dep:libc"]
 
 [dependencies]
@@ -17,7 +17,8 @@ nfsserve = { version = "0.11", optional = true }
 async-trait = { version = "0.1", optional = true }
 libc = { version = "0.2", optional = true }
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["stream", "json"] }
+# TLS with the system's trusted roots, for a server behind HTTPS.
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls-native-roots"] }
 futures-util = "0.3"
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
@@ -29,5 +30,4 @@ getrandom = "0.2"
 [dev-dependencies]
 # The Worker chaos tests signal the process group they start.
 libc = "0.2"
-ludy-cloud = { path = "../ludy-cloud" }
 tempfile = "3"
