@@ -131,7 +131,7 @@ Each line is something the chaos suites would catch if it were false.
 | Nothing in the middle | The code inside does not wait | The runtime hands an actor its HTTP requests one at a time (seen: a request waited for a slow one before it). The collector comes in beside them as a scheduled action; a transaction takes the actor's SQL exclusively and a plain statement waits for it, which is read from Rivet's source and not from a test that produced the overlap |
 | Durable before answering | The platform | The engine has it on disk before a statement is answered. Seen: 80 writes answered before four `kill -9` of the engine were all there afterwards, and every commit of the soaks |
 | Timer | Alarm | `schedule.at`, one event named `collect`; set again when an actor starts, and five seconds after a run that failed, because Rivet does not retry a failed schedule |
-| Blob store | R2 binding | A folder or any S3, through the `object_store` crate |
+| Blob store | R2 binding | A folder or any S3, through the `object_store` crate. Every call to it has a limit, and a store that does not answer is a 503 ([the provider's README](../../providers/rivet/README.md#when-the-blob-store-does-not-answer)) |
 | Upload check | R2, given the SHA-256 | The front hashes the body |
 | HTTP front | The Worker | `axum`, in the same process as the actors |
 

@@ -13,6 +13,12 @@
 //! The type is still called [`Worker`]: the suites were written against the
 //! Cloudflare Worker, and they are the conformance test for every provider.
 //!
+//! On Rivet the server keeps its blobs in a folder of the rig's own. With
+//! `LUDY_RIG_S3_BUCKET` set it keeps them in that bucket instead (see
+//! [`s3_store`]), reached through [`StoreProxy`], which the suites use to
+//! take the store away. `scripts/chaos-r2.sh` sets these; nothing else does,
+//! so an ordinary run never touches anyone's bucket.
+//!
 //! Everything the rig starts is in a process group of its own, on ports of
 //! its own, with its state in a temporary folder, and it signals nothing
 //! else. A Rivet engine container is named `ludy-rig-<port>` and removed
@@ -117,6 +123,33 @@ pub fn available() -> bool {
     }
 }
 
+/// A bucket for the Rivet server's blobs, from the environment:
+/// `LUDY_RIG_S3_BUCKET`, `LUDY_RIG_S3_ENDPOINT` (an `https://` address),
+/// `LUDY_RIG_S3_KEY_ID`, `LUDY_RIG_S3_SECRET`, and `LUDY_RIG_S3_REGION`
+/// (`auto` if not given). `None`, the usual case: a folder.
+struct S3 {
+    bucket: String,
+    endpoint: String,
+    key_id: String,
+    secret: String,
+    region: String,
+}
+
+fn s3_store() -> Option<S3> {
+    let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    let bucket = var("LUDY_RIG_S3_BUCKET")?;
+    assert_eq!(provider(), Provider::Rivet, "LUDY_RIG_S3_BUCKET is for LUDY_PROVIDER=rivet: the Worker under wrangler dev has its own emulated R2");
+    let need = |name: &str| var(name).unwrap_or_else(|| panic!("LUDY_RIG_S3_BUCKET is set, so {name} must be too"));
+    let endpoint = need("LUDY_RIG_S3_ENDPOINT");
+    assert!(endpoint.starts_with("https://"), "LUDY_RIG_S3_ENDPOINT must be https: the store proxy tunnels TLS and nothing else");
+    Some(S3 { bucket, endpoint, key_id: need("LUDY_RIG_S3_KEY_ID"), secret: need("LUDY_RIG_S3_SECRET"), region: var("LUDY_RIG_S3_REGION").unwrap_or_else(|| "auto".into()) })
+}
+
+/// Whether this run keeps the server's blobs in a real bucket.
+pub fn store_is_remote() -> bool {
+    std::env::var("LUDY_RIG_S3_BUCKET").is_ok_and(|v| !v.is_empty())
+}
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
@@ -138,6 +171,9 @@ pub struct Worker {
     child: Option<Child>,
     /// Only with the Rivet provider.
     engine: Option<Engine>,
+    s3: Option<S3>,
+    /// Between the server and its bucket, when the blobs are in one.
+    pub store: Option<StoreProxy>,
     /// How long each start took, in milliseconds.
     pub starts: Vec<u64>,
     pub kills: u32,
@@ -153,7 +189,12 @@ impl Worker {
     pub async fn start_with(vars: Vec<(String, String)>) -> Worker {
         let port = free_port();
         let engine = (provider() == Provider::Rivet).then(|| Engine { name: format!("ludy-rig-{port}"), port: free_port(), created: false });
-        let mut w = Worker { dir: tempfile::tempdir().unwrap(), port, inspector: free_port(), vars, child: None, engine, starts: vec![], kills: 0 };
+        let s3 = s3_store();
+        let store = match &s3 {
+            Some(_) => Some(StoreProxy::start().await),
+            None => None,
+        };
+        let mut w = Worker { dir: tempfile::tempdir().unwrap(), port, inspector: free_port(), vars, child: None, engine, s3, store, starts: vec![], kills: 0 };
         w.boot().await;
         w
     }
@@ -190,6 +231,15 @@ impl Worker {
             // Without the two the harness sets, the server must behave as it does for anyone.
             .env_remove("LUDY_DEV")
             .env_remove("GC_GRACE_MS");
+        if let (Some(s3), Some(store)) = (&self.s3, &self.store) {
+            cmd.env("LUDY_BLOBS", format!("s3://{}", s3.bucket))
+                .env("AWS_ENDPOINT", &s3.endpoint)
+                .env("AWS_ACCESS_KEY_ID", &s3.key_id)
+                .env("AWS_SECRET_ACCESS_KEY", &s3.secret)
+                .env("AWS_REGION", &s3.region)
+                // Every connection to the bucket goes through the rig.
+                .env("AWS_PROXY_URL", store.url());
+        }
         for (k, v) in &self.vars {
             cmd.env(k, v);
         }
@@ -336,6 +386,13 @@ impl Drop for Worker {
         if std::thread::panicking() {
             eprintln!("--- the end of the server's log ---\n{}", tail(&self.log(), 60));
         }
+        // The log names every drive this server was asked about. A run
+        // against a real bucket keeps it, to clean up by and to look at.
+        if let Ok(keep) = std::env::var("LUDY_RIG_LOG_DIR") {
+            let name = format!("server-{}-{}.log", self.port, ludy_proto::now_ms());
+            let _ = std::fs::create_dir_all(&keep);
+            let _ = std::fs::copy(self.log_path(), PathBuf::from(keep).join(name));
+        }
     }
 }
 
@@ -370,6 +427,226 @@ pub fn log_count(log: &str, event: &str, outcome: Option<&str>) -> usize {
     let event = format!("\"t\":\"{event}\"");
     let outcome = outcome.map(|o| format!("\"outcome\":\"{o}\""));
     log.lines().filter(|l| l.contains(&event) && outcome.as_ref().is_none_or(|o| l.contains(o))).count()
+}
+
+// -------------------------------------------------- the store's proxy
+
+/// What stands between the server and its bucket: an HTTP proxy the
+/// server's S3 client is told to use. The client asks it to `CONNECT` to
+/// the bucket and speaks TLS through the tunnel, so the proxy sees no
+/// request, only bytes, and what it can do to them is what a network does:
+/// refuse the connection, carry nothing while holding it open, or cut it.
+///
+/// The S3 client keeps its connections, so a fault has to reach tunnels
+/// that are already open: every tunnel checks the switches before each
+/// piece it carries.
+pub struct StoreProxy {
+    pub addr: SocketAddr,
+    pub faults: Arc<StoreFaults>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+const STORE_PASS: u32 = 0;
+const STORE_REFUSE: u32 = 1;
+const STORE_STALL: u32 = 2;
+
+#[derive(Default)]
+pub struct StoreFaults {
+    /// Every spell of weather a soak asked for: what, and for how long.
+    spells: Mutex<Vec<(&'static str, u64)>>,
+    mode: AtomicU32,
+    /// Raised to end every tunnel that is open.
+    cut: AtomicU64,
+    pub connections: AtomicU64,
+    pub refused: AtomicU64,
+    pub cuts: AtomicU64,
+    pub bytes_up: AtomicU64,
+    pub bytes_down: AtomicU64,
+}
+
+impl StoreProxy {
+    pub async fn start() -> StoreProxy {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let faults = Arc::new(StoreFaults::default());
+        let shared = faults.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((conn, _)) = listener.accept().await else { break };
+                tokio::spawn(tunnel(conn, shared.clone()));
+            }
+        });
+        StoreProxy { addr, faults, task }
+    }
+
+    pub fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    /// The store is reachable again.
+    pub fn pass(&self) {
+        self.faults.mode.store(STORE_PASS, Ordering::SeqCst);
+    }
+
+    /// The store is gone: open connections end, new ones are turned away.
+    pub fn refuse(&self) {
+        self.faults.mode.store(STORE_REFUSE, Ordering::SeqCst);
+        self.faults.cut.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The store says nothing: connections stay open and carry no byte.
+    pub fn stall(&self) {
+        self.faults.mode.store(STORE_STALL, Ordering::SeqCst);
+    }
+
+    /// Every open connection to the store ends in the middle of whatever
+    /// it was doing; the next one gets through.
+    pub fn sever(&self) {
+        self.faults.cut.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn connections(&self) -> u64 {
+        self.faults.connections.load(Ordering::SeqCst)
+    }
+
+    /// Let the store back in after `ms`, from the side, while the test
+    /// goes on asking the server for things.
+    pub fn heal_after(&self, ms: u64) -> tokio::task::JoinHandle<()> {
+        let faults = self.faults.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            faults.mode.store(STORE_PASS, Ordering::SeqCst);
+        })
+    }
+
+    /// Some weather for a soak, chosen by two rolls of its dice (`kind`
+    /// below 100, `length` below 1000): the store turns connections away,
+    /// says nothing, or drops what is open, mostly for a second or two,
+    /// sometimes for longer than a client waits (3 s here, 8 s in the
+    /// engine), and now and then for longer than any single request lives.
+    /// Returns what it did and the task that lets the store back in.
+    pub fn weather(&self, kind: u64, length: u64) -> (String, tokio::task::JoinHandle<()>) {
+        let short = 300 + length * 5 / 2;
+        let medium = 4000 + length * 4;
+        let long = 32_000 + length * 6;
+        let (what, ms) = match kind {
+            0..=34 => ("is gone", short),
+            35..=64 => ("says nothing", short),
+            65..=79 => ("drops its connections", 0),
+            80..=89 => ("says nothing", medium),
+            90..=96 => ("is gone", medium),
+            _ => ("says nothing", long),
+        };
+        match what {
+            "is gone" => self.refuse(),
+            "says nothing" => self.stall(),
+            _ => self.sever(),
+        }
+        self.faults.spells.lock().unwrap().push((what, ms));
+        (if ms == 0 { format!("the store {what}") } else { format!("the store {what} for {ms} ms") }, self.heal_after(ms))
+    }
+
+    /// The weather a soak had, for its report: how often each kind, the
+    /// longest of each, and how many spells outlasted 3, 8 and 30 seconds
+    /// (the rig client's patience, the engine's, and a request's life).
+    pub fn weather_report(&self) -> String {
+        let spells = self.faults.spells.lock().unwrap();
+        let of = |what: &str| {
+            let ms: Vec<u64> = spells.iter().filter(|s| s.0 == what).map(|s| s.1).collect();
+            (ms.len(), ms.iter().copied().max().unwrap_or(0))
+        };
+        let (gone, silent, dropped) = (of("is gone"), of("says nothing"), of("drops its connections"));
+        let over = |limit: u64| spells.iter().filter(|s| s.1 > limit).count();
+        format!("gone {} times (longest {} ms), silent {} times (longest {} ms), connections dropped {} times; {} spells over 3 s, {} over 8 s, {} over 30 s", gone.0, gone.1, silent.0, silent.1, dropped.0, over(3000), over(8000), over(30_000))
+    }
+
+    /// One line for a report: what went through and what was done to it.
+    pub fn summary(&self) -> String {
+        let n = |a: &AtomicU64| a.load(Ordering::SeqCst);
+        let f = &self.faults;
+        format!("{} connections, {} turned away, {} cut; {} bytes up, {} down", n(&f.connections), n(&f.refused), n(&f.cuts), n(&f.bytes_up), n(&f.bytes_down))
+    }
+}
+
+/// Cut every open connection to the store, from a task that only holds the switches.
+pub fn faults_sever(faults: &StoreFaults) {
+    faults.cut.fetch_add(1, Ordering::SeqCst);
+}
+
+impl Drop for StoreProxy {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Carry one direction of a tunnel until it ends, the switches say stop,
+/// or the tunnel is cut. Returns whether it was the rig that ended it.
+async fn pump(mut from: tokio::net::tcp::OwnedReadHalf, mut to: tokio::net::tcp::OwnedWriteHalf, faults: Arc<StoreFaults>, born: u64, count: fn(&StoreFaults) -> &AtomicU64) -> bool {
+    use tokio::io::AsyncWriteExt;
+    let ended = |f: &StoreFaults| f.cut.load(Ordering::SeqCst) != born || f.mode.load(Ordering::SeqCst) == STORE_REFUSE;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = tokio::select! {
+            read = from.read(&mut buf) => match read { Ok(n) if n > 0 => n, _ => return false },
+            _ = async { while !ended(&faults) { tokio::time::sleep(Duration::from_millis(10)).await } } => return true,
+        };
+        // A stalled store has the bytes and does nothing with them.
+        while faults.mode.load(Ordering::SeqCst) == STORE_STALL && !ended(&faults) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if ended(&faults) {
+            return true;
+        }
+        if to.write_all(&buf[..n]).await.is_err() {
+            return false;
+        }
+        count(&faults).fetch_add(n as u64, Ordering::Relaxed);
+    }
+}
+
+async fn tunnel(mut client: TcpStream, faults: Arc<StoreFaults>) {
+    use tokio::io::AsyncWriteExt;
+    faults.connections.fetch_add(1, Ordering::SeqCst);
+    let born = faults.cut.load(Ordering::SeqCst);
+    // `CONNECT host:port HTTP/1.1`, some headers, an empty line.
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match client.read(&mut byte).await {
+            Ok(1) if head.len() < 8192 => head.push(byte[0]),
+            _ => return,
+        }
+    }
+    let head = String::from_utf8_lossy(&head).into_owned();
+    let mut words = head.split_whitespace();
+    let (Some("CONNECT"), Some(target)) = (words.next(), words.next()) else {
+        let _ = client.write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n").await;
+        return;
+    };
+    // A store that says nothing does not answer the knock either.
+    while faults.mode.load(Ordering::SeqCst) == STORE_STALL && faults.cut.load(Ordering::SeqCst) == born {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    if faults.mode.load(Ordering::SeqCst) == STORE_REFUSE || faults.cut.load(Ordering::SeqCst) != born {
+        faults.refused.fetch_add(1, Ordering::SeqCst);
+        return;
+    }
+    let Ok(upstream) = TcpStream::connect(target).await else {
+        let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+        return;
+    };
+    if client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.is_err() {
+        return;
+    }
+    let (from_client, to_client) = client.into_split();
+    let (from_upstream, to_upstream) = upstream.into_split();
+    let by_the_rig = tokio::select! {
+        r = pump(from_client, to_upstream, faults.clone(), born, |f| &f.bytes_up) => r,
+        r = pump(from_upstream, to_client, faults.clone(), born, |f| &f.bytes_down) => r,
+    };
+    if by_the_rig {
+        faults.cuts.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 // -------------------------------------------------------------- the proxy
@@ -681,6 +958,41 @@ impl Client {
     pub async fn raw(&self, method: reqwest::Method, path: &str, body: Vec<u8>) -> (u16, Vec<u8>) {
         let resp = self.http.request(method, format!("{}{path}", self.base)).timeout(Duration::from_secs(30)).body(body).send().await.expect("the Worker is up");
         (resp.status().as_u16(), resp.bytes().await.unwrap().to_vec())
+    }
+
+    /// One attempt, no retry, with a limit of its own: the status if an
+    /// answer came within `limit`, and how long that took.
+    pub async fn attempt(&self, method: reqwest::Method, path: &str, body: Option<Vec<u8>>, limit: Duration) -> (Option<u16>, Duration) {
+        let started = Instant::now();
+        let mut req = self.http.request(method, format!("{}{path}", self.base)).timeout(limit);
+        if let Some(body) = body {
+            req = req.body(body);
+        }
+        let status = match req.send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                resp.bytes().await.ok().map(|_| status)
+            }
+            Err(_) => None,
+        };
+        (status, started.elapsed())
+    }
+
+    /// The same, keeping what came back: the status and the body as text.
+    pub async fn attempt_text(&self, method: reqwest::Method, path: &str, body: Option<Vec<u8>>, limit: Duration) -> (Option<(u16, String)>, Duration) {
+        let started = Instant::now();
+        let mut req = self.http.request(method, format!("{}{path}", self.base)).timeout(limit);
+        if let Some(body) = body {
+            req = req.body(body);
+        }
+        let answer = match req.send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                resp.text().await.ok().map(|text| (status, text))
+            }
+            Err(_) => None,
+        };
+        (answer, started.elapsed())
     }
 
     /// One attempt, no retry: for requests that are expected to fail.

@@ -106,7 +106,13 @@ One quick run of `ludy bench` (`--quick`) against it, to see what a store over a
 
 Against the same benchmark with the blobs on the server's own disk ([benchmarks](../evidence/benchmarks.md)): a cold 64 KiB read is 113 ms at the median where it was under 10, a cold sequential read 20 MB/s where it was over 120, and small files upload at 7 a second where they did at about 200. The last is the one to know about before putting many small files in a drive; see [known problems](../known-issues.md#the-engine-and-the-app).
 
-Not tried with R2: the chaos suites, wrong or revoked credentials, a bucket in a jurisdiction, anything larger than the 95 MB video, and what the calls cost.
+Not tried with R2: wrong or revoked credentials, a bucket in a jurisdiction, anything larger than the 95 MB video, and what the calls cost.
+
+### When the bucket does not answer
+
+A bucket can go away, or stay connected and say nothing. The server gives every call to it a limit, 8 seconds for most, and past it answers 503; the app's engine asks again, and writes wait in the Mac's journal meanwhile. While a commit waits for the bucket its drive answers nothing else, for up to those 8 seconds. The limits and what the log shows are in [the provider's README](../../providers/rivet/README.md#when-the-blob-store-does-not-answer).
+
+This was tested against the same bucket, with a proxy between the server and R2 that refuses, stalls and cuts connections, in a loop with the server's processes killed as well: [chaos testing](../evidence/chaos-testing.md#the-store-taken-away). The first runs of it found two faults in the server, a request that waited 107 seconds for a silent bucket and error texts that named the bucket to the client, both fixed.
 
 ## MinIO
 
@@ -120,7 +126,7 @@ Nothing has to be set. [`docker-compose.minio.yml`](../../docker-compose.minio.y
 
 The image is Chainguard's build of MinIO (`cgr.dev/chainguard/minio:latest`); MinIO no longer publishes images of its own on Docker Hub, and Chainguard offers only the `latest` tag for free, so the version is not pinned.
 
-Checked on 2026-11-23: started from nothing in 12 seconds, a drive created, a 24 MiB file and a small folder uploaded, the file downloaded from a second keystore and compared. MinIO's volume held 15 shards and 3 manifests for the drive, 27 MB, and the server's own blob volume stayed empty. On 2026-11-22 the collector's deletes and a `kill -9` of the containers were tried on this path as well. The chaos suites have not run with MinIO.
+Checked on 2026-11-23: started from nothing in 12 seconds, a drive created, a 24 MiB file and a small folder uploaded, the file downloaded from a second keystore and compared. MinIO's volume held 15 shards and 3 manifests for the drive, 27 MB, and the server's own blob volume stayed empty. Done again the same day with the server built from the checkout, after its store limits went in; with MinIO's container stopped, an upload was answered 503 after 0.9 seconds. On 2026-11-22 the collector's deletes and a `kill -9` of the containers were tried on this path as well. The chaos suites have not run with MinIO.
 
 ## Another S3
 
@@ -146,4 +152,4 @@ With `AWS_ENDPOINT` set, the bucket goes in the path, which R2 and MinIO want. T
 | MinIO under Compose | Yes, as above |
 | R2 under Compose | Yes, by hand against a real bucket, as [above](#what-was-seen-with-r2) |
 | Any other S3 | No |
-| The chaos suites with a bucket | No. They run with a folder |
+| The chaos suites with a bucket | R2: yes, in a loop with the bucket itself taken away ([chaos testing](../evidence/chaos-testing.md#the-store-taken-away)). MinIO and any other S3: no |

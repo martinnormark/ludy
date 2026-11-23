@@ -2,18 +2,19 @@
 
 What is expected to break, what is fragile, what nobody has checked, what is not built, and the decisions still open, for every part of Ludy: the engine and the app on the Mac, the encryption format, the server's logic and its two providers. What was checked, and how, is in [what works](evidence/verification.md) and [chaos testing](evidence/chaos-testing.md). Nothing here has been deployed anywhere: every result is from one Mac with the server on it, and the only thing reached over a real network was an R2 bucket.
 
-State of the tests on 2026-11-23, one run of each, after the app moved to this engine. Cloudflare means local `wrangler dev` 4.166.0; Rivet means `ludy-rivet` beside a `rivetdev/engine:3.1.1` container, both killed at each `kill -9`.
+State of the tests on 2026-11-23, one run of each with the blobs in a folder, after the app moved to this engine and after the fixes the bucket led to. Cloudflare means local `wrangler dev` 4.166.0; Rivet means `ludy-rivet` beside a `rivetdev/engine:3.1.1` container, both killed at each `kill -9`.
 
 | Suite | Cloudflare | Rivet |
 |---|---|---|
 | `cargo test` (no server): 80 tests | pass | |
-| The server under chaos: 12 scenarios and a soak | 13 pass, 148 s; soak seed 51220, 10 kills | 13 pass, 339 s; soak seed 52453, 18 kills |
-| The engine under chaos: 17 scenarios and a soak | 18 pass, 306 s; soak seed 88292, 5 kills of the server, 16 of the app | 18 pass, 308 s; soak seed 38116, 9 kills of the server, 12 of the app |
+| The server under chaos: 12 scenarios and a soak | 13 pass, 168 s; soak seed 19199, 9 kills | 13 pass, 259 s; soak seed 97809, 9 kills |
+| The engine under chaos: 17 scenarios and a soak | 18 pass, 222 s; soak seed 50895, 11 kills of the server, 7 of the app | 18 pass, 258 s; soak seed 76092, 6 kills of the server, 7 of the app |
 | Chaos on a real mount (`scripts/chaos-mount.sh`) | not run | pass, once, under Compose |
+| Everything above with the blobs in a real R2 bucket and the bucket taken away as well (`scripts/chaos-r2.sh`, four rounds) | does not apply | 14 legs pass: [chaos testing](evidence/chaos-testing.md#state) |
 
 More soak seeds were run on 2026-11-22, before this move: 16 of the server's and 8 of the engine's on Cloudflare, 8 and 7 on Rivet, one of which failed its log check ([below](#the-rivet-provider)). The tables are in [`bench/2026-11-22-providers-chaos.md`](../bench/2026-11-22-providers-chaos.md).
 
-Nothing has run on Cloudflare's Workers, or on a Rivet engine of more than one instance. The Rivet provider was run against a real Cloudflare R2 bucket by hand (2026-11-23); the suites were not.
+Nothing has run on Cloudflare's Workers, or on a Rivet engine of more than one instance. The Rivet provider was run against a real Cloudflare R2 bucket by hand and under the chaos suites (2026-11-23).
 
 ## Known problems
 
@@ -54,6 +55,8 @@ A fix is small: cap `/missing` at the commit's limit, and make that limit a sett
 - **A mount whose process was killed stays in the mount table until something touches it.** The mounts are soft with a 45-second dead timeout, but the kernel only starts that clock on a request: on 2026-11-23 an untouched dead mount was still listed three minutes after `kill -9`, and was gone 50 seconds after one `ls`. The app removes such leftovers when it next starts.
 - **Notices are lost in a crash.** What the engine has to tell the person (a file kept under another name, a change it had to drop) is held in memory until the app or `ludy mount` shows it. The app shows the latest one only.
 - **"On this Mac" is blank for a file this session has not read.** The app learns how much of a file is cached from its manifest, which it fetches on the first read.
+- **A commit waiting for a silent bucket holds its drive.** A drive handles one request at a time, and a commit that names blobs the drive has not seen asks the store about them from inside the drive. If the bucket stays connected and says nothing, that commit holds the drive for up to 8 seconds before it fails, and the drive's feed and every other request wait behind it; a client that keeps retrying the commit keeps the drive busy for most of an outage. Seen: the feed answered after 7.7 s (2026-11-23). Other drives are not affected. Doing the lookups outside the drive would fix it.
+- **An upload to the bucket slower than 250 KB a second fails for ever.** The server gives an upload 8 seconds plus one for every 250 KB, so that a silent bucket is noticed. A server whose link to its bucket is slower than that will time out on a large shard every time, the engine will send it again, and the file will never finish. The numbers are constants in [`blobs.rs`](../providers/rivet/src/blobs.rs), not settings.
 - **Small files are slow when the store is far away.** With the blobs in R2, 500 files of 4 KiB took 74.5 s to upload, 7 a second, against about 200 a second with the blobs on the server's own disk (2026-11-23, one run). Each file is five requests, and the server asks the store about or writes to it in four of them. Batching would be the fix and is [not built](#not-built).
 - **`ludy bench` leaves a drive behind on every run.** It empties the drive at the end; the empty drive stays, because nothing deletes a drive.
 
@@ -98,7 +101,7 @@ A fix is small: cap `/missing` at the commit's limit, and make that limit a sett
 
 ### Rivet
 
-- **The chaos suites with a bucket.** They run with a folder. R2 and MinIO as the store were tried by hand under Compose ([object storage](hosting/object-storage.md#what-was-checked)): upload, read, range read, the lookups of a commit, a `kill -9` of the containers, and the collector's deletes. Not tried with either: the store refusing or timing out in the middle of an upload, wrong credentials, a bucket in an R2 jurisdiction, a file larger than 95 MB.
+- **A bucket that fails in ways a network cannot.** The chaos suites run against R2 with the bucket refusing, silent and cut off ([chaos testing](evidence/chaos-testing.md#the-store-taken-away)). The proxy that does it sees only encrypted bytes, so it cannot fail one request and pass another, and it cannot make the store answer wrongly: an error status from R2 itself, throttling, one object that will not delete, wrong or revoked credentials. Also not tried: a bucket in an R2 jurisdiction, a file larger than 95 MB, MinIO or any other S3 under the suites.
 - **Requests near the size limits through the engine's gateway.** A commit of 100,000 shard names is about 6.7 MB. One request that size was tried: a `/missing` question about 100,000 shards, 6.8 MB up and 6.7 MB back, answered in 7.3 s with a folder and 11.8 s with MinIO. A commit that size was not.
 - **A frozen server.** The soaks stop the server for up to 4.5 s, longer than the two seconds after which the rig's engine gives its actors away, and thaw it again; every run passed. Whether a thawed server can still write to a drive the engine has started elsewhere was not looked at directly, and with one node there is no elsewhere.
 - **Only the engine dying, or only the server.** The suites kill both together. One soak of each suite was run each way (`LUDY_RIVET_KILL=server`, `engine`) and passed; the twelve scenarios were not.

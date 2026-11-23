@@ -20,6 +20,15 @@
 # and other apps leave it alone. Needs Docker running and a release build:
 #   cargo build --release -p ludy-cli
 # At the end the server's containers and volumes are removed.
+#
+# CHAOS_MOUNT_BUILD=1 builds the server's image from the checkout first
+# (minutes, the first time), so that what is tested is the source here.
+#
+# CHAOS_MOUNT_STORE=r2 (or minio) adds docker-compose.r2.yml (or .minio.yml),
+# so the server keeps its blobs there. With r2 the settings come from .env,
+# and the blobs stay in the bucket when the containers go: the drive's id
+# is written to the file LUDY_CHAOS_DRIVE_LOG names, for
+# `scripts/s3-drives.py clean` to remove them by.
 set -eu
 WORK="${1:?usage: chaos-mount.sh <work-dir> [files] [copy-MiB] [port]}"
 FILES="${2:-2000}"
@@ -38,7 +47,12 @@ for d in home cache home2 cache2 src out; do rm -rf "${WORK:?}/$d"; done
 mkdir -p "$WORK/mnt" "$WORK/src"
 
 say() { printf '%s  %s\n' "$(date +%H:%M:%S)" "$*"; }
-compose() { docker compose -p "$PROJECT" -f "$HERE/docker-compose.yml" "$@"; }
+case "${CHAOS_MOUNT_STORE:-volume}" in
+  volume) STORE_FILE="" ;;
+  r2|minio) STORE_FILE="$HERE/docker-compose.$CHAOS_MOUNT_STORE.yml" ;;
+  *) echo "CHAOS_MOUNT_STORE is volume, r2 or minio"; exit 2 ;;
+esac
+compose() { docker compose -p "$PROJECT" -f "$HERE/docker-compose.yml" ${STORE_FILE:+-f "$STORE_FILE"} "$@"; }
 # The Mac that mounts, and a second one that only checks.
 mac()   { LUDY_HOME="$WORK/home"  LUDY_CACHE_DIR="$WORK/cache"  LUDY_CACHE_MB=300 "$LUDY" "$@"; }
 other() { LUDY_HOME="$WORK/home2" LUDY_CACHE_DIR="$WORK/cache2" LUDY_CACHE_MB=300 "$LUDY" "$@"; }
@@ -134,8 +148,14 @@ verify() {
 }
 
 say "start a server of its own on port $PORT, make a drive, mount it (hidden) at $MNT"
+# CHAOS_MOUNT_BUILD=1: the server from this checkout, not the published image.
+if [ "${CHAOS_MOUNT_BUILD:-0}" = 1 ]; then compose build ludy >> "$WORK/server.log" 2>&1; fi
 server_up
 mac mkdrive Chaos > /dev/null
+if [ -n "${LUDY_CHAOS_DRIVE_LOG:-}" ]; then
+  mkdir -p "$(dirname "$LUDY_CHAOS_DRIVE_LOG")"
+  echo "/drives/$(mac drives | awk '$1 == "Chaos" {print $2}')" >> "$LUDY_CHAOS_DRIVE_LOG"
+fi
 other add "$(mac key Chaos)" > /dev/null
 start_mount; wait_mounted
 

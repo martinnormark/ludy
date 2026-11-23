@@ -35,6 +35,13 @@ pub const OURS: &str = "x-ludy-drive";
 /// After a collector run that failed, try again this much later.
 const RETRY_MS: u64 = 5_000;
 
+/// The store failed under a drive. The log gets what it said; the fault,
+/// which travels to whoever sent the request, only says that it happened.
+fn store_fault(what: &str, key: &str, e: anyhow::Error, started: u64) -> Fault {
+    crate::store_trouble(what, key, &format!("{e:#}"), crate::now_ms().saturating_sub(started));
+    Fault(crate::STORE_AWAY.trim_end().to_string())
+}
+
 fn fault(e: impl std::fmt::Display) -> Fault {
     Fault(format!("{e:#}"))
 }
@@ -168,11 +175,13 @@ impl Platform for Rivet {
     }
 
     async fn blob_exists(&self, key: &str) -> Result<bool, Fault> {
-        self.env.blobs.exists(key).await.map_err(fault)
+        let started = crate::now_ms();
+        self.env.blobs.exists(key).await.map_err(|e| store_fault("lookup", key, e, started))
     }
 
     async fn blob_delete(&self, key: &str) -> Result<(), Fault> {
-        self.env.blobs.delete(key).await.map_err(fault)
+        let started = crate::now_ms();
+        self.env.blobs.delete(key).await.map_err(|e| store_fault("delete", key, e, started))
     }
 
     async fn timer(&self) -> Result<Option<u64>, Fault> {
@@ -256,7 +265,10 @@ impl Actor for DriveActor {
             Err(f) => {
                 let ms = crate::now_ms().saturating_sub(started);
                 crate::log(&ludy_server::log_line("fault", "", &[("method", method.into()), ("path", path.into()), ("error", f.0.clone().into()), ("ms", ms.into())]));
-                response(500, "text/plain; charset=utf-8", f.0.into_bytes())
+                // The store not answering is the one fault with a status of
+                // its own, the same one the front gives for it.
+                let status = if f.0 == crate::STORE_AWAY.trim_end() { 503 } else { 500 };
+                response(status, "text/plain; charset=utf-8", f.0.into_bytes())
             }
         }
     }

@@ -12,7 +12,7 @@ Where each part of Ludy stands on 2026-11-23, and where its lists of limits are 
 | The server's logic | Built. Tested by itself on SQLite in memory, with storage made to fail | [The server](how-it-works/server.md) |
 | The Rivet provider (Docker Compose) | Built. Passes both chaos suites. One machine only | [Hosting](hosting/compose.md) |
 | The Cloudflare provider | Built. Passes both chaos suites under `wrangler dev`. Never deployed | [Hosting](hosting/cloudflare.md) |
-| R2 as the store under Compose | Works against a real bucket: uploads, range reads, a mount, a kill of the server, the collector's deletes. The chaos suites have not run with it | [Hosting](hosting/object-storage.md#cloudflare-r2) |
+| R2 as the store under Compose | Works against a real bucket, by hand and under the chaos suites in a loop, with the bucket itself made to refuse, go silent and drop connections | [Hosting](hosting/object-storage.md#cloudflare-r2), [chaos testing](evidence/chaos-testing.md#the-store-taken-away) |
 | The encryption format | Version 1. Checked against a second implementation by the same author; reviewed by nobody else | [Encryption](how-it-works/encryption.md) |
 | Sign-in, sharing | Not built. A drive is opened by a key kept in a file on the Mac | [Not built](known-issues.md#not-built) |
 

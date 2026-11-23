@@ -1016,8 +1016,19 @@ async fn soak() {
     let mut trace: Vec<String> = Vec::new();
     let mut thaw: Option<tokio::task::JoinHandle<()>> = None;
     let (mut kills, mut crashes, mut freezes, mut reads_ok, mut reads_failed, mut remote_n) = (0u32, 0u32, 0u32, 0u32, 0u32, 0u64);
+    let (mut store_healing, mut store_faults) = (None::<tokio::task::JoinHandle<()>>, 0u32);
 
     for step in 0..steps {
+        // With the blobs in a bucket, the bucket has weather too: about one
+        // step in fourteen starts some, once the last has passed.
+        if let Some(store) = &b.worker.store {
+            if store_healing.as_ref().is_none_or(|h| h.is_finished()) && rnd(100) < 7 {
+                let (what, healing) = store.weather(rnd(100), rnd(1000));
+                trace.push(format!("{step}: {what}"));
+                store_healing = Some(healing);
+                store_faults += 1;
+            }
+        }
         let mine = |k: &String| k != "remote" && !k.starts_with("remote/");
         let dirs: Vec<String> = std::iter::once(String::new()).chain(expect.iter().filter(|(k, v)| v.is_none() && mine(k)).map(|(k, _)| k.clone())).collect();
         let files: Vec<String> = expect.iter().filter(|(k, v)| v.is_some() && mine(k)).map(|(k, _)| k.clone()).collect();
@@ -1219,6 +1230,12 @@ async fn soak() {
     if let Some(t) = thaw.take() {
         t.await.unwrap();
     }
+    if let Some(store) = &b.worker.store {
+        if let Some(healing) = store_healing.take() {
+            healing.abort();
+        }
+        store.pass();
+    }
     b.proxy.rates(0, 0);
     assert!(a.mac.fs.flush(Duration::from_secs(180)).await, "the drive never settled: {:?}\n{}", a.mac.fs.pending(), trace.join("\n"));
     other.flush().await;
@@ -1262,6 +1279,11 @@ async fn soak() {
     eprintln!("| Wall time | {:.0} s |", started.elapsed().as_secs_f64());
     eprintln!("| Files and folders at the end | {} |", expect.len());
     eprintln!("| kill -9 of the Worker / kills of the app / freezes | {kills} / {crashes} / {freezes} |");
+    if let Some(store) = &b.worker.store {
+        eprintln!("| Store: spells of weather / times the server logged that it did not answer | {store_faults} / {} |", log_count(&b.worker.log(), "store", None));
+        eprintln!("| Store weather | {} |", store.weather_report());
+        eprintln!("| Store proxy | {} |", store.summary());
+    }
     eprintln!("| Proxy: connections / replies lost / requests lost | {} / {} / {} |", f.connections.load(Ordering::SeqCst), f.replies_lost.load(Ordering::SeqCst), f.requests_lost.load(Ordering::SeqCst));
     eprintln!("| Reads checked against what was written / reads that failed while the cloud was away | {reads_ok} / {reads_failed} |");
     eprintln!("| Read back from the cloud by this Mac: bytes / range requests | {} / {} |", downloaded.0, downloaded.1);

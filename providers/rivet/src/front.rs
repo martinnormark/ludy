@@ -51,10 +51,19 @@ fn refuse(r: &Refusal) -> Response {
 
 /// Storage or the engine failed: a 5xx, and the sender tries again. `event`
 /// is `error` for what should not happen and `upstream` for the engine or a
-/// node being away, which a restart of either causes.
+/// node being away, which a restart of either causes. A store that did not
+/// answer has its own, [`store_failed`].
 fn failed(event: &str, status: u16, method: &Method, path: &str, error: String, started: Instant) -> Response {
     log(&log_line(event, "", &[("method", method.as_str().into()), ("path", path.into()), ("error", error.clone().into()), ("ms", (started.elapsed().as_millis() as u64).into())]));
     text(status, error)
+}
+
+/// The blob store failed or did not answer in time: a 503, and the sender
+/// tries again. The log gets the store's own words, which name the bucket
+/// and its address; the sender gets none of that.
+fn store_failed(method: &Method, path: &str, error: &anyhow::Error, started: Instant) -> Response {
+    crate::store_trouble(method.as_str(), path, &format!("{error:#}"), started.elapsed().as_millis() as u64);
+    text(503, crate::STORE_AWAY.to_string())
 }
 
 async fn handle(State(env): State<Arc<Env>>, method: Method, uri: Uri, headers: HeaderMap, body: Body) -> Response {
@@ -67,12 +76,12 @@ async fn handle(State(env): State<Arc<Env>>, method: Method, uri: Uri, headers: 
         Route::Blob { put: false, key, .. } => blob_get(&env, &method, &path, &headers, &key, started).await,
         Route::DevBlobs { prefix } => match env.blobs.list(&prefix).await {
             Ok(names) => json(&names),
-            Err(e) => failed("error", 500, &method, &path, format!("{e:#}"), started),
+            Err(e) => store_failed(&method, &path, &e, started),
         },
         // Lose a blob behind the drive's back, as a failed or over-eager cleanup would.
         Route::DevBlobDelete { key } => match env.blobs.delete(&key).await {
             Ok(()) => text(200, "deleted\n"),
-            Err(e) => failed("error", 500, &method, &path, format!("{e:#}"), started),
+            Err(e) => store_failed(&method, &path, &e, started),
         },
         Route::DevCrypt => text(200, front::crypt_selftest()),
         Route::Drive { drive } => to_drive(&env, &method, &path, uri.query().unwrap_or_default(), body, &drive, started).await,
@@ -116,7 +125,7 @@ async fn blob_put(env: &Env, method: &Method, path: &str, body: Body, kind: Blob
             log(&log_line("blob", drive, &[("kind", kind.letter().into()), ("bytes", n.into())]));
             text(201, "stored\n")
         }
-        Err(e) => failed("error", 500, method, path, format!("{e:#}"), started),
+        Err(e) => store_failed(method, path, &e, started),
     }
 }
 
@@ -125,7 +134,7 @@ async fn blob_get(env: &Env, method: &Method, path: &str, headers: &HeaderMap, k
     let found = match env.blobs.get(key, range).await {
         Ok(Some(found)) => found,
         Ok(None) => return refuse(&front::no_blob()),
-        Err(e) => return failed("error", 500, method, path, format!("{e:#}"), started),
+        Err(e) => return store_failed(method, path, &e, started),
     };
     // The store's stream goes to the client as it comes; nothing is copied here.
     let mut resp = Response::new(Body::from_stream(found.bytes));

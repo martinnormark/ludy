@@ -69,6 +69,7 @@ A drive can be open in one process at a time on a Mac. While the app has a drive
 | `cargo test` | The tests that need no server |
 | `cargo test -p ludy-core --test sealed_engine -- --ignored --test-threads=1` | The engine against a server the test starts; see [chaos testing](evidence/chaos-testing.md#running-them) for what it needs |
 | `scripts/chaos-mount.sh <work-dir>` | Flood, copy and kill the server and then the mounting process, on a hidden mount (needs Docker and `cargo build --release -p ludy-cli`) |
+| `scripts/chaos-r2.sh <work-dir> [rounds]` | The chaos suites in a loop with the server's blobs in the R2 bucket `.env` names, taking the bucket away as well; see [chaos testing](evidence/chaos-testing.md#the-store-taken-away) |
 
 Set `LUDY=target/release/ludy` to make the two seed scripts use a built binary instead of `cargo run`.
 

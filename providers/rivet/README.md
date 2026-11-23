@@ -29,6 +29,20 @@ Where this fits, and what a provider has to promise: [the server](../../docs/how
 
 These are the server's own. The settings the Compose files read from `.env` are in [the Compose page](../../docs/hosting/compose.md#settings).
 
+## When the blob store does not answer
+
+A folder answers or fails at once. A bucket is on a network, and can go away or stay connected and say nothing. Every call to the store has a limit ([`blobs.rs`](src/blobs.rs)), and the S3 client retries a few times inside it:
+
+| Call | Limit |
+|---|---|
+| A lookup or a delete, which a drive makes during a commit and the collector | 8 seconds |
+| A read | 8 seconds until the store starts answering, and 8 between any two pieces of the body |
+| An upload | 8 seconds, plus one for every 250 KB of the body: 9 s for a 200 KB shard, 75 s for the largest shard, 16 MiB |
+
+Past its limit the server answers 503 with `the blob store did not answer; try again`, and the sender does. It writes a line of its own kind to the log, `"t":"store"`, with what the store said, which names the bucket and its address; none of that goes to the sender. A read that fails in the middle ends the response short, which the engine notices and asks for again.
+
+A commit that names blobs the drive has no row for asks the store about them, and a drive handles one request at a time. So while the store is silent, such a commit holds its drive for up to those 8 seconds, and everything else for that drive, its feed included, waits behind it. Other drives are not affected, and neither are commits that need no lookup: creating, renaming, moving, deleting.
+
 ## How it is put together
 
 ```text

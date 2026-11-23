@@ -9,7 +9,7 @@ Read [before you expose it](#before-you-expose-it) first: the server has no sign
 | Path | The server runs as | Drives' databases | Sealed shards and manifests | Checked | Page |
 |---|---|---|---|---|---|
 | Docker Compose, the default | Two containers on one machine | A Docker volume | A Docker volume | Yes: suites, a mount, kills (2026-11-23) | [compose.md](compose.md) |
-| Docker Compose with Cloudflare R2 | Two containers on one machine | A Docker volume | An R2 bucket | Yes, against a real bucket (2026-11-23). Not the chaos suites | [object-storage.md](object-storage.md#cloudflare-r2) |
+| Docker Compose with Cloudflare R2 | Two containers on one machine | A Docker volume | An R2 bucket | Yes, against a real bucket, by hand and under the chaos suites (2026-11-23) | [object-storage.md](object-storage.md#cloudflare-r2) |
 | Docker Compose with MinIO or another S3 | Two or three containers on one machine | A Docker volume | A bucket | MinIO: yes (2026-11-23). Any other S3: no | [object-storage.md](object-storage.md#minio) |
 | The binary beside a Rivet engine | A process from the checkout, the engine in a container | The engine's volume | A folder or a bucket | Yes: both chaos suites run it this way | [binary.md](binary.md) |
 | Cloudflare Worker, local | `wrangler dev` on this Mac | `.wrangler` in the checkout | `.wrangler` in the checkout | Yes: suites and a mount (2026-11-23) | [cloudflare.md](cloudflare.md#run-it-locally) |

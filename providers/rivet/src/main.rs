@@ -52,6 +52,19 @@ pub fn env() -> Arc<Env> {
     ENV.get().expect("set at start, before any actor").clone()
 }
 
+/// What a sender is told when the blob store failed or did not answer in
+/// time. The store's own words name the bucket and its address; they go to
+/// the log and nowhere else.
+pub const STORE_AWAY: &str = "the blob store did not answer; try again\n";
+
+/// A line in the log for a call to the blob store that failed. Its own kind
+/// of event: a store on a network goes away now and then, and whoever asked
+/// asks again, so it is not an `error`, and whoever reads the log for a
+/// store that keeps failing can count these.
+pub fn store_trouble(what: &str, path: &str, error: &str, ms: u64) {
+    log(&ludy_server::log_line("store", "", &[("what", what.into()), ("path", path.into()), ("error", error.into()), ("ms", ms.into())]));
+}
+
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }

@@ -594,17 +594,16 @@ impl<P: Platform> Drive<P> {
         }
         // Make the marks durable before deleting anything.
         self.p.flush().await?;
-        if let Some(n) = stop_after {
-            for id in dying.iter().take(n) {
-                self.p.blob_delete(&blob_key(drive, id)).await?;
-            }
-            return Ok(true);
-        }
-        for batch in dying.chunks(STORE_BATCH) {
+        // A dying instance gets as far as `n` objects; the rest stay marked.
+        let reach = stop_after.unwrap_or(dying.len()).min(dying.len());
+        for batch in dying[..reach].chunks(STORE_BATCH) {
             let keys: Vec<String> = batch.iter().map(|id| blob_key(drive, id)).collect();
             for result in futures_util::future::join_all(keys.iter().map(|key| self.p.blob_delete(key))).await {
                 result?;
             }
+        }
+        if stop_after.is_some() {
+            return Ok(true);
         }
         let gone = dying.clone();
         let forgotten = self
