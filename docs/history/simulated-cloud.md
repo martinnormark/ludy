@@ -1,5 +1,7 @@
 # The simulated cloud and shards
 
+> **History.** This page is about the local server Ludy started on. That engine and its simulated server were removed on 2026-11-23, when the app moved to the end-to-end encrypted engine and a real server; the last commit that has them is `9f45636`. Nothing here was measured on what Ludy is now, and the page is kept as it was written, so its present tense is the past. Links to code that no longer exists were turned into plain text. For the current system see [what works](../evidence/verification.md), [chaos testing](../evidence/chaos-testing.md) and [benchmarks](../evidence/benchmarks.md).
+
 The cloud in this repository is a local S3-like server. A drive is a bucket of objects, and every write makes a version that never changes. Content is cut into shards by content-defined chunking and each shard is stored once under its SHA-256, so an edit uploads only the shards it touched and identical content is never stored twice.
 
 ## The cloud

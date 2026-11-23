@@ -1,18 +1,18 @@
-# Architecture: one cloud, two places to run it
+# The server: one crate of logic, two providers
 
-The cloud's logic is one crate with no platform in it, [`ludy-server`](../../crates/ludy-server). A provider is a thin package that supplies storage, a timer and an HTTP front to it. Two exist: Rivet actors under Docker Compose, which is what `docker compose up` starts, and a Cloudflare Worker. Both pass the same chaos suites.
+The server's logic is one crate with no platform in it, [`ludy-server`](../../crates/ludy-server). A provider is a thin package that supplies storage, a timer and an HTTP front to it. Two exist: Rivet actors under Docker Compose, which is what `docker compose up` starts, and a Cloudflare Worker. Both pass the same chaos suites, and the app, the CLI and the mount work against either.
 
-Written 2026-11-22. What is not verified is in [known-issues.md](known-issues.md).
+How to set each one up is in [hosting](../hosting/README.md). What is not verified is in [known problems](../known-issues.md).
 
 ## What runs where
 
 ```mermaid
 flowchart TB
-  clients["Clients<br/>ludy-core on the Mac; later iOS, web"]
+  clients["Clients<br/>ludy-core on the Mac"]
   proto{{"The protocol: ludy-proto<br/>same HTTP on every provider"}}
   clients --> proto
 
-  subgraph server["crates/ludy-server: the cloud's logic, no platform in it"]
+  subgraph server["crates/ludy-server: the server's logic, no platform in it"]
     front["front: which request goes where,<br/>checks on a blob's path and size"]
     logic["drive: tables, commit, feed,<br/>collector, recount"]
     ports["ports: SQL with a transaction, blob store,<br/>timer, clock, two settings, log"]
@@ -50,12 +50,14 @@ flowchart TB
 Three facts everything leans on:
 
 1. **The server never holds a key.** It stores sealed bytes under the SHA-256 of those bytes, and a tree of nodes whose names and keys are sealed. Everything that needs a key happens in the client.
-2. **The client only knows a base URL.** [`SealedClient`](../../crates/ludy-core/src/sealed_client.rs) takes one and speaks the protocol below. It has no idea what answers.
+2. **The client only knows a base URL.** [`SealedClient`](../../crates/ludy-core/src/sealed_client.rs) takes one (`LUDY_SERVER`) and speaks the protocol below. It has no idea what answers, beyond the name the server gives itself at `GET /`.
 3. **A drive is one small database with one writer.** All of a drive's bookkeeping is a SQLite database of five tables, and every commit is one transaction on it. Bytes do not pass through it.
 
-### Which one to run
+### The two providers side by side
 
-| | [Rivet](../../providers/rivet) (`docker compose up`) | [Cloudflare](../../providers/cloudflare) (`wrangler deploy`) |
+Which to choose, and the steps for each, are in [hosting](../hosting/README.md).
+
+| | [Rivet](../../providers/rivet) (`docker compose up`) | [Cloudflare](../../providers/cloudflare) (`wrangler dev`, `wrangler deploy`) |
 |---|---|---|
 | Runs on | Any machine with Docker, or the binary beside an engine | Cloudflare's network |
 | A drive is | A Rivet actor, placed by the engine | A Durable Object |
@@ -64,7 +66,7 @@ Three facts everything leans on:
 | Uploads checked against their name | The front hashes the body | R2 does |
 | More than one machine | The engine's documentation asks for three or more engine instances and a bucket; not tried here | Yes, it is Cloudflare's |
 | TLS, sign-in | Neither. Put a proxy in front | TLS is Cloudflare's. No sign-in |
-| State | Passes both chaos suites, engine and server both killed | Passes both chaos suites under `wrangler dev`; never deployed |
+| State | Passes both chaos suites, engine and server both killed; a real mount survived the same | Passes both chaos suites under `wrangler dev`, and a drive was mounted from it; never deployed |
 
 **Rivet cannot be the Cloudflare option too.** That was the hope: one Rivet codebase, hosted on Compose or on Workers. Rivet 3 (3.0.0 shipped 2026-11-01; this uses 3.1.1) has no Workers target. Its actors run in long-lived processes that dial out to an engine, and the engine refuses serverless pools (`pool.serverless_unsupported`). The older `@rivetkit/cloudflare-workers` package, on the 2.x line that Rivet's migration guide retires, only made a Worker a runner for an engine hosted somewhere else; the state never lived on Cloudflare. So Cloudflare stays its own provider, and what the two share is everything that matters: the drive logic, the protocol, and the test of both.
 
@@ -74,6 +76,7 @@ What does carry over is storage: R2 speaks S3, so the Rivet provider can keep it
 
 | Request | What it does |
 |---|---|
+| `GET /` | The provider says its name: `ludy-rivet` or `ludy-worker` |
 | `PUT /drives/:drive` | Create the drive. Safe to repeat |
 | `GET /drives/:drive` | The drive's head: epoch, sequence number, root |
 | `POST /drives/:drive/commit` | Apply a list of ops together or not at all. Safe to repeat |
@@ -86,6 +89,8 @@ What does carry over is storage: R2 speaks S3, so the Rivet provider can keep it
 | `/_dev/...` | Fault switches and the drive's recount of itself, for the tests only |
 
 The types are in [`ludy_proto::tree`](../../crates/ludy-proto/src/tree.rs). A provider is anything that answers these requests the same way. Clients do not change, and nothing about a provider leaks into `ludy-core`.
+
+There is no request that lists drives, none that deletes a drive, and no sign-in: a drive's id is the only thing a request needs to read or change that drive's sealed content.
 
 ## The shared crate
 
@@ -140,10 +145,9 @@ app/
   Cargo.toml                 workspace: crates/*, providers/rivet
   crates/
     ludy-proto/              the protocol and the encryption format
-    ludy-server/             the cloud's logic behind ports
+    ludy-server/             the server's logic behind ports
     ludy-core/               the client engine; its tests hold the chaos suites
     ludy-app/  ludy-cli/     the Mac app and the command line
-    ludy-cloud/              the simulated cloud; retire once the app mounts sealed drives
   providers/
     rivet/                   ludy-rivet: front, actors, Dockerfile
     cloudflare/              the Worker; a workspace of its own, WebAssembly only
@@ -158,7 +162,7 @@ app/
 The two suites are the definition of a correct provider:
 
 - [`worker_chaos.rs`](../../crates/ludy-core/tests/worker_chaos.rs): a model predicts every commit while the server is killed, frozen and restarted and a proxy loses messages.
-- [`sealed_engine.rs`](../../crates/ludy-core/tests/sealed_engine.rs): the real engine against the server under the same faults.
+- [`sealed_engine.rs`](../../crates/ludy-core/tests/sealed_engine.rs): the engine against the server under the same faults.
 
 Both go through [`worker_rig`](../../crates/ludy-core/tests/worker_rig/mod.rs), whose `Worker` type is the launcher: start, freeze, thaw, `kill -9`, restart, read the log. `LUDY_PROVIDER` chooses what it launches. For `cloudflare` (the default) that is `wrangler dev`. For `rivet` it is `target/release/ludy-rivet` and an engine container of the rig's own; `kill -9` takes both, as a machine losing power would, and a freeze stops the server while the engine runs on. The proxy, the client, the model and the reader are the same for both.
 

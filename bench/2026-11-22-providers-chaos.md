@@ -26,7 +26,7 @@ The tables below are from the first complete run on each provider. Three small c
 | Worker soak on Rivet, only the server killed (seed 41) | pass, 3 kills |
 | Worker soak on Rivet, only the engine killed (seed 43) | pass, 10 kills |
 | Engine soak on Rivet, seed 6 (before the three changes) | pass |
-| Engine soak on Rivet, seed 5 (before the three changes) | **failed its log check.** Every file held what was written; the server's log had one commit that came back from Rivet with its result unknown after a freeze. See [known problems](../docs/real-cloud/known-issues.md#the-rivet-provider) |
+| Engine soak on Rivet, seed 5 (before the three changes) | **failed its log check.** Every file held what was written; the server's log had one commit that came back from Rivet with its result unknown after a freeze. See [known problems](../docs/known-issues.md#the-rivet-provider) |
 | Engine soak on Rivet, seed 5 again | pass, 11 kills. A seed fixes the order of steps, not the drive's keys or the timing, so this is not the same run |
 | Engine soak on Rivet, only the server killed (seed 42) | pass, 10 kills |
 | Engine soak on Rivet, only the engine killed (seed 44) | pass, 7 kills |

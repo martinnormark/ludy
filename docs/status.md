@@ -1,41 +1,39 @@
 # Status
 
-Where each part of Ludy stands, and where its lists of limits are kept. Each list lives on one page only; this page points at them. The one list that lives here is [Not built](#not-built).
+Where each part of Ludy stands on 2026-11-23, and where its lists of limits are kept. Ludy runs on a real server: the app, the CLI and the mount use the end-to-end encrypted engine against either provider. Everything was checked from one Mac, with the server on that Mac; the one thing outside it so far is a Cloudflare R2 bucket as the store. Nothing is deployed, and there is no sign-in.
 
 ## At a glance
 
 | Part | State | Detail |
 |---|---|---|
-| Simulated cloud, engine, mount | Built, covered by automated tests, and checked against real mounts | [What works](evidence/verification.md) |
-| The app | Built. Some controls were clicked and checked in screenshots; the rest were not | [Not verified](evidence/verification.md#not-verified) |
-| The engine under faults | A chaos suite and a randomized soak pass; seven problems are known and not fixed | [Chaos testing](evidence/chaos-testing.md#known-and-not-fixed) |
-| The encrypted cloud | Built beside the simulated one. Its server runs self-hosted on Rivet actors (`docker compose up`) and as a Cloudflare Worker, and both pass the chaos suites locally. The app does not use it, and nothing has been deployed | [The real cloud](real-cloud/overview.md), [known problems](real-cloud/known-issues.md), [architecture](real-cloud/architecture.md) |
+| The engine | Built. Covered by a suite of scenarios and a soak against both providers, under kills, freezes and lost messages | [Chaos testing](evidence/chaos-testing.md) |
+| The mount | Built. Drives were mounted from both providers and read and written from the shell; a mount survived the server and the mounting process being killed. The Finder and applications have not been tried on this engine | [What works](evidence/verification.md#against-real-mounts) |
+| The app | Built. Lists, browses and mounts encrypted drives. A handful of screens were looked at; most controls were not clicked | [Not verified](known-issues.md#the-app) |
+| The server's logic | Built. Tested by itself on SQLite in memory, with storage made to fail | [The server](how-it-works/server.md) |
+| The Rivet provider (Docker Compose) | Built. Passes both chaos suites. One machine only | [Hosting](hosting/compose.md) |
+| The Cloudflare provider | Built. Passes both chaos suites under `wrangler dev`. Never deployed | [Hosting](hosting/cloudflare.md) |
+| R2 as the store under Compose | Works against a real bucket: uploads, range reads, a mount, a kill of the server, the collector's deletes. The chaos suites have not run with it | [Hosting](hosting/object-storage.md#cloudflare-r2) |
+| The encryption format | Version 1. Checked against a second implementation by the same author; reviewed by nobody else | [Encryption](how-it-works/encryption.md) |
+| Sign-in, sharing | Not built. A drive is opened by a key kept in a file on the Mac | [Not built](known-issues.md#not-built) |
 
-## Simulated cloud, engine and app (2026-11-19)
+## What changed on 2026-11-23
 
-The server, the engine and the app are built, covered by automated tests, and checked against real mounts: listing, range-only reads, video playback, writes, remote changes, eject and the crash case all work (see [What works](evidence/verification.md)). Not checked: most of the app's controls beyond the handful that were clicked (see [Not verified](evidence/verification.md#not-verified)), and the Quick Look panel itself. Read [Eject and the "network volume" prompt](how-it-works/mount.md#eject-and-the-network-volume-prompt) for a hazard to know about. The engine has a benchmark and a chaos suite (cloud killed mid-upload, stalls, app crashes with unsent writes); see [Benchmarks](evidence/benchmarks.md) and [Chaos testing](evidence/chaos-testing.md).
+Until then the app ran on an earlier engine against a simulated server on localhost, and the encrypted engine and the real server were being built beside them. On this date:
 
-## The encrypted cloud (2026-11-22)
-
-The format, the protocol, the server and a second engine exist and are tested against each other. The server's logic is one crate, `ludy-server`, with two providers: Rivet actors under Docker Compose, and a Cloudflare Worker under `wrangler dev`. Nothing mounts a sealed drive yet, there is no sign-in, and nothing has been deployed. What was built and how it was checked is in [the real cloud](real-cloud/overview.md); what is expected to break, what is fragile and what nobody has checked is in [known problems](real-cloud/known-issues.md).
+- The app, the CLI, the NFS adapter and `ludy bench` moved to the encrypted engine.
+- The simulated server (`ludy-cloud`), the earlier engine and their tests were removed. Their pages are under [history](README.md#history).
+- A keystore was added, since the server lists no drives and holds no key.
+- Features that the simulated server faked or that the real one has nothing for were taken out of the app: sharing by email, forking a drive, deleting a drive on the server, keeping a file offline, the link's simulated speed.
 
 ## Where the limits are listed
 
-| List | About | Page |
-|---|---|---|
-| Not verified | The app's controls, Quick Look, the Finder | [verification](evidence/verification.md#not-verified) |
-| Known and not fixed | The engine and the simulated cloud | [chaos testing](evidence/chaos-testing.md#known-and-not-fixed) |
-| Known problems, not verified, not built, open decisions | The encrypted cloud | [known problems](real-cloud/known-issues.md) |
-| Not built | The engine, the simulated cloud and the app | below |
+One page: [known problems](known-issues.md). Its sections:
 
-## Not built
+| Section | About |
+|---|---|
+| [Known problems](known-issues.md#known-problems) | What is expected to break or is wrong today, on the server, in the engine and the app, on each provider |
+| [Not verified](known-issues.md#not-verified) | What nobody has checked |
+| [Not built](known-issues.md#not-built) | What is missing |
+| [Decisions still open](known-issues.md#decisions-still-open) | Questions waiting for an answer |
 
-This list is about the engine, the simulated cloud and the app. What the encrypted cloud lacks is in [known problems](real-cloud/known-issues.md#not-built).
-
-- **Shards on the read path and in the cache.** Reads are range requests on the object, and the disk cache is keyed by version and block, not by shard. So after a patch the Mac's cache does not carry over to the new version except for the file that was just uploaded, and two files with the same content are cached twice.
-- **Insert.** A write at an offset is a patch; inserting bytes in the middle of a file through the mount is a rewrite of everything after it, as in any filesystem. Content-defined cutting resynchronises (a unit test covers it), so most of the shards after the insert are found in the cloud and not sent again, but they are read and hashed.
-- **Cleanup of abandoned uploads while the server runs.** Shards sent for an upload that never commits stay until the server restarts.
-- **Not exercised:** the client's second attempt after the cloud reports a missing shard at commit (the server's 409 is tested; the retry has never fired).
-- **A second user.** Sharing records an email and a role on the drive and shows who has access. There are no accounts, and nothing enforces View versus Edit.
-- **Thumbnails** in the in-app browser, drag and drop, search, and a menu-bar launcher.
-- **An app bundle.** The app runs from `cargo run` and is unsigned.
+Each [hosting](hosting/README.md) page ends with what was checked for that way of running the server.
