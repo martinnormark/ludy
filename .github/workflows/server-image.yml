@@ -16,8 +16,6 @@ on:
   push:
     branches:
       - main
-      # Where the server lives until it is merged. Remove this line then.
-      - provider-agnostic-server
     # Everything providers/rivet/Dockerfile copies, and what decides how it
     # is built.
     paths:

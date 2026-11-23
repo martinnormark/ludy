@@ -9,7 +9,7 @@ The server is yours to run: one `docker compose up` on a machine with Docker, or
 - **It runs on a real server.** The app, the CLI and the mount work against either provider of the server, and both providers pass the same chaos suites (2026-11-23). The local simulated server the project started on is gone.
 - **The server has only run on one Mac.** With Docker Compose it was tried with its blobs in a volume, in MinIO and in a real Cloudflare R2 bucket. The Worker has never been deployed to Cloudflare, and no second machine has been involved.
 - **There is no sign-in.** Whoever can reach a server can use it, so it has to stay on a machine or network you trust. A drive is opened by its key, which is kept in a file on the Mac.
-- **Not checked on the current engine:** the Finder, Quick Look and video playback from a mount, and most of the app's controls.
+- **Not checked on the current engine:** the Finder beyond one copy, Quick Look and video playback from a mount, and most of the app's controls.
 
 More in [docs/status.md](docs/status.md).
 
@@ -70,6 +70,6 @@ The full map is [docs/README.md](docs/README.md).
 | [`crates/ludy-server`](crates/ludy-server) | The server's logic, with no platform in it |
 | [`providers/rivet`](providers/rivet) | The provider `docker compose up` starts: Rivet actors |
 | [`providers/cloudflare`](providers/cloudflare) | The Cloudflare provider: a Worker |
-| [`scripts`](scripts) | Demo drives, a stress drive, and chaos on a real mount |
+| [`scripts`](scripts) | Demo drives, a stress drive, chaos on a real mount, and the chaos suites in a loop on an R2 bucket |
 | [`bench`](bench) | Raw benchmark and chaos tables, by date |
 | [`docs`](docs) | Everything else |

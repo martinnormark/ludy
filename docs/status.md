@@ -7,7 +7,7 @@ Where each part of Ludy stands on 2026-11-23, and where its lists of limits are 
 | Part | State | Detail |
 |---|---|---|
 | The engine | Built. Covered by a suite of scenarios and a soak against both providers, under kills, freezes and lost messages | [Chaos testing](evidence/chaos-testing.md) |
-| The mount | Built. Drives were mounted from both providers and read and written from the shell; a mount survived the server and the mounting process being killed. The Finder and applications have not been tried on this engine | [What works](evidence/verification.md#against-real-mounts) |
+| The mount | Built. Drives were mounted from both providers and read and written from the shell; a mount survived the server and the mounting process being killed. On this engine the Finder was used once, to copy a file in, and applications not at all | [What works](evidence/verification.md#against-real-mounts) |
 | The app | Built. Lists, browses and mounts encrypted drives. A handful of screens were looked at; most controls were not clicked | [Not verified](known-issues.md#the-app) |
 | The server's logic | Built. Tested by itself on SQLite in memory, with storage made to fail | [The server](how-it-works/server.md) |
 | The Rivet provider (Docker Compose) | Built. Passes both chaos suites. One machine only | [Hosting](hosting/compose.md) |

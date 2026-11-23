@@ -99,7 +99,7 @@ A mounted drive rides through all of these: writes go to the Mac's journal and a
 
 ## Running the source in the checkout
 
-[A workflow](../../.github/workflows/server-image.yml) publishes the image when the server's source changes. Its tag is the Rivet release it is built against, `rivet-3.1.1`, the same as the engine's. To run what is in the checkout instead:
+[A workflow](../../.github/workflows/server-image.yml) publishes the image when the server's source changes on `main`. Its tag is the Rivet release it is built against, `rivet-3.1.1`, the same as the engine's. To run what is in the checkout instead:
 
 ```bash
 docker compose up -d --wait --build
@@ -114,7 +114,7 @@ docker compose pull ludy
 ## What was checked
 
 - **Both chaos suites** pass against this provider, the server and the engine killed together at every `kill -9` (see [chaos testing](../evidence/chaos-testing.md)). They run the binary from `target/release`, not the image.
-- **The Compose file with the published image, 2026-11-23, arm64:** started from nothing; drives created; files uploaded, listed and downloaded with the CLI; a drive mounted, read and written through the Finder's NFS client; a second keystore read back what the first wrote. Details in [what works](../evidence/verification.md).
+- **The Compose file with the published image, 2026-11-23, arm64:** started from nothing; drives created; files uploaded, listed and downloaded with the CLI; a drive mounted, and read and written from the shell; a second keystore read back what the first wrote. Details in [what works](../evidence/verification.md).
 - **A real mount through kills of this stack:** [`scripts/chaos-mount.sh`](../../scripts/chaos-mount.sh) starts a Compose project of its own, kills both containers with SIGKILL in the middle of a flood, and kills the mounting process with unsent writes. Result in [what works](../evidence/verification.md#chaos-on-a-real-mount).
 
 Not checked: the amd64 image (built, never started), more than one machine, a backup and restore of the volumes, anything other than loopback. More in [known problems](../known-issues.md#the-rivet-provider).
