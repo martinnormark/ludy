@@ -1,44 +1,71 @@
 #!/bin/sh
-# A destructive run against a real mount, with the real binaries.
+# A destructive run against a real mount and a real server, with the real
+# binaries.
 #
 #   scripts/chaos-mount.sh <work-dir> [files] [copy-MiB] [port]
 #
-# 1. Flood a folder on the mounted drive with small files and start copying
+# 1. Start a server of its own (docker compose, in a project, on a port and
+#    with volumes of its own), make a drive, mount it.
+# 2. Flood a folder on the mounted drive with small files and start copying
 #    a large one.
-# 2. "Deploy" the cloud in the middle: kill -9 the server, wait, start it
-#    again on the same data.
-# 3. Check that the cloud ends up with every file, byte for byte.
-# 4. Stop the cloud, write more files, kill -9 the mounting process too
-#    (an app crash with unsent writes), bring both back, and check that the
-#    unsent files arrive.
+# 3. Take the server away in the middle: SIGKILL both containers, wait,
+#    start them again on the same volumes.
+# 4. Check from a second keystore, with a cache of its own, that the server
+#    ends up with every file, byte for byte.
+# 5. Kill the server again, write more files, kill -9 the mounting process
+#    too (an app crash with unsent writes), bring both back, and check that
+#    the unsent files arrive.
 #
 # The mount is hidden (nobrowse) and lives under <work-dir>, so the Finder
-# and other apps leave it alone. Needs release builds:
-#   cargo build --release -p ludy-cloud -p ludy-cli
+# and other apps leave it alone. Needs Docker running and a release build:
+#   cargo build --release -p ludy-cli
+# At the end the server's containers and volumes are removed.
+#
+# CHAOS_MOUNT_BUILD=1 builds the server's image from the checkout first
+# (minutes, the first time), so that what is tested is the source here.
+#
+# CHAOS_MOUNT_STORE=r2 (or minio) adds docker-compose.r2.yml (or .minio.yml),
+# so the server keeps its blobs there. With r2 the settings come from .env,
+# and the blobs stay in the bucket when the containers go: the drive's id
+# is written to the file LUDY_CHAOS_DRIVE_LOG names, for
+# `scripts/s3-drives.py clean` to remove them by.
 set -eu
 WORK="${1:?usage: chaos-mount.sh <work-dir> [files] [copy-MiB] [port]}"
 FILES="${2:-2000}"
 COPY_MIB="${3:-200}"
 PORT="${4:-9310}"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-CLOUD="$HERE/target/release/ludy-cloud"
 LUDY="$HERE/target/release/ludy"
-B="http://127.0.0.1:$PORT"
-MNT="$WORK/mnt/Chaos"
-export LUDY_SERVER="$B" LUDY_HOME="$WORK/home" LUDY_CACHE_DIR="$WORK/cache" LUDY_CACHE_MB=300
+PROJECT="ludy-chaos-$PORT"
+export LUDY_SERVER="http://127.0.0.1:$PORT" LUDY_PORT="$PORT"
 
-[ -x "$CLOUD" ] && [ -x "$LUDY" ] || { echo "build first: cargo build --release -p ludy-cloud -p ludy-cli"; exit 2; }
+[ -x "$LUDY" ] || { echo "build first: cargo build --release -p ludy-cli"; exit 2; }
 mkdir -p "$WORK"
-rm -rf "$WORK/data" "$WORK/home" "$WORK/cache" "$WORK/src"
+WORK="$(cd "$WORK" && pwd)"
+MNT="$WORK/mnt/Chaos"
+for d in home cache home2 cache2 src out; do rm -rf "${WORK:?}/$d"; done
 mkdir -p "$WORK/mnt" "$WORK/src"
 
 say() { printf '%s  %s\n' "$(date +%H:%M:%S)" "$*"; }
-start_cloud() { "$CLOUD" --data "$WORK/data" --port "$PORT" --latency-ms 20 --mbps 400 --quiet >> "$WORK/cloud.log" 2>&1 & echo $! > "$WORK/cloud.pid"; }
-cloud_up() { i=0; until curl -fsS -o /dev/null "$B/_stats" 2>/dev/null; do i=$((i+1)); [ $i -lt 100 ] || { echo "cloud did not start"; exit 1; }; sleep 0.1; done; }
-start_mount() { "$LUDY" mount Chaos --nobrowse --root "$WORK/mnt" >> "$WORK/mount.log" 2>&1 & echo $! > "$WORK/mount.pid"; }
+case "${CHAOS_MOUNT_STORE:-volume}" in
+  volume) STORE_FILE="" ;;
+  r2|minio) STORE_FILE="$HERE/docker-compose.$CHAOS_MOUNT_STORE.yml" ;;
+  *) echo "CHAOS_MOUNT_STORE is volume, r2 or minio"; exit 2 ;;
+esac
+compose() { docker compose -p "$PROJECT" -f "$HERE/docker-compose.yml" ${STORE_FILE:+-f "$STORE_FILE"} "$@"; }
+# The Mac that mounts, and a second one that only checks.
+mac()   { LUDY_HOME="$WORK/home"  LUDY_CACHE_DIR="$WORK/cache"  LUDY_CACHE_MB=300 "$LUDY" "$@"; }
+other() { LUDY_HOME="$WORK/home2" LUDY_CACHE_DIR="$WORK/cache2" LUDY_CACHE_MB=300 "$LUDY" "$@"; }
+server_up() { compose up -d --wait >> "$WORK/server.log" 2>&1; }
+server_kill() { compose kill -s SIGKILL >> "$WORK/server.log" 2>&1; }
+# Started directly, not through `mac`: the pid kept has to be the process
+# that serves the mount, not a shell around it.
+start_mount() { LUDY_HOME="$WORK/home" LUDY_CACHE_DIR="$WORK/cache" LUDY_CACHE_MB=300 "$LUDY" mount Chaos --nobrowse --root "$WORK/mnt" >> "$WORK/mount.log" 2>&1 & echo $! > "$WORK/mount.pid"; }
 mounted() { /sbin/mount | grep -q " on $MNT "; }
 wait_mounted() { i=0; until mounted; do i=$((i+1)); [ $i -lt 150 ] || { echo "mount did not appear"; cat "$WORK/mount.log"; exit 1; }; sleep 0.2; done; }
 wait_unmounted() { i=0; while mounted; do i=$((i+1)); [ $i -lt 1500 ] || { echo "mount did not go away"; exit 1; }; sleep 0.2; done; }
+cleanup() { compose down -v >> "$WORK/server.log" 2>&1 || true; }
+trap cleanup EXIT
 
 # write <first> <count> <folder>: deterministic small files, through the mount.
 write_files() {
@@ -53,56 +80,83 @@ for i in range(first, first + count):
 PY
 }
 
-# verify <folder> <first> <count> [big-file]: wait until the cloud has exactly these, then compare bytes.
-verify() {
-python3 - "$B" "$1" "$2" "$3" "${4:-}" "$WORK/src" <<'PY'
-import hashlib, json, random, sys, time, urllib.parse, urllib.request
-base, folder, first, count, big, src = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6]
-want = {}
+# compare <folder> <first> <count> [big-file]: exit 0 if what was downloaded
+# is exactly what was written, 1 if some of it is not there yet, 2 if any of
+# it is wrong.
+compare() {
+python3 - "$WORK/out" "$1" "$2" "$3" "${4:-}" "$WORK/src" <<'PY'
+import hashlib, os, random, sys
+out, folder, first, count, big, src = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6]
+missing = wrong = 0
 for i in range(first, first + count):
     r = random.Random(i)
-    want["%s/note_%05d.bin" % (folder, i)] = r.randbytes(1000 + r.randrange(7000))
-def listing():
-    with urllib.request.urlopen(base + "/Chaos", timeout=30) as f:
-        return {o["key"]: o for o in json.load(f)["objects"] if not o["key"].endswith("/")}
-deadline = time.time() + 600
-while True:
+    want = r.randbytes(1000 + r.randrange(7000))
     try:
-        have = listing()
-        missing = [k for k, v in want.items() if k not in have or have[k]["size"] != len(v)]
-        if big and (big not in have):
-            missing.append(big)
-        if not missing:
-            break
-    except Exception as e:
-        missing = ["(cloud not answering: %s)" % e]
-    if time.time() > deadline:
-        print("FAILED: still missing after 10 minutes:", len(missing), missing[:5]); sys.exit(1)
-    time.sleep(1)
-bad = 0
-for key, data in want.items():
-    with urllib.request.urlopen(base + "/Chaos/" + urllib.parse.quote(key), timeout=30) as f:
-        if f.read() != data:
-            bad += 1
-if big:
+        with open(os.path.join(out, folder, "note_%05d.bin" % i), "rb") as f:
+            got = f.read()
+    except OSError:
+        missing += 1
+        continue
+    if len(got) != len(want):
+        missing += 1
+    elif got != want:
+        wrong += 1
+there = os.path.join(out, folder)
+extra = len(os.listdir(there)) - count if os.path.isdir(there) else 0
+def digest(path):
     h = hashlib.sha256()
-    with urllib.request.urlopen(base + "/Chaos/" + urllib.parse.quote(big), timeout=300) as f:
-        while True:
-            chunk = f.read(1 << 20)
-            if not chunk: break
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
-    local = hashlib.sha256(open(src + "/" + big, "rb").read()).hexdigest()
-    if h.hexdigest() != local:
-        bad += 1
-        print("FAILED: %s differs from the source" % big)
-print("%d small files%s in the cloud, %d wrong" % (len(want), " and " + big if big else "", bad))
-sys.exit(1 if bad else 0)
+    return h.hexdigest()
+if big:
+    try:
+        if os.path.getsize(os.path.join(out, big)) != os.path.getsize(os.path.join(src, big)):
+            missing += 1
+        elif digest(os.path.join(out, big)) != digest(os.path.join(src, big)):
+            wrong += 1
+            print("FAILED: %s differs from the source" % big)
+    except OSError:
+        missing += 1
+if wrong or extra > 0:
+    print("FAILED: %d wrong, %d files nobody wrote" % (wrong, max(extra, 0)))
+    sys.exit(2)
+if missing:
+    print("still missing: %d" % missing)
+    sys.exit(1)
+print("%d small files%s on the server, all as written" % (count, " and " + big if big else ""))
 PY
 }
 
-say "start the cloud and mount a new drive (hidden) at $MNT"
-start_cloud; cloud_up
-curl -fsS -o /dev/null -X PUT "$B/Chaos"
+# verify <folder> <first> <count> [big-file]: download with the second
+# keystore until everything is there, then it must be right.
+verify() {
+  deadline=$(( $(date +%s) + 600 ))
+  while :; do
+    rm -rf "${WORK:?}/out"; mkdir -p "$WORK/out"
+    other get Chaos "$1" "$WORK/out/$1" > "$WORK/get.log" 2>&1 || true
+    if [ -n "${4:-}" ]; then other get Chaos "$4" "$WORK/out/$4" >> "$WORK/get.log" 2>&1 || true; fi
+    code=0
+    compare "$@" > "$WORK/compare.log" || code=$?
+    case "$code" in
+      0) cat "$WORK/compare.log"; return 0 ;;
+      1) [ "$(date +%s)" -lt "$deadline" ] || { echo "FAILED: not there after 10 minutes"; cat "$WORK/compare.log" "$WORK/get.log"; exit 1; }
+         sleep 2 ;;
+      *) cat "$WORK/compare.log"; exit 1 ;;
+    esac
+  done
+}
+
+say "start a server of its own on port $PORT, make a drive, mount it (hidden) at $MNT"
+# CHAOS_MOUNT_BUILD=1: the server from this checkout, not the published image.
+if [ "${CHAOS_MOUNT_BUILD:-0}" = 1 ]; then compose build ludy >> "$WORK/server.log" 2>&1; fi
+server_up
+mac mkdrive Chaos > /dev/null
+if [ -n "${LUDY_CHAOS_DRIVE_LOG:-}" ]; then
+  mkdir -p "$(dirname "$LUDY_CHAOS_DRIVE_LOG")"
+  echo "/drives/$(mac drives | awk '$1 == "Chaos" {print $2}')" >> "$LUDY_CHAOS_DRIVE_LOG"
+fi
+other add "$(mac key Chaos)" > /dev/null
 start_mount; wait_mounted
 
 say "flood: $FILES small files, and a $COPY_MIB MiB copy"
@@ -112,24 +166,28 @@ FLOOD=$!
 cp "$WORK/src/big.bin" "$MNT/big.bin" &
 COPY=$!
 sleep 4
-say "deploy: kill -9 the cloud while they are in flight"
-kill -9 "$(cat "$WORK/cloud.pid")"
+say "SIGKILL the server's two containers while they are in flight"
+server_kill
 sleep 5
-say "the cloud comes back on the same data"
-start_cloud; cloud_up
+say "the server comes back on the same volumes"
+server_up
 wait $FLOOD; wait $COPY
-say "writers finished; waiting for the cloud to hold everything"
+say "writers finished; waiting for the server to hold everything"
 verify flood 0 "$FILES" big.bin
 
-say "the cloud goes down; $((FILES / 4)) more files are written; then the mounting process is killed too"
-kill -9 "$(cat "$WORK/cloud.pid")"
+say "the server goes down; $((FILES / 4)) more files are written; then the mounting process is killed too"
+server_kill
 write_files 100000 $((FILES / 4)) offline
 sleep 1
 kill -9 "$(cat "$WORK/mount.pid")"
-say "waiting for the kernel to drop the dead mount (one to two minutes)"
+# The kernel only notices a dead mount when something asks it for
+# something: untouched, this one was still in the mount table three minutes
+# later. One `ls`, left to time out by itself, starts the clock.
+(ls "$MNT" > /dev/null 2>&1 &)
+say "waiting for the kernel to drop the dead mount (about a minute)"
 wait_unmounted
-say "cloud and mount start again"
-start_cloud; cloud_up
+say "server and mount start again"
+server_up
 start_mount; wait_mounted
 verify offline 100000 $((FILES / 4))
 ls "$MNT/offline" | wc -l | xargs -I{} echo "$(date +%H:%M:%S)  the remounted drive lists {} files in offline/"
@@ -137,5 +195,4 @@ ls "$MNT/offline" | wc -l | xargs -I{} echo "$(date +%H:%M:%S)  the remounted dr
 say "eject"
 kill -INT "$(cat "$WORK/mount.pid")"
 wait_unmounted
-kill "$(cat "$WORK/cloud.pid")" 2>/dev/null || true
 say "PASSED"

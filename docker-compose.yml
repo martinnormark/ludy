@@ -1,0 +1,92 @@
+# Ludy's server, self-hosted. No settings are needed:
+#
+#   docker compose up -d --wait
+#
+# returns once a drive can answer on http://127.0.0.1:8080. It pulls the
+# server's image; to run the source in this checkout instead, add `--build`.
+#
+#   rivet   the Rivet engine. It places a drive's actor, and keeps each
+#           drive's SQLite database and its timer. One instance, on its own
+#           disk: fine for one machine, and the engine's own documentation
+#           asks for three instances and a bucket in production.
+#   ludy    this repository's server (providers/rivet): the HTTP front every
+#           client talks to, and the actors, one per drive.
+#
+# Sealed shards and manifests go to a volume. To keep them in Cloudflare R2
+# or any S3 instead, add docker-compose.r2.yml or docker-compose.minio.yml:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.r2.yml up -d
+#
+# There is no sign-in yet: whoever can reach port 8080 can read and change
+# every drive (what they read is sealed; they hold no key). So the port is
+# published on this machine only. Put it behind something that authenticates
+# before changing that; docs/hosting/README.md says what that takes.
+name: ludy
+
+services:
+  rivet:
+    # The same release as the `rivetkit` crate in providers/rivet/Cargo.toml
+    # and as the tag of the `ludy` image below.
+    image: rivetdev/engine:3.1.1
+    restart: unless-stopped
+    environment:
+      # Only `ludy` can reach the engine (its port is not published), so a
+      # fixed token does for one machine. Set RIVET_TOKEN in .env otherwise.
+      RIVET__AUTH__ADMIN_TOKEN: ${RIVET_TOKEN:-ludy-on-one-machine}
+      RIVET__STORAGE__LOG_DIRECTORY: /var/lib/rivet/log
+      RIVET__STORAGE__AUTO_PROVISION_PARTITIONS: "1"
+      RIVET__STORAGE__BALANCING__ENABLED: "false"
+      RIVET__OBJECT_STORAGE__PRIMARY__FILE_SYSTEM__PATH: /var/lib/rivet/objects
+      # How long the engine waits for a server that went silent before it
+      # gives its drives to the next one. `docker compose restart` and `down`
+      # tell the engine and do not wait for this; `kill -9` and a power cut
+      # do. The engine's own default leaves a drive unanswered for most of a
+      # minute then, and two seconds for a few seconds; the measurements are
+      # in docs/hosting/compose.md. Two is what both chaos suites run with.
+      # These two settings were found in the engine, not in its documentation.
+      RIVET__PEGBOARD__NODE_LOST_THRESHOLD: ${RIVET_NODE_LOST_MS:-2000}
+      RIVET__PEGBOARD__NODE_PING_TIMEOUT: ${RIVET_NODE_LOST_MS:-2000}
+    volumes:
+      - rivet-log:/var/lib/rivet/log
+      - rivet-objects:/var/lib/rivet/objects
+    # Healthy when the engine says it is ready; `ludy` starts after that.
+    # The check keeps asking for four seconds before it says no, so a start
+    # is noticed when it happens and not at the next check. (A faster check
+    # while starting only, `start_interval`, needs Docker Engine 25.)
+    healthcheck:
+      test: ["CMD-SHELL", "for i in 1 2 3 4 5 6 7 8; do curl -fsS -o /dev/null http://127.0.0.1:6420/ready 2>/dev/null && exit 0; sleep 0.5; done; exit 1"]
+      interval: 3s
+      timeout: 6s
+      retries: 5
+      start_period: 60s
+
+  # Healthy when a drive answers (`ludy-rivet health`, set in the image).
+  ludy:
+    # Built from this repository by .github/workflows/server-image.yml, for
+    # amd64 and arm64, and pulled if it is not here yet. Its tag is the Rivet
+    # release it is built against: the engine's tag above, the `rivetkit`
+    # crate and this move together. Where it cannot be pulled, Compose
+    # builds it from the checkout, which takes some minutes.
+    image: ghcr.io/martinnormark/ludy-rivet:rivet-3.1.1
+    build:
+      context: .
+      dockerfile: providers/rivet/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      rivet:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${LUDY_PORT:-8080}:8080"
+    environment:
+      RIVET_ENDPOINT: http://default:${RIVET_TOKEN:-ludy-on-one-machine}@rivet:6420
+      # A folder, in the volume below. The R2 and MinIO files replace this.
+      LUDY_BLOBS: /var/lib/ludy/blobs
+      # How long a shard no version uses is kept, in milliseconds. A day.
+      GC_GRACE_MS: ${GC_GRACE_MS:-86400000}
+    volumes:
+      - ludy-blobs:/var/lib/ludy/blobs
+
+volumes:
+  rivet-log:
+  rivet-objects:
+  ludy-blobs:

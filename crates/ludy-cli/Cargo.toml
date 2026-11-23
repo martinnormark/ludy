@@ -1,6 +1,6 @@
 [package]
 name = "ludy-cli"
-description = "Headless Ludy: list drives, upload, and mount a drive from the terminal"
+description = "Headless Ludy: create drives, upload, and mount a drive from the terminal"
 version.workspace = true
 edition.workspace = true
 
@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 ludy-core = { path = "../ludy-core" }
-ludy-cloud = { path = "../ludy-cloud" }
+ludy-proto = { path = "../ludy-proto" }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 serde_json = "1"

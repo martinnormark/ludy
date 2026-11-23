@@ -1,0 +1,31 @@
+[package]
+name = "ludy-rivet"
+description = "Ludy's cloud on Rivet actors: an actor per drive, shards in any S3 or a folder. The self-hosted provider"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ludy-rivet"
+path = "src/main.rs"
+
+[dependencies]
+ludy-proto = { path = "../../crates/ludy-proto" }
+ludy-server = { path = "../../crates/ludy-server" }
+# Pinned to the release of the engine image in docker-compose.yml: the two
+# speak a versioned protocol. The server's own image is tagged with this
+# version too (`rivet-3.1.1`), so change both tags there with it.
+# `sqlite-local` runs each actor's SQLite inside this process (about 60,000
+# statements a second in a transaction, against 2,300 over the wire) and
+# needs LIBSQLITE3_FLAGS, set in .cargo/config.toml.
+rivetkit = { version = "=3.1.1", features = ["sqlite-local"] }
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+bytes = "1"
+futures-util = "0.3"
+object_store = { version = "0.14", features = ["aws"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }

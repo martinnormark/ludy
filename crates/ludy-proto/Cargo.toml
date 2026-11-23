@@ -1,6 +1,6 @@
 [package]
 name = "ludy-proto"
-description = "What a Ludy client and the cloud agree on: the JSON types on the wire, and how file content is cut into shards"
+description = "What a Ludy client and the server agree on: the node-tree protocol, the encryption format, and how file content is cut into shards"
 version.workspace = true
 edition.workspace = true
 

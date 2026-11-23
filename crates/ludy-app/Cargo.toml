@@ -14,4 +14,6 @@ path = "src/main.rs"
 gpui = { version = "0.2.2", default-features = false, features = ["runtime_shaders", "font-kit"] }
 ludy-core = { path = "../ludy-core" }
 anyhow = "1"
+# localtime_r: a file's modification time in this Mac's time zone.
+libc = "0.2"
 objc = "0.2"

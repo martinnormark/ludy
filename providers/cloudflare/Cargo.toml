@@ -1,0 +1,27 @@
+[package]
+name = "ludy-worker"
+description = "Ludy's cloud on Cloudflare Workers: a Durable Object per drive, shards in R2"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# Built only for wasm32 by worker-build, so it stays out of the main
+# workspace: `cargo test` there never tries to build it natively.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+worker = "0.9"
+worker-macros = "0.9"
+ludy-proto = { path = "../../crates/ludy-proto" }
+ludy-server = { path = "../../crates/ludy-server" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

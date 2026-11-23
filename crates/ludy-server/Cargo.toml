@@ -1,0 +1,21 @@
+[package]
+name = "ludy-server"
+description = "Ludy's cloud with no platform in it: a drive's tables, commits, feed and collector, behind ports a provider implements"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Builds for wasm32-unknown-unknown (the Cloudflare provider) and natively
+# (the Rivet provider and the tests). So: no tokio, no threads, no clock and
+# no file access in here. A provider supplies all of those through `ports`.
+[dependencies]
+ludy-proto = { path = "../ludy-proto" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+# The same libsqlite3-sys as the Rivet provider's embedded SQLite; cargo
+# allows one per build.
+rusqlite = { version = "0.32", features = ["bundled"] }
+futures-executor = "0.3"

@@ -16,7 +16,7 @@ Each mounted drive is an NFSv3 server inside the app's own process (the [`nfsser
 | Loopback SMB (what Space's CLI uses) | Would need an SMB2/3 server written from scratch. |
 | WebDAV (`mount_webdav`) | macOS's WebDAV client downloads a file to a local cache when it is opened, which defeats the purpose for a 50 GB file. Not tested here; ruled out on that basis. |
 
-A throwaway spike confirmed this before anything else was built, and the measurements against the real code are under [What works](../evidence/verification.md): a listing causes no object request, and a 64 KiB read in the middle of a 50 GB file causes one 256 KiB range request.
+A throwaway spike confirmed this before anything else was built, and the measurements against the real code are under [what works](../evidence/verification.md#against-real-mounts): a listing fetches no content, and a 64 KiB read in the middle of a 24 MiB file causes one range request.
 
 Mount options are in [`mount.rs`](../../crates/ludy-core/src/mount.rs): 256 KiB reads to match the cache block size, kernel read-ahead of 8 blocks, a one-second attribute cache so remote changes show up quickly, and a soft mount with a dead timeout so a crashed app cannot hang the Finder for long.
 
@@ -34,6 +34,6 @@ What Ludy does about it:
 - If the watchdog expires, the drive is shown as "eject did not finish" with a hint to answer any pending permission prompt, and the eject completes by itself once the kernel lets it through. A force-unmount probably cannot beat a call held by a prompt; the watchdog is the real protection.
 - A stuck eject is recorded on disk with the `umount` process id. While that process is alive, Ludy refuses to mount at the same path, even after a restart.
 - The mount table is read with `getmntinfo(MNT_NOWAIT)`. The app's own process never stats, creates or removes a mount-point path; `mkdir` and `rmdir` run as child processes.
-- If the app is killed outright, the mounts are soft with a 45-second dead timeout. Tested twice with `kill -9`: the kernel dropped the mount by itself 55 to 57 seconds later, and an `ls` of the dead mount in the meantime failed with "Operation timed out" instead of hanging.
+- If the app is killed outright, the mounts are soft with a 45-second dead timeout. The kernel starts that clock when something next asks the dead mount for anything: after `kill -9`, an `ls` of the mount failed with "Operation timed out" instead of hanging, and the kernel dropped the mount 50 to 57 seconds after it (seen three times). A dead mount that nothing touches stays in the mount table; one was still there three minutes later (2026-11-23). The app unmounts such leftovers under its mount root when it next starts.
 
 If you ever see a stuck eject: look for a macOS permission prompt and answer it. Do not `ls -la` the mount root in the meantime.

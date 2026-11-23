@@ -1,0 +1,79 @@
+# Builds the self-hosted server (providers/rivet) for amd64 and arm64 and
+# publishes it as ghcr.io/<owner>/ludy-rivet, so that `docker compose up`
+# pulls it and does not spend minutes building it.
+#
+# The tag is the Rivet release the server is built against, `rivet-3.1.1`:
+# the server and the engine speak a versioned protocol, and the Compose
+# file names that engine and this tag side by side. It is read from
+# providers/rivet/Cargo.toml here, so a new Rivet release means changing the
+# crate there and the two image tags in docker-compose.yml.
+#
+# The build itself is Docker's reusable workflow: one runner per platform,
+# from the commit, with a signed record of where the image came from.
+name: server image
+
+on:
+  push:
+    branches:
+      - main
+    # Everything providers/rivet/Dockerfile copies, and what decides how it
+    # is built.
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - .cargo/**
+      - .dockerignore
+      - crates/**
+      - providers/rivet/**
+      - .github/workflows/server-image.yml
+      # .dockerignore keeps these out of the build.
+      - '!**/*.md'
+
+permissions:
+  contents: read
+
+# A newer push replaces the tag anyway; do not let an older build finish last.
+concurrency:
+  group: server-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rivet:
+    name: Which Rivet release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: read
+        run: |
+          version=$(sed -n 's/^rivetkit = { version = "=\([0-9][0-9.]*\)".*/\1/p' providers/rivet/Cargo.toml)
+          test -n "$version" || { echo "no pinned rivetkit version in providers/rivet/Cargo.toml" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "rivetkit $version"
+
+  image:
+    needs: rivet
+    uses: docker/github-builder/.github/workflows/build.yml@v1
+    permissions:
+      contents: read # to fetch the repository
+      id-token: write # to sign the record of the build
+      packages: write # to publish to ghcr.io
+    with:
+      output: image
+      push: true
+      file: providers/rivet/Dockerfile
+      platforms: linux/amd64,linux/arm64
+      cache: true
+      cache-scope: ludy-rivet
+      cache-mode: max
+      # The source label ties the package to this repository.
+      set-meta-labels: true
+      meta-images: ghcr.io/${{ github.repository_owner }}/ludy-rivet
+      meta-tags: |
+        type=raw,value=rivet-${{ needs.rivet.outputs.version }}
+    secrets:
+      registry-auths: |
+        - registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}

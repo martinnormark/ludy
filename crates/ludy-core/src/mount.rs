@@ -21,7 +21,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use tokio::process::Command;
 
-use crate::drive::DriveFs;
+use crate::sealed_drive::SealedDrive;
 use crate::nfs::NfsDrive;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -67,7 +67,7 @@ pub fn ludy_mounts(root: &Path) -> Vec<MountEntry> {
 }
 
 /// Start serving `fs` over NFSv3 on a free loopback port.
-pub async fn serve(fs: Arc<DriveFs>, read_only: bool) -> Result<(u16, tokio::task::JoinHandle<()>)> {
+pub async fn serve(fs: Arc<SealedDrive>, read_only: bool) -> Result<(u16, tokio::task::JoinHandle<()>)> {
     let export = fs.name.clone();
     let mut listener = NFSTcpListener::bind("127.0.0.1:0", NfsDrive::new(fs, read_only)).await.context("bind NFS listener")?;
     listener.with_export_name(&export);
@@ -264,7 +264,7 @@ pub async fn detach(mountpoint: &Path, watchdog: Duration) -> Result<Detach> {
 /// Wait until the volume has seen no filesystem calls for `quiet`, giving up
 /// after `max`. Ejecting while something is crawling the volume is what the
 /// spike showed to be dangerous, so give crawlers a moment to finish.
-pub async fn wait_quiet(fs: &DriveFs, quiet: Duration, max: Duration) -> bool {
+pub async fn wait_quiet(fs: &SealedDrive, quiet: Duration, max: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + max;
     loop {
         let last = fs.last_activity_ms.load(std::sync::atomic::Ordering::Relaxed);

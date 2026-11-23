@@ -1,51 +1,74 @@
 # What works, and how it was checked
 
-Three kinds of check, in three sections: automated tests with no kernel mount involved, real mounts on macOS, and by hand. The last section lists what was not verified. All of this is about the engine and the simulated cloud; the encrypted cloud's checks are in [the real cloud](../real-cloud/overview.md).
+Four kinds of check, in four sections: automated tests, real mounts on macOS, the command line and scripts by hand, and the app from screenshots. Everything here was done on 2026-11-23 on one Mac over loopback unless a line says otherwise, with the engine the app uses now and a real server. What was not checked is in [known problems](../known-issues.md#not-verified); the largest gaps are the Finder and applications on a mount, most of the app's controls, and anything deployed.
 
 ## By automated tests
 
-Checked by `cargo test` (68 integration tests and 34 unit tests in the protocol, cloud and engine crates, no kernel mount involved; the cloud server's request log is the witness; 24 of the integration tests are the chaos tests described under [Chaos testing](chaos-testing.md)):
+`cargo test`, which needs no server: 87 tests pass, in the protocol, the engine, the server's logic and the app.
 
-- A listing shows real sizes, including a 50 GB synthetic file, with no object bytes downloaded.
-- A 64 KiB read from the middle of the 50 GB file returns the right bytes (compared with the generator) and causes one range request of at most two blocks.
-- A second read, and a read after "restarting" with a fresh cache object over the same folder, cause no request.
-- Sequential reads trigger read-ahead in coalesced requests; a large read is fetched in parallel; six readers of one block share one request. A reader that wants the first block of a 2 MiB request gets it while the rest is still arriving.
-- The cache stays under its cap and evicts; pinned files survive eviction and read without the network.
-- Writes return without waiting for the cloud, are readable immediately, and upload in the background; partial overwrites, appends and truncates merge correctly.
-- Folder creation, rename (including the write-temp-then-rename save pattern) and delete are replayed in order.
-- Changes made directly on the server (add, modify, delete) appear in the drive's tree in under two seconds.
-- The NFS adapter serves lookups, paginated listings, reads and writes, and rejects file handles from an earlier mount. A folder read in pages of any size gives every entry once; a page asked for after an entry that has since gone starts the listing over.
-- Server: HTTP range semantics, versions and restore, `If-Match` races, rename, fork without copying, long-poll, throttling, the range log, and persistence across restarts.
-- Shards on the server: a 24 MiB object is stored as shards named by their SHA-256 and reads back across shard boundaries; the same content under three keys in two drives is stored once; a 4 KiB edit adds at most three shards; a shard whose body does not hash to its name, a manifest naming an absent shard, and one whose lengths do not add up are refused; deletes and the history cap release shards nothing else uses, and keep the ones a fork or another key still needs; a restart keeps what is in use and removes uploads that never committed; a data folder written before shards existed (whole-object blobs) still serves and its keys move to shards when next written.
-- Shards from the engine: a new 10 MiB file goes up as shards, each byte once, and the same bytes written under another name send nothing; a 4 KiB write into a 24 MiB file sends at most three shards and under 8 MiB, and downloads under 8 MiB to re-cut the touched shard; 605,000 bytes written into a 50 GB synthetic file upload exactly 605,000 bytes and download nothing; truncating and growing a file keeps its untouched leading shards and never brings old bytes back.
+- **The format.** The Rust code reproduces test vectors written by a second implementation in JavaScript ([`crypt-v1.mjs`](../../crates/ludy-proto/tests/vectors/crypt-v1.mjs)). Unit tests cover damage: a flipped byte, swapped frames, a missing tail, a frame of another shard, a key, name or manifest moved to another node.
+- **The server's logic**, on SQLite in memory: the rules of a commit, the feed, the collector, and a commit that fails at every statement in turn leaving all of it or none.
+- **The keystore.** Drives are kept per server, survive a reopen, cannot share a name or be listed twice; the file is mode 0600; a file that does not parse is not replaced. Two keystores open on one file keep each other's changes, as do seven processes adding ten drives each at once; with the lock taken out, that test fails. And once by hand: with the app open on an empty keystore, `ludy add` from a terminal, and the drive was in the app's window two seconds later.
+- **The mount's bookkeeping**, the cache, the patch planner and the range arithmetic.
+
+Against a server the test starts, on each provider (ignored in a plain `cargo test`; see [chaos testing](chaos-testing.md)): the server under chaos, 13 tests, and the engine under chaos, 18 tests, all pass on both. They cover reads that fetch only what is asked for, uploads that send only what changed, crashes with unsent writes, two Macs on one drive, restoring a version, synthetic files, copying folders in and out, and drive keys.
 
 ## Against real mounts
 
-Checked against real mounts on macOS 27.0.1, with the CLI and with the app (`--mount`), using the demo data from `scripts/seed-demo.sh`:
+Hidden mounts (`nobrowse`) under a scratch folder, driven from the shell.
 
-- **Listing.** `ls -la` shows every file at its real size, the 50 GB one included, and causes no object request.
-- **Mid-file read.** A 64 KiB `dd` at the 25 GiB mark of the 50 GB file returns bytes equal to an independent SplitMix64 written in Python, and the server log shows one request: `bytes=26843545600-26843807743` (256 KiB). The cache grew by 256 KiB.
-- **Video.** Playing `demo.mp4` (95 MB, 104 s) with AVPlayer, the framework Quick Look uses, from a hidden mount with an empty cache: first frame after 0.30 s, 7.6 s played in 8 s of wall time, 12 range requests of 256 KiB to 2 MiB covering the first 14.9 MB (16% of the file), cache at 14 MB. A Quick Look thumbnail (`qlmanage -t`) was produced from the mount.
-- **Nothing reads behind your back.** A Finder-visible mount left untouched for 30 seconds caused no range request. During the earlier tests one 30-byte read of `shot-list.txt` appeared that the test did not make; its origin is unknown.
-- **Finder.** The mount has no `nobrowse` flag, the sidebar lists `ludy.localhost` under Locations with an eject button, and the computer view lists the drive as a remote volume.
-- **Writes.** `cp` of a 3 MB file returned in 0.08 s; the PUT followed in the background and the server's copy has the same SHA-256. `mkdir`, `mv` and `rm` reached the server in order. `._*` files stayed local.
-- **Remote changes.** A file put on the server with `curl`, and one deleted there, showed in `ls` within three seconds. Repeated after the change feed went in: the server's log shows the mount asking `?feed` (1 changed; then 1 deleted) and no listing.
-- **Shards.** On a hidden mount, with the server log as witness. `cp` of a 20 MiB file: 8 shard uploads, 20,971,520 bytes, then a commit with an empty body. `cp` of the same file under another name: the check answered "0 of 8 missing", no shard was sent, and the server's disk did not grow. Five bytes written at 10 MiB + 123 with `dd conv=notrunc`: one shard of 5,289,289 bytes sent, and the server's copy equals the expected patched file while the second copy is unchanged. 8 KiB written at 25 GiB + 4096 of the 50 GB synthetic file: one shard of 8,192 bytes sent (the kernel first read the 256 KiB block around the write, one range request); the file is still 50 GB; reading it back through the mount and from the server gives the generated bytes, then the 8 KiB, then generated bytes again; the server's data folder stayed at 116 MB. After a server restart the shard totals were unchanged (52 shards, 121,369,066 bytes) and `ludy put` of a 7 MB file sent 5 shards the first time and nothing under a second key.
-- **Eject.** Ctrl-C in the CLI and SIGTERM to the app both ejected in one to two seconds, with a Finder window open on the volume, and a write made just before the eject was uploaded first. No mount was left behind in nine cycles.
-- **The app.** Started with `--mount Footage`, it mounted the drive, showed the card as mounted with its path, and the status panel counted the range request and the cache blocks.
-- **Crash.** See [the eject section](../how-it-works/mount.md#eject-and-the-network-volume-prompt): the kernel drops the mount of a killed process after 55 to 57 seconds.
+**From the Compose server**, a drive seeded with the CLI:
 
-## By hand, without a mount
+- **Listing.** `ls -la` showed every file at its size, a 50 GiB synthetic one included (53,687,091,200 bytes).
+- **Reading.** A 3 MB file read through the mount compared equal to its source. 64 KiB read at 26 GB into the synthetic file came back with no range request; that the bytes are the right ones is checked by the engine's tests, not here.
+- **A cold read in the middle.** With an empty cache, 64 KiB read with `dd` from the middle of a 24 MiB file compared equal to the source and caused one range request; 513 KiB came down in all, the manifest included.
+- **Writing.** A new text file, a new folder, a 5 MB copy into it, a rename with a move, and five bytes written in place at 1 MB with `dd conv=notrunc`. A second keystore with its own cache then downloaded the files: the patched 5 MB file equalled the expected bytes and the text file its content.
+- **Eject.** Ctrl-C ejected in under two seconds and left no mount behind.
+- **One drive, one process.** While the drive was mounted, `ludy ls` on it from the same keystore was refused with a message naming the cause; after the eject it worked.
 
-Checked by hand, without a mount:
+**From the Worker under `wrangler dev`:** a drive created, a 24 MiB file, a folder and a synthetic file put in it, then mounted. Listing showed all three; a 64 KiB read from the middle of the 24 MiB file and a whole 3 MB file compared equal to their sources, both from the cache the upload had filled; a text file and a 5 MB copy written through the mount were read back, equal, from a second keystore with an empty cache.
 
-- The server, with `curl`: upload of the 95 MB video, range reads compared against the source file, and mid-file bytes of a synthetic 50 GB object compared against the Python generator.
-- The app, from screenshots: the drives screen with a drive mounted and not, the folder grid and list, the drive and file context menus, the share, fork, new-folder and versions dialogs, and an 820 by 560 window.
-- Clicks, posted to the app's own window with `--click` and checked in a screenshot after each: Mount on a card (the drive mounted), the eject icon (it ejected), Open, a folder tile, a breadcrumb, the grid/list toggle, a sidebar drive, the new-folder button, the card's "..." menu and Fork in it, and Versions in a file's menu.
+**From the app:** started with `--mount Footage`, it mounted the drive, `ls` on the mount point listed its three entries, the card showed the drive as mounted with its path and size, and stopping the app with SIGTERM ejected it and left no mount behind.
 
-## Not verified
+### Chaos on a real mount
 
-- **The rest of the app's controls.** Right-click itself (the injected event does not carry the right button, so the file menu was opened with `--demo`), typing in a dialog, Import, Show in Finder, Open in Terminal, Rename, Delete, Share's Send invite, Restore, Keep offline, Clear, and scrolling by hand.
-- **The Quick Look panel** (space bar in the Finder). `qlmanage -p` crashes on any movie on this macOS version, the local file included, so playback was checked with AVPlayer instead.
-- **Dragging a file in with the Finder**, and how quickly a Finder window redraws after a server-side change. Both were checked from the shell only.
-- **Another app raising the "network volume" prompt during an eject.** The watchdog path for that is written but has only been reasoned about.
+[`scripts/chaos-mount.sh`](../../scripts/chaos-mount.sh), once to the end: 2,000 small files and a 200 MiB copy written through a mount while both of the server's containers were killed and restarted, then 500 more files written with the server down and the mounting process killed with `kill -9`. Every file reached the server as written, checked by download from a second keystore. More in [chaos testing](chaos-testing.md#a-real-mount).
+
+## The command line and the scripts
+
+- **Every `ludy` command** was run against the Compose server: `server`, `drives`, `mkdrive`, `key`, `add`, `ls`, `put` of a file and of a folder, `get` of a file and of a folder, `synth`, `mount`, `bench`. `forget` was run against the Worker under `wrangler dev`.
+- **A drive's key on a second keystore.** `ludy key` on one, `ludy add` on another with its own cache, and the second read what the first wrote. This stands in for a second Mac throughout.
+- **`scripts/seed-demo.sh`** made three drives, uploaded the 95 MB video in 5.3 s and added five synthetic files of 12 to 180 GB. Run a second time it changed nothing and sent 2.3 KiB for the video: every shard was already there.
+- **`scripts/seed-stress.sh`** uploaded 5,000 small files in 28.6 s.
+- **TLS.** `LUDY_SERVER=https://example.com ludy server` completed a handshake and reported that what answered is not a Ludy server. No Ludy server has been reached over `https://`.
+
+## The app, from screenshots
+
+Taken of the app's own window against the Compose server with the demo drives:
+
+- The drives screen: three cards, one mounted with its path and "79.6 GB · 4 files", two showing "End-to-end encrypted" because they had not been opened; the sidebar's "Server connected" and `ludy-rivet · 127.0.0.1:8090`.
+- A drive's folder as a grid and as a list, opened without mounting: names, sizes and dates read from the encrypted tree.
+- The drive menu (Open, Show in Finder, Open in Terminal, Copy path, Rename, Copy drive key, Mount, Remove drive) and the file menu (Open, Show in Finder, Open in Terminal, Copy path, Rename, Versions, Delete), opened with `--demo`.
+- The drive-key dialog.
+- Names in a folder of long and awkward ones (no spaces, many dots, accents, a run of forty W's) and in a folder of 1,500 names of 30 to 70 characters: two lines in the grid and one in the list, the middle left out and the extension readable, at the default window size and at 820 by 560.
+- The details pane, opened by a click posted with `--click` on a tile and on a list row: the name in full, kind, size, date, place, and the tile or row shown as selected.
+- A double-click posted with `--dclick` on a file in the last column of the grid, at a point where the pane is blank once open and at a point where its Show in Finder button is: the pane opened, the tiles moved, and both times the file the first click selected was the one opened (the drive was not mounted, so what showed was the notice asking to mount it to open files, not the one about the Finder).
+- That opening the pane moves nothing beside it: screenshots of a folder before and after a file was selected, at window widths of 820, 908, 1000, 1180 and 1400 points, compared pixel by pixel over the header and the first row left of the pane. No pixel differed at 1000, 1180 and 1400 with a file of the second row selected. With a file of the first row selected and the selection's background colour ignored, none differed at those three, and at 820 and 908 the only ones were where the uncovered shot shows the start of the next tile's name and the other shows the margin before the pane.
+- The list with the pane open in a window 908 points wide: two columns left, Name and Size, and names still readable.
+- A file selected in the second row of a window 480 points high: after the grid went from six tiles in a row to four, the selected tile was on screen.
+
+Scrolling a folder of 5,000 files was measured with `--perf`; the numbers are in [the app](../how-it-works/app.md#scrolling-a-large-folder).
+
+Apart from those posted clicks, no control was clicked in the window. What each does goes through engine calls that the tests cover, and the list of what was not exercised is in [known problems](../known-issues.md#the-app).
+
+## The ways of hosting
+
+Each [hosting](../hosting/README.md) page ends with what was checked for it. In one line each: Compose with a volume, Compose with MinIO, Compose with a real R2 bucket, the binary beside an engine and the Worker under `wrangler dev` were all started and used today; the deployed Worker has never been run.
+
+## What was checked before and not again
+
+These were seen on the engine Ludy started on, against the simulated server, and are recorded in [history](../history/verification.md). The mount adapter and the app's window code are largely the same, but none of this has been repeated on the current engine:
+
+- A Finder-visible mount: the sidebar entry, the eject button, a Finder window open during an eject.
+- Video playback from a mount (first frame after 0.30 s with AVPlayer) and a Quick Look thumbnail.
+- That an untouched mount causes no reads.

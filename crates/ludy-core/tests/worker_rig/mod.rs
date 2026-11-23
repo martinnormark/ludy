@@ -1,11 +1,29 @@
-//! What the Worker chaos tests stand on: the Worker under `wrangler dev` as
-//! a process that can be killed, frozen and restarted; a proxy in front of
-//! it that loses requests and replies; and a client that keeps trying until
-//! it has an answer, counting what it saw on the way.
+//! What the chaos tests of the server and the engine stand on: the server as a
+//! process that can be killed, frozen and restarted; a proxy in front of it
+//! that loses requests and replies; and a client that keeps trying until it
+//! has an answer, counting what it saw on the way.
+//!
+//! The server is whichever provider `LUDY_PROVIDER` names:
+//!
+//! * `cloudflare` (the default): the Worker under `wrangler dev`.
+//! * `rivet`: `target/release/ludy-rivet` with a Rivet engine in a Docker
+//!   container of its own and a folder for the blobs. Build the binary first
+//!   (`cargo build --release -p ludy-rivet`).
+//!
+//! The type is still called [`Worker`]: the suites were written against the
+//! Cloudflare Worker, and they are the conformance test for every provider.
+//!
+//! On Rivet the server keeps its blobs in a folder of the rig's own. With
+//! `LUDY_RIG_S3_BUCKET` set it keeps them in that bucket instead (see
+//! [`s3_store`]), reached through [`StoreProxy`], which the suites use to
+//! take the store away. `scripts/chaos-r2.sh` sets these; nothing else does,
+//! so an ordinary run never touches anyone's bucket.
 //!
 //! Everything the rig starts is in a process group of its own, on ports of
 //! its own, with its state in a temporary folder, and it signals nothing
-//! else.
+//! else. A Rivet engine container is named `ludy-rig-<port>` and removed
+//! when the rig is dropped; if a test run is itself killed, remove what it
+//! left with `docker rm -fv $(docker ps -aq --filter label=ludy-rig)`.
 
 #![allow(dead_code)]
 
@@ -23,13 +41,113 @@ use serde::de::DeserializeOwned;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 
-pub fn worker_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../worker")
+/// Which server the suites run against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Provider {
+    Cloudflare,
+    Rivet,
 }
 
-/// The Worker can only run where Node and its packages are installed.
+pub fn provider() -> Provider {
+    match std::env::var("LUDY_PROVIDER").unwrap_or_default().as_str() {
+        "" | "cloudflare" => Provider::Cloudflare,
+        "rivet" => Provider::Rivet,
+        other => panic!("LUDY_PROVIDER={other}: the providers are cloudflare and rivet"),
+    }
+}
+
+/// What `kill -9` takes on Rivet: `LUDY_RIVET_KILL` is `both` (the default:
+/// the server and the engine's container, as when their machine loses
+/// power), `server` or `engine`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kill {
+    Both,
+    Server,
+    Engine,
+}
+
+fn kill_mode() -> Kill {
+    match std::env::var("LUDY_RIVET_KILL").unwrap_or_default().as_str() {
+        "" | "both" => Kill::Both,
+        "server" => Kill::Server,
+        "engine" => Kill::Engine,
+        other => panic!("LUDY_RIVET_KILL={other}: both, server or engine"),
+    }
+}
+
+/// The Rivet engine image. The same release as the `rivetkit` crate in
+/// `providers/rivet/Cargo.toml` and the image in its `docker-compose.yml`.
+const RIVET_ENGINE_IMAGE: &str = "rivetdev/engine:3.1.1";
+/// The engine's admin token inside the rig. Nothing outside the rig can reach that engine.
+const RIVET_TOKEN: &str = "rig";
+/// A drive nobody creates, asked for to see whether drives answer yet.
+const PROBE_DRIVE: &str = "ffffffffffffffffffffffffffffffff";
+
+pub fn worker_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../providers/cloudflare")
+}
+
+fn rivet_binary() -> PathBuf {
+    match std::env::var("LUDY_RIVET_BIN") {
+        Ok(path) => PathBuf::from(path),
+        Err(_) => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/release/ludy-rivet"),
+    }
+}
+
+fn docker(args: &[&str]) -> bool {
+    Command::new("docker").args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
+}
+
+/// Whether the chosen provider can be started here. A suite that finds it
+/// cannot skips itself and says what is missing.
 pub fn available() -> bool {
-    worker_dir().join("node_modules/.bin/wrangler").exists()
+    match provider() {
+        Provider::Cloudflare => {
+            let there = worker_dir().join("node_modules/.bin/wrangler").exists();
+            if !there {
+                eprintln!("skipped: app/providers/cloudflare/node_modules is not installed (run `npm install` in app/providers/cloudflare)");
+            }
+            there
+        }
+        Provider::Rivet => {
+            if !rivet_binary().exists() {
+                eprintln!("skipped: {} is not built (run `cargo build --release -p ludy-rivet`)", rivet_binary().display());
+                return false;
+            }
+            if !docker(&["version"]) {
+                eprintln!("skipped: Docker is not running, and the Rivet engine runs in a container");
+                return false;
+            }
+            true
+        }
+    }
+}
+
+/// A bucket for the Rivet server's blobs, from the environment:
+/// `LUDY_RIG_S3_BUCKET`, `LUDY_RIG_S3_ENDPOINT` (an `https://` address),
+/// `LUDY_RIG_S3_KEY_ID`, `LUDY_RIG_S3_SECRET`, and `LUDY_RIG_S3_REGION`
+/// (`auto` if not given). `None`, the usual case: a folder.
+struct S3 {
+    bucket: String,
+    endpoint: String,
+    key_id: String,
+    secret: String,
+    region: String,
+}
+
+fn s3_store() -> Option<S3> {
+    let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    let bucket = var("LUDY_RIG_S3_BUCKET")?;
+    assert_eq!(provider(), Provider::Rivet, "LUDY_RIG_S3_BUCKET is for LUDY_PROVIDER=rivet: the Worker under wrangler dev has its own emulated R2");
+    let need = |name: &str| var(name).unwrap_or_else(|| panic!("LUDY_RIG_S3_BUCKET is set, so {name} must be too"));
+    let endpoint = need("LUDY_RIG_S3_ENDPOINT");
+    assert!(endpoint.starts_with("https://"), "LUDY_RIG_S3_ENDPOINT must be https: the store proxy tunnels TLS and nothing else");
+    Some(S3 { bucket, endpoint, key_id: need("LUDY_RIG_S3_KEY_ID"), secret: need("LUDY_RIG_S3_SECRET"), region: var("LUDY_RIG_S3_REGION").unwrap_or_else(|| "auto".into()) })
+}
+
+/// Whether this run keeps the server's blobs in a real bucket.
+pub fn store_is_remote() -> bool {
+    std::env::var("LUDY_RIG_S3_BUCKET").is_ok_and(|v| !v.is_empty())
 }
 
 fn free_port() -> u16 {
@@ -38,26 +156,45 @@ fn free_port() -> u16 {
 
 // ------------------------------------------------------------ the process
 
+/// The Rivet engine's container, beside the server's own process.
+struct Engine {
+    name: String,
+    port: u16,
+    created: bool,
+}
+
 pub struct Worker {
     pub dir: tempfile::TempDir,
     pub port: u16,
     inspector: u16,
     vars: Vec<(String, String)>,
     child: Option<Child>,
+    /// Only with the Rivet provider.
+    engine: Option<Engine>,
+    s3: Option<S3>,
+    /// Between the server and its bucket, when the blobs are in one.
+    pub store: Option<StoreProxy>,
     /// How long each start took, in milliseconds.
     pub starts: Vec<u64>,
     pub kills: u32,
 }
 
 impl Worker {
-    /// Start the Worker with the `_dev` routes on and the collector's grace
+    /// Start the server with the `_dev` routes on and the collector's grace
     /// period as given (use a huge one to keep the collector from running by itself).
     pub async fn start(gc_grace_ms: i64) -> Worker {
         Worker::start_with(vec![("LUDY_DEV".into(), "1".into()), ("GC_GRACE_MS".into(), gc_grace_ms.to_string())]).await
     }
 
     pub async fn start_with(vars: Vec<(String, String)>) -> Worker {
-        let mut w = Worker { dir: tempfile::tempdir().unwrap(), port: free_port(), inspector: free_port(), vars, child: None, starts: vec![], kills: 0 };
+        let port = free_port();
+        let engine = (provider() == Provider::Rivet).then(|| Engine { name: format!("ludy-rig-{port}"), port: free_port(), created: false });
+        let s3 = s3_store();
+        let store = match &s3 {
+            Some(_) => Some(StoreProxy::start().await),
+            None => None,
+        };
+        let mut w = Worker { dir: tempfile::tempdir().unwrap(), port, inspector: free_port(), vars, child: None, engine, s3, store, starts: vec![], kills: 0 };
         w.boot().await;
         w
     }
@@ -74,35 +211,105 @@ impl Worker {
         format!("http://127.0.0.1:{}", self.port)
     }
 
+    /// The server's own process, not started yet.
+    fn command(&self) -> Command {
+        let Some(engine) = &self.engine else {
+            let mut cmd = Command::new(worker_dir().join("node_modules/.bin/wrangler"));
+            cmd.current_dir(worker_dir())
+                .args(["dev", "--port", &self.port.to_string(), "--inspector-port", &self.inspector.to_string()])
+                .args(["--persist-to", self.dir.path().join("state").to_str().unwrap(), "--show-interactive-dev-session=false"])
+                .env("WRANGLER_SEND_METRICS", "false");
+            for (k, v) in &self.vars {
+                cmd.args(["--var", &format!("{k}:{v}")]);
+            }
+            return cmd;
+        };
+        let mut cmd = Command::new(rivet_binary());
+        cmd.env("RIVET_ENDPOINT", format!("http://default:{RIVET_TOKEN}@127.0.0.1:{}", engine.port))
+            .env("LUDY_LISTEN", format!("127.0.0.1:{}", self.port))
+            .env("LUDY_BLOBS", self.dir.path().join("blobs"))
+            // Without the two the harness sets, the server must behave as it does for anyone.
+            .env_remove("LUDY_DEV")
+            .env_remove("GC_GRACE_MS");
+        if let (Some(s3), Some(store)) = (&self.s3, &self.store) {
+            cmd.env("LUDY_BLOBS", format!("s3://{}", s3.bucket))
+                .env("AWS_ENDPOINT", &s3.endpoint)
+                .env("AWS_ACCESS_KEY_ID", &s3.key_id)
+                .env("AWS_SECRET_ACCESS_KEY", &s3.secret)
+                .env("AWS_REGION", &s3.region)
+                // Every connection to the bucket goes through the rig.
+                .env("AWS_PROXY_URL", store.url());
+        }
+        for (k, v) in &self.vars {
+            cmd.env(k, v);
+        }
+        cmd
+    }
+
+    /// Start the Rivet engine's container, or start it again after a kill.
+    /// Its state is in the container, so it is what the engine had on disk.
+    fn boot_engine(&mut self) {
+        let Some(engine) = &mut self.engine else { return };
+        if engine.created {
+            assert!(docker(&["start", &engine.name]), "docker start {}", engine.name);
+            return;
+        }
+        let publish = format!("127.0.0.1:{}:6420", engine.port);
+        let token = format!("RIVET__AUTH__ADMIN_TOKEN={RIVET_TOKEN}");
+        #[rustfmt::skip]
+        let run = [
+            "run", "-d", "--name", &engine.name, "--label", "ludy-rig=1", "-p", &publish,
+            "-e", &token,
+            // One instance, everything on its own disk, and the same wait for
+            // a silent node: what docker-compose.yml runs.
+            "-e", "RIVET__STORAGE__LOG_DIRECTORY=/var/lib/rivet/log",
+            "-e", "RIVET__STORAGE__AUTO_PROVISION_PARTITIONS=1",
+            "-e", "RIVET__STORAGE__BALANCING__ENABLED=false",
+            "-e", "RIVET__OBJECT_STORAGE__PRIMARY__FILE_SYSTEM__PATH=/var/lib/rivet/objects",
+            // How long the engine waits before it gives a dead node's actors
+            // to another. The default is about 45 s, which a suite that
+            // kills the node dozens of times cannot afford.
+            "-e", "RIVET__PEGBOARD__NODE_LOST_THRESHOLD=2000",
+            "-e", "RIVET__PEGBOARD__NODE_PING_TIMEOUT=2000",
+            "-v", "/var/lib/rivet/log", "-v", "/var/lib/rivet/objects",
+            RIVET_ENGINE_IMAGE,
+        ];
+        assert!(docker(&run), "docker run {RIVET_ENGINE_IMAGE} as {}", engine.name);
+        engine.created = true;
+    }
+
     async fn boot(&mut self) {
         let started = Instant::now();
-        let log = std::fs::OpenOptions::new().create(true).append(true).open(self.log_path()).unwrap();
-        let mut cmd = Command::new(worker_dir().join("node_modules/.bin/wrangler"));
-        cmd.current_dir(worker_dir())
-            .args(["dev", "--port", &self.port.to_string(), "--inspector-port", &self.inspector.to_string()])
-            .args(["--persist-to", self.dir.path().join("state").to_str().unwrap(), "--show-interactive-dev-session=false"])
-            .env("WRANGLER_SEND_METRICS", "false")
-            .stdin(Stdio::null())
-            .stdout(log.try_clone().unwrap())
-            .stderr(log)
-            // A group of its own, so that killing it takes workerd along and nothing else.
-            .process_group(0);
-        for (k, v) in &self.vars {
-            cmd.args(["--var", &format!("{k}:{v}")]);
+        self.boot_engine();
+        // After a kill of the engine alone the server is still running.
+        if self.child.is_none() {
+            let log = std::fs::OpenOptions::new().create(true).append(true).open(self.log_path()).unwrap();
+            let mut cmd = self.command();
+            cmd.stdin(Stdio::null())
+                .stdout(log.try_clone().unwrap())
+                .stderr(log)
+                // A group of its own, so that killing it takes its children along and nothing else.
+                .process_group(0);
+            self.child = Some(cmd.spawn().expect("start the server"));
         }
-        self.child = Some(cmd.spawn().expect("start wrangler dev"));
         let http = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().unwrap();
         let deadline = Instant::now() + Duration::from_secs(180);
+        // Up means a drive answers. On Rivet the front is up before the
+        // engine has given the node its actors back.
+        let probe = match self.engine {
+            Some(_) => format!("{}/drives/{PROBE_DRIVE}", self.url()),
+            None => self.url(),
+        };
         loop {
-            if let Ok(r) = http.get(self.url()).send().await {
-                if r.status().is_success() {
+            if let Ok(r) = http.get(&probe).send().await {
+                if r.status().is_success() || r.status().as_u16() == 404 {
                     break;
                 }
             }
             if let Some(status) = self.child.as_mut().unwrap().try_wait().unwrap() {
-                panic!("wrangler dev exited with {status}:\n{}", tail(&self.log(), 40));
+                panic!("the server exited with {status}:\n{}", tail(&self.log(), 40));
             }
-            assert!(Instant::now() < deadline, "wrangler dev did not come up:\n{}", tail(&self.log(), 40));
+            assert!(Instant::now() < deadline, "the server did not come up:\n{}", tail(&self.log(), 40));
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         self.starts.push(started.elapsed().as_millis() as u64);
@@ -116,7 +323,9 @@ impl Worker {
         signal_group(self.pid(), signal);
     }
 
-    /// Stop every process of the Worker where it stands; requests hang.
+    /// Stop every process of the server where it stands; requests hang.
+    /// On Rivet that is the node, front and actors together; the engine
+    /// keeps running and sees a node that has stopped answering.
     pub fn freeze(&self) {
         self.signal(libc::SIGSTOP);
     }
@@ -126,13 +335,28 @@ impl Worker {
     }
 
     /// `kill -9` the whole group: nothing gets to flush or say goodbye.
+    /// On Rivet the engine's container is killed the same way right after,
+    /// as when the machine both run on loses power.
     pub fn kill9(&mut self) {
+        if let (Some(engine), Kill::Engine) = (&self.engine, kill_mode()) {
+            if self.child.is_some() && docker(&["kill", "-s", "KILL", &engine.name]) {
+                self.kills += 1;
+            }
+            return;
+        }
+        self.kill_server(kill_mode() == Kill::Both);
+    }
+
+    fn kill_server(&mut self, engine_too: bool) {
         if let Some(mut child) = self.child.take() {
             let pid = child.id() as i32;
             // A stopped process does not die until it is continued on some systems; be sure.
             signal_group(pid, libc::SIGCONT);
             signal_group(pid, libc::SIGKILL);
             let _ = child.wait();
+            if let (Some(engine), true) = (&self.engine, engine_too) {
+                docker(&["kill", "-s", "KILL", &engine.name]);
+            }
             self.kills += 1;
             // The port must really be free before anything is started on it again.
             let deadline = Instant::now() + Duration::from_secs(20);
@@ -155,9 +379,19 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        self.kill9();
+        self.kill_server(true);
+        if let Some(engine) = &self.engine {
+            docker(&["rm", "-f", "-v", &engine.name]);
+        }
         if std::thread::panicking() {
-            eprintln!("--- the end of the Worker's log ---\n{}", tail(&self.log(), 60));
+            eprintln!("--- the end of the server's log ---\n{}", tail(&self.log(), 60));
+        }
+        // The log names every drive this server was asked about. A run
+        // against a real bucket keeps it, to clean up by and to look at.
+        if let Ok(keep) = std::env::var("LUDY_RIG_LOG_DIR") {
+            let name = format!("server-{}-{}.log", self.port, ludy_proto::now_ms());
+            let _ = std::fs::create_dir_all(&keep);
+            let _ = std::fs::copy(self.log_path(), PathBuf::from(keep).join(name));
         }
     }
 }
@@ -193,6 +427,226 @@ pub fn log_count(log: &str, event: &str, outcome: Option<&str>) -> usize {
     let event = format!("\"t\":\"{event}\"");
     let outcome = outcome.map(|o| format!("\"outcome\":\"{o}\""));
     log.lines().filter(|l| l.contains(&event) && outcome.as_ref().is_none_or(|o| l.contains(o))).count()
+}
+
+// -------------------------------------------------- the store's proxy
+
+/// What stands between the server and its bucket: an HTTP proxy the
+/// server's S3 client is told to use. The client asks it to `CONNECT` to
+/// the bucket and speaks TLS through the tunnel, so the proxy sees no
+/// request, only bytes, and what it can do to them is what a network does:
+/// refuse the connection, carry nothing while holding it open, or cut it.
+///
+/// The S3 client keeps its connections, so a fault has to reach tunnels
+/// that are already open: every tunnel checks the switches before each
+/// piece it carries.
+pub struct StoreProxy {
+    pub addr: SocketAddr,
+    pub faults: Arc<StoreFaults>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+const STORE_PASS: u32 = 0;
+const STORE_REFUSE: u32 = 1;
+const STORE_STALL: u32 = 2;
+
+#[derive(Default)]
+pub struct StoreFaults {
+    /// Every spell of weather a soak asked for: what, and for how long.
+    spells: Mutex<Vec<(&'static str, u64)>>,
+    mode: AtomicU32,
+    /// Raised to end every tunnel that is open.
+    cut: AtomicU64,
+    pub connections: AtomicU64,
+    pub refused: AtomicU64,
+    pub cuts: AtomicU64,
+    pub bytes_up: AtomicU64,
+    pub bytes_down: AtomicU64,
+}
+
+impl StoreProxy {
+    pub async fn start() -> StoreProxy {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let faults = Arc::new(StoreFaults::default());
+        let shared = faults.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((conn, _)) = listener.accept().await else { break };
+                tokio::spawn(tunnel(conn, shared.clone()));
+            }
+        });
+        StoreProxy { addr, faults, task }
+    }
+
+    pub fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    /// The store is reachable again.
+    pub fn pass(&self) {
+        self.faults.mode.store(STORE_PASS, Ordering::SeqCst);
+    }
+
+    /// The store is gone: open connections end, new ones are turned away.
+    pub fn refuse(&self) {
+        self.faults.mode.store(STORE_REFUSE, Ordering::SeqCst);
+        self.faults.cut.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The store says nothing: connections stay open and carry no byte.
+    pub fn stall(&self) {
+        self.faults.mode.store(STORE_STALL, Ordering::SeqCst);
+    }
+
+    /// Every open connection to the store ends in the middle of whatever
+    /// it was doing; the next one gets through.
+    pub fn sever(&self) {
+        self.faults.cut.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn connections(&self) -> u64 {
+        self.faults.connections.load(Ordering::SeqCst)
+    }
+
+    /// Let the store back in after `ms`, from the side, while the test
+    /// goes on asking the server for things.
+    pub fn heal_after(&self, ms: u64) -> tokio::task::JoinHandle<()> {
+        let faults = self.faults.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            faults.mode.store(STORE_PASS, Ordering::SeqCst);
+        })
+    }
+
+    /// Some weather for a soak, chosen by two rolls of its dice (`kind`
+    /// below 100, `length` below 1000): the store turns connections away,
+    /// says nothing, or drops what is open, mostly for a second or two,
+    /// sometimes for longer than a client waits (3 s here, 8 s in the
+    /// engine), and now and then for longer than any single request lives.
+    /// Returns what it did and the task that lets the store back in.
+    pub fn weather(&self, kind: u64, length: u64) -> (String, tokio::task::JoinHandle<()>) {
+        let short = 300 + length * 5 / 2;
+        let medium = 4000 + length * 4;
+        let long = 32_000 + length * 6;
+        let (what, ms) = match kind {
+            0..=34 => ("is gone", short),
+            35..=64 => ("says nothing", short),
+            65..=79 => ("drops its connections", 0),
+            80..=89 => ("says nothing", medium),
+            90..=96 => ("is gone", medium),
+            _ => ("says nothing", long),
+        };
+        match what {
+            "is gone" => self.refuse(),
+            "says nothing" => self.stall(),
+            _ => self.sever(),
+        }
+        self.faults.spells.lock().unwrap().push((what, ms));
+        (if ms == 0 { format!("the store {what}") } else { format!("the store {what} for {ms} ms") }, self.heal_after(ms))
+    }
+
+    /// The weather a soak had, for its report: how often each kind, the
+    /// longest of each, and how many spells outlasted 3, 8 and 30 seconds
+    /// (the rig client's patience, the engine's, and a request's life).
+    pub fn weather_report(&self) -> String {
+        let spells = self.faults.spells.lock().unwrap();
+        let of = |what: &str| {
+            let ms: Vec<u64> = spells.iter().filter(|s| s.0 == what).map(|s| s.1).collect();
+            (ms.len(), ms.iter().copied().max().unwrap_or(0))
+        };
+        let (gone, silent, dropped) = (of("is gone"), of("says nothing"), of("drops its connections"));
+        let over = |limit: u64| spells.iter().filter(|s| s.1 > limit).count();
+        format!("gone {} times (longest {} ms), silent {} times (longest {} ms), connections dropped {} times; {} spells over 3 s, {} over 8 s, {} over 30 s", gone.0, gone.1, silent.0, silent.1, dropped.0, over(3000), over(8000), over(30_000))
+    }
+
+    /// One line for a report: what went through and what was done to it.
+    pub fn summary(&self) -> String {
+        let n = |a: &AtomicU64| a.load(Ordering::SeqCst);
+        let f = &self.faults;
+        format!("{} connections, {} turned away, {} cut; {} bytes up, {} down", n(&f.connections), n(&f.refused), n(&f.cuts), n(&f.bytes_up), n(&f.bytes_down))
+    }
+}
+
+/// Cut every open connection to the store, from a task that only holds the switches.
+pub fn faults_sever(faults: &StoreFaults) {
+    faults.cut.fetch_add(1, Ordering::SeqCst);
+}
+
+impl Drop for StoreProxy {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Carry one direction of a tunnel until it ends, the switches say stop,
+/// or the tunnel is cut. Returns whether it was the rig that ended it.
+async fn pump(mut from: tokio::net::tcp::OwnedReadHalf, mut to: tokio::net::tcp::OwnedWriteHalf, faults: Arc<StoreFaults>, born: u64, count: fn(&StoreFaults) -> &AtomicU64) -> bool {
+    use tokio::io::AsyncWriteExt;
+    let ended = |f: &StoreFaults| f.cut.load(Ordering::SeqCst) != born || f.mode.load(Ordering::SeqCst) == STORE_REFUSE;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = tokio::select! {
+            read = from.read(&mut buf) => match read { Ok(n) if n > 0 => n, _ => return false },
+            _ = async { while !ended(&faults) { tokio::time::sleep(Duration::from_millis(10)).await } } => return true,
+        };
+        // A stalled store has the bytes and does nothing with them.
+        while faults.mode.load(Ordering::SeqCst) == STORE_STALL && !ended(&faults) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if ended(&faults) {
+            return true;
+        }
+        if to.write_all(&buf[..n]).await.is_err() {
+            return false;
+        }
+        count(&faults).fetch_add(n as u64, Ordering::Relaxed);
+    }
+}
+
+async fn tunnel(mut client: TcpStream, faults: Arc<StoreFaults>) {
+    use tokio::io::AsyncWriteExt;
+    faults.connections.fetch_add(1, Ordering::SeqCst);
+    let born = faults.cut.load(Ordering::SeqCst);
+    // `CONNECT host:port HTTP/1.1`, some headers, an empty line.
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match client.read(&mut byte).await {
+            Ok(1) if head.len() < 8192 => head.push(byte[0]),
+            _ => return,
+        }
+    }
+    let head = String::from_utf8_lossy(&head).into_owned();
+    let mut words = head.split_whitespace();
+    let (Some("CONNECT"), Some(target)) = (words.next(), words.next()) else {
+        let _ = client.write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n").await;
+        return;
+    };
+    // A store that says nothing does not answer the knock either.
+    while faults.mode.load(Ordering::SeqCst) == STORE_STALL && faults.cut.load(Ordering::SeqCst) == born {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    if faults.mode.load(Ordering::SeqCst) == STORE_REFUSE || faults.cut.load(Ordering::SeqCst) != born {
+        faults.refused.fetch_add(1, Ordering::SeqCst);
+        return;
+    }
+    let Ok(upstream) = TcpStream::connect(target).await else {
+        let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+        return;
+    };
+    if client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.is_err() {
+        return;
+    }
+    let (from_client, to_client) = client.into_split();
+    let (from_upstream, to_upstream) = upstream.into_split();
+    let by_the_rig = tokio::select! {
+        r = pump(from_client, to_upstream, faults.clone(), born, |f| &f.bytes_up) => r,
+        r = pump(from_upstream, to_client, faults.clone(), born, |f| &f.bytes_down) => r,
+    };
+    if by_the_rig {
+        faults.cuts.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 // -------------------------------------------------------------- the proxy
@@ -504,6 +958,41 @@ impl Client {
     pub async fn raw(&self, method: reqwest::Method, path: &str, body: Vec<u8>) -> (u16, Vec<u8>) {
         let resp = self.http.request(method, format!("{}{path}", self.base)).timeout(Duration::from_secs(30)).body(body).send().await.expect("the Worker is up");
         (resp.status().as_u16(), resp.bytes().await.unwrap().to_vec())
+    }
+
+    /// One attempt, no retry, with a limit of its own: the status if an
+    /// answer came within `limit`, and how long that took.
+    pub async fn attempt(&self, method: reqwest::Method, path: &str, body: Option<Vec<u8>>, limit: Duration) -> (Option<u16>, Duration) {
+        let started = Instant::now();
+        let mut req = self.http.request(method, format!("{}{path}", self.base)).timeout(limit);
+        if let Some(body) = body {
+            req = req.body(body);
+        }
+        let status = match req.send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                resp.bytes().await.ok().map(|_| status)
+            }
+            Err(_) => None,
+        };
+        (status, started.elapsed())
+    }
+
+    /// The same, keeping what came back: the status and the body as text.
+    pub async fn attempt_text(&self, method: reqwest::Method, path: &str, body: Option<Vec<u8>>, limit: Duration) -> (Option<(u16, String)>, Duration) {
+        let started = Instant::now();
+        let mut req = self.http.request(method, format!("{}{path}", self.base)).timeout(limit);
+        if let Some(body) = body {
+            req = req.body(body);
+        }
+        let answer = match req.send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                resp.text().await.ok().map(|text| (status, text))
+            }
+            Err(_) => None,
+        };
+        (answer, started.elapsed())
     }
 
     /// One attempt, no retry: for requests that are expected to fail.

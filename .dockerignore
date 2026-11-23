@@ -1,0 +1,15 @@
+# The image is built from the manifests and sources only.
+target
+**/target
+**/node_modules
+providers/cloudflare/build
+providers/cloudflare/.wrangler
+.git
+bench
+docs
+data
+scripts
+**/*.md
+.env
+.env.*
+!.env.example

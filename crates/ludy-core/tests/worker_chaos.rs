@@ -1,4 +1,4 @@
-//! Chaos tests for the Worker (`app/worker`): the node-tree protocol under
+//! Chaos tests for the Worker (`app/providers/cloudflare`): the node-tree protocol under
 //! `wrangler dev`, with the process killed with `kill -9`, frozen, and
 //! restarted, and with requests and replies lost on the way.
 //!
@@ -11,7 +11,7 @@
 //! is byte for byte what was written, and storage holds exactly the blobs it
 //! should.
 //!
-//! These need Node and `app/worker/node_modules`, so they are ignored by
+//! These need Node and `app/providers/cloudflare/node_modules`, so they are ignored by
 //! default:
 //!
 //! ```text
@@ -464,7 +464,6 @@ struct Rig {
 
 async fn rig(gc_grace_ms: i64, seed: u64) -> Option<Rig> {
     if !available() {
-        eprintln!("skipped: app/worker/node_modules is not installed (run `npm install` in app/worker)");
         return None;
     }
     let worker = Worker::start(gc_grace_ms).await;
@@ -493,7 +492,7 @@ fn assert_quiet_log(worker: &Worker, allowed: &[&str]) {
 /// The reply to a commit is lost three times. The client keeps sending the
 /// same commit; it must be applied once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn a_lost_reply_does_not_apply_a_commit_twice() {
     let Some(rig) = rig(NEVER, 1).await else { return };
     let mut m = Model::new(&rig.client, 1).await;
@@ -527,7 +526,7 @@ async fn a_lost_reply_does_not_apply_a_commit_twice() {
 
 /// A commit whose last op is refused must leave nothing of its first ops.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn a_refused_commit_leaves_nothing_behind() {
     let Some(rig) = rig(NEVER, 2).await else { return };
     let mut m = Model::new(&rig.client, 2).await;
@@ -589,7 +588,7 @@ async fn a_refused_commit_leaves_nothing_behind() {
 /// `kill -9` while a burst of commits is in flight. Every one of them is
 /// retried until answered, and every one must be there exactly once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn kill_nine_in_a_burst_of_commits() {
     let Some(mut rig) = rig(NEVER, 3).await else { return };
     let mut m = Model::new(&rig.client, 3).await;
@@ -716,7 +715,7 @@ async fn burst_and_kill(rig: &mut Rig, m: &mut Model, creates: usize, tag: u64) 
 /// Two writers put a new version on the same base at the same moment.
 /// Exactly one wins, and the other is told which version it lost to.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn of_two_writers_on_one_base_exactly_one_wins() {
     let Some(rig) = rig(NEVER, 4).await else { return };
     let mut m = Model::new(&rig.client, 4).await;
@@ -753,7 +752,7 @@ async fn of_two_writers_on_one_base_exactly_one_wins() {
 /// A shard that vanishes from storage between upload and commit is named in
 /// the refusal; uploading it again makes the same commit go through.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn a_shard_lost_before_the_commit_is_asked_for_again() {
     let Some(rig) = rig(NEVER, 5).await else { return };
     let mut m = Model::new(&rig.client, 5).await;
@@ -791,7 +790,7 @@ async fn a_shard_lost_before_the_commit_is_asked_for_again() {
 /// writers keep bringing back content whose shards were just let go. No
 /// version may ever come to depend on a shard the collector removed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn the_collector_never_takes_what_a_commit_names() {
     let Some(rig) = rig(0, 6).await else { return };
     let mut m = Model::new(&rig.client, 6).await;
@@ -884,7 +883,7 @@ async fn prepare_racing(client: &Client, m: &mut Model, node: &Id, key: &NodeKey
 /// A panic in the middle of a commit's transaction, after it has written,
 /// must leave nothing of it; and the drive must keep working.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn a_panic_inside_a_commit_leaves_no_half_commit() {
     let Some(rig) = rig(NEVER, 7).await else { return };
     let mut m = Model::new(&rig.client, 7).await;
@@ -916,13 +915,13 @@ async fn a_panic_inside_a_commit_leaves_no_half_commit() {
     let log = rig.worker.log();
     assert!(log.contains("panic inside a transaction"), "the panic should be in the log");
     // The panic itself is in the log, and nothing else is.
-    assert_quiet_log(&rig.worker, &["panicked at src/drive.rs", "panic inside a transaction", "RuntimeError: unreachable", "/_dev/panic"]);
+    assert_quiet_log(&rig.worker, &["ludy-server/src/drive.rs", "panic inside a transaction", "RuntimeError: unreachable", "/_dev/panic"]);
 }
 
 /// The fault switches and the consistency check must not exist unless the
 /// harness asked for them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn the_dev_routes_are_off_unless_switched_on() {
     if !available() {
         return;
@@ -962,7 +961,7 @@ async fn the_dev_routes_are_off_unless_switched_on() {
 /// once the collector has finished, the same commit goes through after a
 /// fresh upload.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn a_collector_cut_short_never_hands_out_what_it_marked() {
     let Some(mut rig) = rig(NEVER, 9).await else { return };
     let mut m = Model::new(&rig.client, 9).await;
@@ -1044,7 +1043,7 @@ async fn a_collector_cut_short_never_hands_out_what_it_marked() {
 
 /// A folder of three thousand files made in three commits and deleted in one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn a_wide_tree_in_few_commits() {
     let Some(rig) = rig(NEVER, 10).await else { return };
     let mut m = Model::new(&rig.client, 10).await;
@@ -1094,7 +1093,7 @@ async fn a_wide_tree_in_few_commits() {
 /// Forty versions of one file: twenty-five are kept, and what the dropped
 /// ones used is let go.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn history_is_capped_and_the_dropped_versions_let_go() {
     let Some(rig) = rig(NEVER, 11).await else { return };
     let mut m = Model::new(&rig.client, 11).await;
@@ -1134,7 +1133,7 @@ async fn history_is_capped_and_the_dropped_versions_let_go() {
 
 /// What does not fit or does not parse is refused with an answer, never an error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Node and app/worker/node_modules"]
+#[ignore = "needs Node and app/providers/cloudflare/node_modules"]
 async fn oversized_and_malformed_requests_are_refused() {
     let Some(rig) = rig(NEVER, 12).await else { return };
     let mut m = Model::new(&rig.client, 12).await;
@@ -1203,8 +1202,279 @@ async fn oversized_and_malformed_requests_are_refused() {
 
 /// Random operations on a drive while the Worker is killed, frozen and
 /// restarted and the proxy loses requests and replies. The seed is printed.
+// ------------------------------------------------- the store taken away
+//
+// These need the server's blobs in a real bucket behind the rig's store
+// proxy (`LUDY_RIG_S3_*`, which `scripts/chaos-r2.sh` sets), and skip
+// themselves otherwise. What "right" means when the store fails:
+//
+// * a request that needs the store gets a 5xx within `STORE_PATIENCE`,
+//   never a wrong answer and never silence;
+// * what needs no store keeps working, and the drive is never held for
+//   longer than one bounded wait;
+// * a commit is applied whole or not at all;
+// * once the store is back, the next attempt succeeds and storage holds
+//   exactly what the commits name.
+
+/// How long the server may take to say that its store did not answer.
+const STORE_PATIENCE: Duration = Duration::from_secs(20);
+
+fn skipped_without_a_bucket() {
+    eprintln!("skipped: the server's blobs are in a folder. scripts/chaos-r2.sh runs this against a bucket");
+}
+
+/// Create a file and commit `data` as its first version.
+async fn write_file(rig: &Rig, m: &mut Model, name: &str, data: Vec<u8>) -> Id {
+    let root = m.root;
+    let (file, op, node) = m.create_op(&root, name, Kind::File);
+    let key = node.key.clone();
+    let put = m.prepare(&rig.client, &file, &key, Some(0), data).await;
+    let version = m.must_commit(&rig.client, vec![op, put.op.clone()], 2, name).await;
+    m.live.insert(file, node);
+    m.committed_version(&file, put, version);
+    file
+}
+
+/// A commit whose blobs the drive has never heard of, so that it has to ask the store about them.
+fn commit_needing_the_store(m: &mut Model, name: &str) -> Commit {
+    let root = m.root;
+    let (file, op, _) = m.create_op(&root, name, Kind::File);
+    m.never.insert(file);
+    let put = Op::Put { node: hex(&file), base: Some(0), size: 10, manifest: hex(&m.rng.bytes(32)), shards: vec![hex(&m.rng.bytes(32))], meta: hex(&m.rng.bytes(37)) };
+    Commit { id: m.commit_id(), ops: vec![op, put] }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "minutes long; needs Node and app/worker/node_modules"]
+#[ignore = "needs a bucket: scripts/chaos-r2.sh"]
+async fn a_store_that_is_gone_fails_requests_in_time_and_nothing_is_half_done() {
+    let Some(rig) = rig(NEVER, 31).await else { return };
+    let Some(store) = &rig.worker.store else { return skipped_without_a_bucket() };
+    let mut m = Model::new(&rig.client, 31).await;
+    write_file(&rig, &mut m, "before.bin", synth::bytes(1, 0, 300_000)).await;
+    let up = store.faults.bytes_up.load(Ordering::SeqCst);
+    assert!(store.connections() > 0 && up > 300_000, "the server did not reach its bucket through the rig's proxy ({})", store.summary());
+
+    store.refuse();
+    let sealed = crypt::seal_shard(&synth::bytes(2, 0, 200_000), &m.dedup);
+    let shard_path = format!("/drives/{}/shards/{}", m.drive, sealed.id_hex());
+    // What the sender is told: that the store did not answer, and nothing
+    // about where or what the store is.
+    let told_only_that = |what: &str, answer: &Option<(u16, String)>, took: Duration| {
+        eprintln!("\n{what} with the store gone: {:?} after {took:?}", answer.as_ref().map(|a| a.0));
+        let (status, text) = answer.as_ref().unwrap_or_else(|| panic!("{what}: no answer in {took:?}"));
+        assert_eq!(*status, 503, "{what} with the store gone");
+        assert!(took < STORE_PATIENCE, "{what}: the server took {took:?} to say its store is gone");
+        assert_eq!(text.trim(), "the blob store did not answer; try again", "{what}");
+        let host = std::env::var("LUDY_RIG_S3_ENDPOINT").unwrap_or_default().replace("https://", "");
+        let bucket = std::env::var("LUDY_RIG_S3_BUCKET").unwrap_or_default();
+        assert!(!text.contains(&host) && !text.contains(&bucket) && !text.contains("http"), "{what}: the reply names the store: {text}");
+    };
+    let (answer, took) = rig.client.attempt_text(reqwest::Method::PUT, &shard_path, Some(sealed.bytes.clone()), Duration::from_secs(240)).await;
+    told_only_that("an upload", &answer, took);
+
+    // A stored shard cannot be read, and the server says so.
+    let stored = m.stored.iter().find(|b| b.starts_with("s/")).unwrap()[2..].to_string();
+    let (answer, took) = rig.client.attempt_text(reqwest::Method::GET, &format!("/drives/{}/shards/{stored}", m.drive), None, Duration::from_secs(240)).await;
+    told_only_that("a read", &answer, took);
+
+    // A commit that has to ask the store is neither applied nor told its
+    // blobs are missing: the server does not know.
+    let commit = commit_needing_the_store(&mut m, "asks-the-store.bin");
+    let body = serde_json::to_vec(&commit).unwrap();
+    let (answer, took) = rig.client.attempt_text(reqwest::Method::POST, &format!("/drives/{}/commit", m.drive), Some(body.clone()), Duration::from_secs(240)).await;
+    told_only_that("a commit that has to look its blobs up", &answer, took);
+
+    // What needs no store goes on: a folder, the feed, the drive's own check.
+    let started = Instant::now();
+    let root = m.root;
+    let (folder, op, node) = m.create_op(&root, "made-without-the-store", Kind::Folder);
+    m.must_commit(&rig.client, vec![op], 1, "a folder while the store is gone").await;
+    m.live.insert(folder, node);
+    rig.client.whole_feed(&m.drive, 100).await;
+    rig.client.check(&m.drive, "while the store is gone").await;
+    assert!(started.elapsed() < Duration::from_secs(5), "a folder, the feed and the check took {:?} with the store gone", started.elapsed());
+
+    // Back: the commit that could not be looked up is now refused for what it is,
+    // the upload goes through, and a new file is written and read.
+    store.pass();
+    let (status, _) = rig.client.attempt(reqwest::Method::POST, &format!("/drives/{}/commit", m.drive), Some(body), Duration::from_secs(60)).await;
+    assert_eq!(status, Some(409), "with the store back, a commit naming blobs nobody uploaded is refused as missing");
+    let name = sealed.id_hex();
+    rig.client.put_shard(&m.drive, &name, sealed.bytes).await;
+    m.stored.insert(format!("s/{name}"));
+    write_file(&rig, &mut m, "after.bin", synth::bytes(3, 0, 300_000)).await;
+    m.verify(&rig.client, true, "after the store came back").await;
+    eprintln!("store proxy: {}", store.summary());
+    assert_quiet_log(&rig.worker, &[]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a bucket: scripts/chaos-r2.sh"]
+async fn a_store_that_says_nothing_does_not_hang_the_drive() {
+    let Some(rig) = rig(NEVER, 32).await else { return };
+    let Some(store) = &rig.worker.store else { return skipped_without_a_bucket() };
+    let mut m = Model::new(&rig.client, 32).await;
+    write_file(&rig, &mut m, "before.bin", synth::bytes(4, 0, 200_000)).await;
+    let other = Model::new(&rig.client, 3200).await;
+
+    store.stall();
+    let sealed = crypt::seal_shard(&synth::bytes(5, 0, 200_000), &m.dedup);
+    let (status, took) = rig.client.attempt(reqwest::Method::PUT, &format!("/drives/{}/shards/{}", m.drive, sealed.id_hex()), Some(sealed.bytes.clone()), Duration::from_secs(240)).await;
+    eprintln!("\nan upload with the store silent: {status:?} after {took:?}");
+    assert!(status == Some(503) && took < STORE_PATIENCE, "an upload with the store silent: {status:?} after {took:?}");
+    // What a mounted drive meets: a read of a shard that is there.
+    let stored = m.stored.iter().find(|b| b.starts_with("s/")).unwrap()[2..].to_string();
+    let (status, took) = rig.client.attempt(reqwest::Method::GET, &format!("/drives/{}/shards/{stored}", m.drive), None, Duration::from_secs(240)).await;
+    eprintln!("a read with the store silent: {status:?} after {took:?}");
+    assert!(status == Some(503) && took < STORE_PATIENCE, "a read with the store silent: {status:?} after {took:?}");
+
+    // A commit that waits for the store holds its drive. While it waits,
+    // the drive's feed must still be answered within the same bound, and
+    // another drive must not notice at all.
+    let commit = commit_needing_the_store(&mut m, "asks-the-store.bin");
+    let (client, path, body) = (rig.client.clone(), format!("/drives/{}/commit", m.drive), serde_json::to_vec(&commit).unwrap());
+    let waiting = tokio::spawn(async move { client.attempt(reqwest::Method::POST, &path, Some(body), Duration::from_secs(240)).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (status, took) = rig.client.attempt(reqwest::Method::GET, &format!("/drives/{}", other.drive), None, Duration::from_secs(60)).await;
+    eprintln!("another drive's head while a commit waits for the store: {status:?} after {took:?}");
+    assert!(status == Some(200) && took < Duration::from_secs(3), "another drive was held up: {status:?} after {took:?}");
+    let (status, took) = rig.client.attempt(reqwest::Method::GET, &format!("/drives/{}/feed?since=0&limit=100", m.drive), None, Duration::from_secs(240)).await;
+    eprintln!("the same drive's feed while a commit waits for the store: {status:?} after {took:?}");
+    assert!(status == Some(200) && took < STORE_PATIENCE, "the drive's feed was held for {took:?} behind a commit waiting for the store ({status:?})");
+    let (status, took) = waiting.await.unwrap();
+    eprintln!("the commit itself: {status:?} after {took:?}");
+    assert!(status == Some(503) && took < STORE_PATIENCE, "a commit with the store silent: {status:?} after {took:?}");
+
+    store.pass();
+    let (status, took) = rig.client.attempt(reqwest::Method::GET, &format!("/drives/{}", m.drive), None, Duration::from_secs(60)).await;
+    assert!(status == Some(200) && took < Duration::from_secs(5), "with the store back the drive answered {status:?} after {took:?}");
+    write_file(&rig, &mut m, "after.bin", synth::bytes(6, 0, 200_000)).await;
+    m.verify(&rig.client, true, "after the store spoke again").await;
+    eprintln!("store proxy: {}", store.summary());
+    assert_quiet_log(&rig.worker, &[]);
+}
+
+/// The store says nothing for 35 seconds: longer than the server lets any
+/// call to it wait, longer than a client waits for one attempt, and long
+/// enough for attempts to pile up behind one another in the drive. A client
+/// that keeps asking, as the engine does, is in the middle of writing a file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a bucket: scripts/chaos-r2.sh"]
+async fn a_store_silent_for_longer_than_any_request_lives_is_ridden_out() {
+    const SILENCE: Duration = Duration::from_secs(35);
+    let Some(rig) = rig(NEVER, 35).await else { return };
+    let Some(store) = &rig.worker.store else { return skipped_without_a_bucket() };
+    let mut m = Model::new(&rig.client, 35).await;
+    write_file(&rig, &mut m, "before.bin", synth::bytes(7, 0, 200_000)).await;
+    let mut other = Model::new(&rig.client, 3500).await;
+
+    store.stall();
+    let healing = store.heal_after(SILENCE.as_millis() as u64);
+    let started = Instant::now();
+    // Lookups, a shard, a manifest and a commit, each sent again and again
+    // until it is answered.
+    write_file(&rig, &mut m, "through-the-silence.bin", synth::bytes(8, 0, 400_000)).await;
+    let took = started.elapsed();
+    eprintln!("\na file written through {SILENCE:?} of silence from the store was in after {took:?}");
+    assert!(took >= SILENCE - Duration::from_secs(1), "the write finished after {took:?}, before the store spoke again: it cannot have reached the store");
+    assert!(took < SILENCE + STORE_PATIENCE, "the write needed {took:?}: {:?} after the store was back", took.saturating_sub(SILENCE));
+    healing.await.unwrap();
+    // The drive is not left busy with what piled up, and another drive never noticed.
+    let (status, took) = rig.client.attempt(reqwest::Method::GET, &format!("/drives/{}/feed?since=0&limit=100", m.drive), None, Duration::from_secs(60)).await;
+    assert!(status == Some(200) && took < Duration::from_secs(3), "after the silence the drive's feed answered {status:?} after {took:?}");
+    let root = other.root;
+    let (folder, op, node) = other.create_op(&root, "untouched", Kind::Folder);
+    other.must_commit(&rig.client, vec![op], 1, "another drive").await;
+    other.live.insert(folder, node);
+    m.verify(&rig.client, true, "after the silence").await;
+    other.verify(&rig.client, true, "the other drive").await;
+    let log = rig.worker.log();
+    eprintln!("the server gave up on the store {} times and logged each; store proxy: {}", log_count(&log, "store", None), store.summary());
+    assert!(log_count(&log, "store", None) >= 3, "35 s of silence should have run several calls into their limit");
+    assert_quiet_log(&rig.worker, &[]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a bucket: scripts/chaos-r2.sh"]
+async fn connections_to_the_store_cut_in_mid_flight_lose_nothing() {
+    let Some(rig) = rig(NEVER, 33).await else { return };
+    let Some(store) = &rig.worker.store else { return skipped_without_a_bucket() };
+    let mut m = Model::new(&rig.client, 33).await;
+    // Uploads and commits of several megabytes while every connection to
+    // the store is cut again and again under them.
+    let cutting = {
+        let faults = store.faults.clone();
+        tokio::spawn(async move {
+            for _ in 0..40 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                faults_sever(&faults);
+            }
+        })
+    };
+    let mut files = Vec::new();
+    for i in 0..4u64 {
+        files.push(write_file(&rig, &mut m, &format!("cut-{i}.bin"), synth::bytes(40 + i, 0, 2_500_000)).await);
+    }
+    // Reads through the same weather: every byte must be the one written.
+    m.verify(&rig.client, true, "while connections are being cut").await;
+    cutting.await.unwrap();
+    assert!(store.faults.cuts.load(Ordering::SeqCst) > 0, "no connection was open when the rig cut: {}", store.summary());
+    // Delete two of them and collect, cut again in the middle of the deletes.
+    for file in files.drain(..2) {
+        let changes = m.deleted(&file);
+        m.must_commit(&rig.client, vec![Op::Delete { node: hex(&file) }], changes, "delete").await;
+    }
+    let cutting = {
+        let faults = store.faults.clone();
+        tokio::spawn(async move {
+            for _ in 0..8 {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                faults_sever(&faults);
+            }
+        })
+    };
+    m.collect(&rig.client, "with connections cut under the collector").await;
+    cutting.await.unwrap();
+    m.verify(&rig.client, true, "at the end").await;
+    eprintln!("store proxy: {}", store.summary());
+    assert_quiet_log(&rig.worker, &[]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a bucket: scripts/chaos-r2.sh"]
+async fn the_collector_gets_through_a_store_that_was_gone() {
+    let Some(rig) = rig(NEVER, 34).await else { return };
+    let Some(store) = &rig.worker.store else { return skipped_without_a_bucket() };
+    let mut m = Model::new(&rig.client, 34).await;
+    let mut files = Vec::new();
+    for i in 0..12u64 {
+        files.push(write_file(&rig, &mut m, &format!("going-{i}.bin"), synth::bytes(60 + i, 0, 20_000 + 1000 * i as usize)).await);
+    }
+    let kept = write_file(&rig, &mut m, "staying.bin", synth::bytes(90, 0, 150_000)).await;
+    for file in files {
+        let changes = m.deleted(&file);
+        m.must_commit(&rig.client, vec![Op::Delete { node: hex(&file) }], changes, "delete").await;
+    }
+    // 24 blobs are now unused. The collector is asked to run with the
+    // store gone, and goes on being asked until it has run; the store
+    // comes back seven seconds in.
+    store.refuse();
+    let healing = store.heal_after(7000);
+    let started = Instant::now();
+    m.collect(&rig.client, "after the store came back under the collector").await;
+    healing.await.unwrap();
+    eprintln!("the collector ran to its end {:?} after it was first asked, with the store gone for 7 s", started.elapsed());
+    assert!(started.elapsed() < Duration::from_secs(7) + STORE_PATIENCE, "the collector needed {:?} after a 7 s outage", started.elapsed());
+    // What it removed can be written again, and what was in use is intact.
+    write_file(&rig, &mut m, "back.bin", synth::bytes(60, 0, 20_000)).await;
+    assert!(m.live.contains_key(&kept));
+    m.verify(&rig.client, true, "at the end").await;
+    eprintln!("store proxy: {}", store.summary());
+    assert_quiet_log(&rig.worker, &[]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "minutes long; needs Node and app/providers/cloudflare/node_modules"]
 async fn soak() {
     let seed: u64 = std::env::var("WORKER_CHAOS_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or_else(|| ludy_proto::now_ms() % 100_000);
     let steps: u64 = std::env::var("WORKER_CHAOS_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
@@ -1214,11 +1484,22 @@ async fn soak() {
     let mut m = Model::new(&rig.client, seed).await;
     let mut observer = Observer::default();
     let (mut freezes, mut collections, mut refusals) = (0u32, 0u32, BTreeMap::<&str, u32>::new());
+    let (mut store_healing, mut store_faults) = (None::<tokio::task::JoinHandle<()>>, 0u32);
     // Six replies and four requests in a hundred never arrive.
     rig.proxy.rates(60, 40);
     let names = ["a", "b", "c", "notes.txt", "clip.mov", "caf\u{e9}", "cafe\u{301}", "Report", "report", "\u{65e5}\u{672c}\u{8a9e}", "x y z", "d", "e", "f"];
 
     for step in 0..steps {
+        // With the blobs in a bucket, the bucket has weather too: about one
+        // step in fourteen starts some, once the last has passed.
+        if let Some(store) = &rig.worker.store {
+            if store_healing.as_ref().is_none_or(|h| h.is_finished()) && m.rng.below(100) < 7 {
+                let (what, healing) = store.weather(m.rng.below(100), m.rng.below(1000));
+                m.trace.push(format!("{step}: {what}"));
+                store_healing = Some(healing);
+                store_faults += 1;
+            }
+        }
         let roll = m.rng.below(100);
         let name = names[m.rng.below(names.len() as u64) as usize];
         let (folders, files) = (m.folders(), m.files());
@@ -1421,6 +1702,13 @@ async fn soak() {
     }
 
     // The faults stop; what is there must be exactly what was written.
+    if let Some(store) = &rig.worker.store {
+        store.pass();
+        if let Some(healing) = store_healing.take() {
+            healing.abort();
+        }
+        store.pass();
+    }
     rig.proxy.rates(0, 0);
     m.verify(&rig.client, true, "at the end").await;
     observer.matches_a_full_read(&rig.client, &m.drive).await;
@@ -1457,6 +1745,11 @@ async fn soak() {
     eprintln!("| Timeouts / connection errors / 5xx seen by the client | {} / {} / {} |", n(&seen.timeouts), n(&seen.transport_errors), n(&seen.server_errors));
     eprintln!("| Proxy: connections / replies lost / requests lost | {} / {} / {} |", n(&f.connections), n(&f.replies_lost), n(&f.requests_lost));
     eprintln!("| kill -9 / freezes / collector runs | {} / {freezes} / {collections} |", rig.worker.kills);
+    if let Some(store) = &rig.worker.store {
+        eprintln!("| Store: spells of weather / times the server logged that it did not answer | {store_faults} / {} |", log_count(&log, "store", None));
+        eprintln!("| Store weather | {} |", store.weather_report());
+        eprintln!("| Store proxy | {} |", store.summary());
+    }
     eprintln!("| Worker start, ms (first, then after each kill) | {:?} |", rig.worker.starts);
     eprintln!("| At the end: live nodes / files / tombstones | {nodes_at_end} / {files_at_end} / {} |", end_stats["tombstones"]);
     eprintln!("| At the end: versions / blobs in use / database bytes | {} / {} / {} |", end_stats["versions"], end_stats["blobs_in_use"], end_stats["database_bytes"]);

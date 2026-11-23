@@ -1,15 +1,14 @@
-//! What a Ludy client and the cloud agree on.
+//! What a Ludy client and the server agree on.
 //!
-//! * [`wire`]: the JSON types of the HTTP API (listings, the change feed,
-//!   versions, the request log)
-//! * [`shard`]: how file content is cut into shards, and the manifest that
-//!   lists them. Two clients share shards only if they cut the same way.
-//! * [`synth`]: the bytes of a synthetic object
-//! * [`tree`]: the node-tree protocol of an encrypted drive: commits of ops
-//!   on nodes, and the feed of what changed. Spoken by the Worker in
-//!   `app/worker`; the engine and `ludy-cloud` still use [`wire`]
-//! * [`crypt`]: end-to-end encryption: sealed shards, keyed cut points, node
-//!   keys, sealed names and manifests. Not used by the engine or the cloud yet
+//! * [`tree`]: the node-tree protocol of an end-to-end encrypted drive:
+//!   commits of ops on nodes, and the feed of what changed. Every provider
+//!   of the server speaks it, and the engine in `ludy-core` is its client
+//! * [`crypt`]: the encryption format: sealed shards, keyed cut points, node
+//!   keys, sealed names and manifests. Only clients use it; the server holds
+//!   no key
+//! * [`shard`]: the cutting parameters and the segment types the format
+//!   builds on, and SHA-256 names
+//! * [`synth`]: the bytes of a synthetic file
 //!
 //! Nothing here does I/O beyond reading a byte stream to cut it, so every
 //! client (the desktop engine, a phone, a tool) and the server can use it.
@@ -18,9 +17,6 @@ pub mod crypt;
 pub mod shard;
 pub mod synth;
 pub mod tree;
-pub mod wire;
-
-pub use wire::{Changes, Content, DriveInfo, Listing, LogEntry, ObjectInfo, Share, Version};
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
