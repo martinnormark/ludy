@@ -6,7 +6,7 @@ State of the tests on 2026-11-23, one run of each with the blobs in a folder, af
 
 | Suite | Cloudflare | Rivet |
 |---|---|---|
-| `cargo test` (no server): 83 tests | pass | |
+| `cargo test` (no server): 87 tests | pass | |
 | The server under chaos: 12 scenarios and a soak | 13 pass, 168 s; soak seed 19199, 9 kills | 13 pass, 259 s; soak seed 97809, 9 kills |
 | The engine under chaos: 17 scenarios and a soak | 18 pass, 222 s; soak seed 50895, 11 kills of the server, 7 of the app | 18 pass, 258 s; soak seed 76092, 6 kills of the server, 7 of the app |
 | Chaos on a real mount (`scripts/chaos-mount.sh`) | not run | pass, once, under Compose |

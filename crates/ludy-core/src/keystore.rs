@@ -8,11 +8,17 @@
 //! until there is sign-in and keys are wrapped for people. Whoever can read
 //! the file can read and change every drive in it, and a drive whose entry
 //! is lost cannot be opened by anyone.
+//!
+//! The app and `ludy` share the file, and may both be running. So the file
+//! is what counts, not what a process read from it earlier: a change takes
+//! a lock that every process honours, reads the file, changes what it read
+//! and writes that; and a listing reads the file again when it has been
+//! replaced. A key another process added is never written over.
 
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{anyhow, bail, Context, Result};
 use ludy_proto::crypt::{self, NodeId, NodeKey};
@@ -49,7 +55,32 @@ pub struct SavedDrive {
 pub struct Keystore {
     path: PathBuf,
     server: String,
-    entries: Mutex<Vec<Entry>>,
+    loaded: Mutex<Loaded>,
+}
+
+/// What the file held when it was last read, and which file that was.
+struct Loaded {
+    entries: Vec<Entry>,
+    stamp: Option<Stamp>,
+}
+
+/// Tells one writing of the file from the next: every save is a new file
+/// renamed into place, so the inode changes even within one clock tick.
+type Stamp = (u64, std::time::SystemTime, u64);
+
+fn stamp(path: &Path) -> Option<Stamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.ino(), meta.modified().ok()?, meta.len()))
+}
+
+/// The file's entries. A file that is not there is an empty keystore; one
+/// that does not parse is an error, so that it is never taken for empty.
+fn read(path: &Path) -> Result<Vec<Entry>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(serde_json::from_slice::<File>(&bytes).with_context(|| format!("{} is not a Ludy keystore; move it away to start a new one", path.display()))?.drives),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
+    }
 }
 
 fn unhex<const N: usize>(s: &str) -> Option<[u8; N]> {
@@ -77,21 +108,53 @@ impl Keystore {
     /// is not there yet is an empty keystore; one that does not parse is an
     /// error, so that it is never overwritten by an empty one.
     pub fn open(path: &Path, server: &str) -> Result<Keystore> {
-        let entries = match std::fs::read(path) {
-            Ok(bytes) => serde_json::from_slice::<File>(&bytes).with_context(|| format!("{} is not a Ludy keystore; move it away to start a new one", path.display()))?.drives,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
-        };
-        Ok(Keystore { path: path.to_path_buf(), server: server.trim_end_matches('/').to_string(), entries: Mutex::new(entries) })
+        let at = stamp(path);
+        let entries = read(path)?;
+        Ok(Keystore { path: path.to_path_buf(), server: server.trim_end_matches('/').to_string(), loaded: Mutex::new(Loaded { entries, stamp: at }) })
+    }
+
+    /// What the file holds now. It is read again only when it has been
+    /// replaced since the last look, by this process or another. A file
+    /// that cannot be read at this moment leaves what was read before: a
+    /// listing has nobody to tell, and the next change will say so.
+    fn current(&self) -> MutexGuard<'_, Loaded> {
+        let mut loaded = self.loaded.lock().unwrap();
+        let at = stamp(&self.path);
+        if at != loaded.stamp {
+            if let Ok(entries) = read(&self.path) {
+                *loaded = Loaded { entries, stamp: at };
+            }
+        }
+        loaded
+    }
+
+    /// Change the file: under a lock every Ludy process takes, read it,
+    /// let `edit` change what was read, and write that. So two processes
+    /// changing it at once both keep their change, and neither writes an
+    /// old list over a key the other added. The system lets go of the lock
+    /// when the process ends, however it ends.
+    fn change(&self, edit: impl FnOnce(&mut Vec<Entry>) -> Result<()>) -> Result<()> {
+        let mut loaded = self.loaded.lock().unwrap();
+        let dir = self.path.parent().ok_or_else(|| anyhow!("the keystore has no folder"))?;
+        std::fs::create_dir_all(dir)?;
+        let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(self.path.with_extension("lock")).with_context(|| format!("cannot lock {}", self.path.display()))?;
+        lock.lock().with_context(|| format!("cannot lock {}", self.path.display()))?;
+        let at = stamp(&self.path);
+        let mut entries = read(&self.path)?;
+        *loaded = Loaded { entries: entries.clone(), stamp: at };
+        edit(&mut entries)?;
+        self.save(&entries)?;
+        *loaded = Loaded { entries, stamp: stamp(&self.path) };
+        Ok(())
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// Replace the file, whole, by a rename: a reader sees the old file or
+    /// the new one. Only [`Keystore::change`] calls this, with the lock held.
     fn save(&self, entries: &[Entry]) -> Result<()> {
-        let dir = self.path.parent().ok_or_else(|| anyhow!("the keystore has no folder"))?;
-        std::fs::create_dir_all(dir)?;
         let tmp = self.path.with_extension("tmp");
         let _ = std::fs::remove_file(&tmp);
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp).with_context(|| format!("cannot write {}", tmp.display()))?;
@@ -104,8 +167,8 @@ impl Keystore {
 
     /// The drives on this keystore's server, by name.
     pub fn list(&self) -> Vec<SavedDrive> {
-        let entries = self.entries.lock().unwrap();
-        let mut out: Vec<SavedDrive> = entries.iter().filter(|e| e.server == self.server).filter_map(|e| Some(SavedDrive { name: e.name.clone(), keys: keys_of(e)? })).collect();
+        let loaded = self.current();
+        let mut out: Vec<SavedDrive> = loaded.entries.iter().filter(|e| e.server == self.server).filter_map(|e| Some(SavedDrive { name: e.name.clone(), keys: keys_of(e)? })).collect();
         out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         out
     }
@@ -120,18 +183,16 @@ impl Keystore {
         if !valid_drive_name(name) {
             bail!("{name:?} cannot be a drive's name: no slash or colon, no leading dot, at most 64 bytes");
         }
-        let mut entries = self.entries.lock().unwrap();
-        if let Some(e) = entries.iter().find(|e| e.server == self.server && (e.name == name || e.drive == keys.drive)) {
-            if e.name == name {
-                bail!("there is already a drive called {name}");
+        self.change(|entries| {
+            if let Some(e) = entries.iter().find(|e| e.server == self.server && (e.name == name || e.drive == keys.drive)) {
+                if e.name == name {
+                    bail!("there is already a drive called {name}");
+                }
+                bail!("that drive is already here, as {}", e.name);
             }
-            bail!("that drive is already here, as {}", e.name);
-        }
-        let mut next = entries.clone();
-        next.push(Entry { name: name.to_string(), server: self.server.clone(), drive: keys.drive.clone(), root: crypt::hex(&keys.root.0), root_key: crypt::hex(keys.root_key.expose()) });
-        self.save(&next)?;
-        *entries = next;
-        Ok(())
+            entries.push(Entry { name: name.to_string(), server: self.server.clone(), drive: keys.drive.clone(), root: crypt::hex(&keys.root.0), root_key: crypt::hex(keys.root_key.expose()) });
+            Ok(())
+        })
     }
 
     /// Give a drive another name on this Mac. The name sealed in the cloud
@@ -140,31 +201,27 @@ impl Keystore {
         if !valid_drive_name(to) {
             bail!("{to:?} cannot be a drive's name: no slash or colon, no leading dot, at most 64 bytes");
         }
-        let mut entries = self.entries.lock().unwrap();
-        if entries.iter().any(|e| e.server == self.server && e.name == to) {
-            bail!("there is already a drive called {to}");
-        }
-        let mut next = entries.clone();
-        let entry = next.iter_mut().find(|e| e.server == self.server && e.name == from).ok_or_else(|| anyhow!("no drive called {from}"))?;
-        entry.name = to.to_string();
-        self.save(&next)?;
-        *entries = next;
-        Ok(())
+        self.change(|entries| {
+            if entries.iter().any(|e| e.server == self.server && e.name == to) {
+                bail!("there is already a drive called {to}");
+            }
+            let entry = entries.iter_mut().find(|e| e.server == self.server && e.name == from).ok_or_else(|| anyhow!("no drive called {from}"))?;
+            entry.name = to.to_string();
+            Ok(())
+        })
     }
 
     /// Forget a drive's key. The drive stays on the server, and without its
     /// key nobody can read it.
     pub fn remove(&self, name: &str) -> Result<()> {
-        let mut entries = self.entries.lock().unwrap();
-        let mut next = entries.clone();
-        let before = next.len();
-        next.retain(|e| !(e.server == self.server && e.name == name));
-        if next.len() == before {
-            bail!("no drive called {name}");
-        }
-        self.save(&next)?;
-        *entries = next;
-        Ok(())
+        self.change(|entries| {
+            let before = entries.len();
+            entries.retain(|e| !(e.server == self.server && e.name == name));
+            if entries.len() == before {
+                bail!("no drive called {name}");
+            }
+            Ok(())
+        })
     }
 
     /// A drive's key as one line of text, to carry to another Mac. Whoever
@@ -234,6 +291,102 @@ mod tests {
         assert_eq!(Keystore::open(&path, "http://127.0.0.1:8787").unwrap().list().len(), 1, "the other server's drive is untouched");
     }
 
+    /// Two `Keystore`s on one file stand in for the app and `ludy` running
+    /// at the same time: each has its own copy of what it read.
+    #[test]
+    fn a_change_keeps_what_another_process_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("drives.json");
+        let app = Keystore::open(&path, "http://x").unwrap();
+        app.add("Footage", &keys(1)).unwrap();
+        let cli = Keystore::open(&path, "http://x").unwrap();
+        cli.add("FromCli", &keys(2)).unwrap();
+
+        // The app sees it without being reopened, and its own changes,
+        // made from a copy read before the CLI's, keep the CLI's drive.
+        let names = |k: &Keystore| k.list().into_iter().map(|d| d.name).collect::<Vec<_>>();
+        assert_eq!(names(&app), ["Footage", "FromCli"]);
+        app.add("FromApp", &keys(3)).unwrap();
+        app.rename("Footage", "Rushes").unwrap();
+        app.remove("FromApp").unwrap();
+        assert_eq!(names(&cli), ["FromCli", "Rushes"]);
+        assert_eq!(names(&Keystore::open(&path, "http://x").unwrap()), ["FromCli", "Rushes"]);
+
+        // What the other took or removed is refused, not written over.
+        assert!(app.add("FromCli", &keys(4)).is_err(), "the name is the CLI's");
+        assert!(app.add("Again", &keys(2)).is_err(), "the drive is already here");
+        cli.remove("Rushes").unwrap();
+        assert!(app.rename("Rushes", "Gone").is_err());
+        assert!(app.get("Rushes").is_none());
+        assert_eq!(names(&app), ["FromCli"]);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn changes_from_many_at_once_are_all_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("drives.json");
+        let (writers, each) = (8u8, 12u8);
+        let threads: Vec<_> = (0..writers)
+            .map(|w| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    // A keystore of its own, opened before the others wrote.
+                    let store = Keystore::open(&path, "http://x").unwrap();
+                    for i in 0..each {
+                        store.add(&format!("w{w}-{i}"), &keys(w * each + i)).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let all = Keystore::open(&path, "http://x").unwrap().list();
+        assert_eq!(all.len(), usize::from(writers) * usize::from(each));
+    }
+
+    /// The same from real processes: this test starts the test binary
+    /// again, several times at once, each as [`a_writer_in_its_own_process`].
+    #[test]
+    fn changes_from_other_processes_are_all_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("drives.json");
+        let mine = Keystore::open(&path, "http://x").unwrap();
+        let (writers, each) = (6u8, 10u8);
+        let children: Vec<_> = (0..writers)
+            .map(|w| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "keystore::tests::a_writer_in_its_own_process", "--nocapture"])
+                    .env("LUDY_TEST_KEYSTORE", &path)
+                    .env("LUDY_TEST_WRITER", format!("{w},{each}"))
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        for i in 0..each {
+            mine.add(&format!("mine-{i}"), &keys(200 + i)).unwrap();
+        }
+        for mut child in children {
+            assert!(child.wait().unwrap().success(), "a writer failed");
+        }
+        assert_eq!(mine.list().len(), usize::from(writers + 1) * usize::from(each));
+        assert_eq!(Keystore::open(&path, "http://x").unwrap().list().len(), usize::from(writers + 1) * usize::from(each));
+    }
+
+    /// Does nothing by itself; see [`changes_from_other_processes_are_all_kept`].
+    #[test]
+    fn a_writer_in_its_own_process() {
+        let (Ok(path), Ok(job)) = (std::env::var("LUDY_TEST_KEYSTORE"), std::env::var("LUDY_TEST_WRITER")) else { return };
+        let (w, each) = job.split_once(',').unwrap();
+        let (w, each): (u8, u8) = (w.parse().unwrap(), each.parse().unwrap());
+        let store = Keystore::open(Path::new(&path), "http://x").unwrap();
+        for i in 0..each {
+            store.add(&format!("w{w}-{i}"), &keys(w * each + i)).unwrap();
+        }
+    }
+
     #[test]
     fn a_file_that_does_not_parse_is_not_replaced() {
         let dir = tempfile::tempdir().unwrap();
@@ -241,6 +394,17 @@ mod tests {
         std::fs::write(&path, b"not json").unwrap();
         assert!(Keystore::open(&path, "http://x").is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"not json");
+
+        // Nor when it stops parsing under a keystore that is already open:
+        // the change is refused, and a listing keeps what it last read.
+        let good = dir.path().join("good.json");
+        let store = Keystore::open(&good, "http://x").unwrap();
+        store.add("Footage", &keys(1)).unwrap();
+        std::fs::write(&good, b"not json").unwrap();
+        assert!(store.add("Archive", &keys(2)).is_err());
+        assert!(store.remove("Footage").is_err());
+        assert_eq!(std::fs::read(&good).unwrap(), b"not json");
+        assert_eq!(store.list().len(), 1);
     }
 
     #[test]

@@ -28,7 +28,7 @@ The code is [`sealed_drive.rs`](../../crates/ludy-core/src/sealed_drive.rs) (the
 
 ## Drives and keys
 
-The server lists no drives and holds no key, so the list of drives is on the Mac: [`keystore.rs`](../../crates/ludy-core/src/keystore.rs) keeps a file, `drives.json`, with each drive's name, the server it lives on, its id and the key of its root folder. Only the drives of the server the engine is talking to are listed.
+The server lists no drives and holds no key, so the list of drives is on the Mac: [`keystore.rs`](../../crates/ludy-core/src/keystore.rs) keeps a file, `drives.json`, with each drive's name, the server it lives on, its id and the key of its root folder. Only the drives of the server the engine is talking to are listed. The app and `ludy` share that file and may run at the same time, so every change to it takes a lock both honour (`drives.lock` beside it), reads the file again and changes what it read; a drive one of them adds shows up in the other, and neither writes an old list over the other's key.
 
 - The file is readable by its owner only (mode 0600) and is not encrypted. Whoever can read it can read and change every drive in it. It is a stand-in until there is sign-in.
 - A drive whose entry is lost cannot be opened by anyone. `ludy key <drive>` prints the entry as one line, `ludy1-<drive id>-<root key>`, and `ludy add <key>` on another Mac turns it back into an entry after checking with the server that the key is that drive's.
